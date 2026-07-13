@@ -1,4 +1,11 @@
+from typing import List
+from pydantic import BaseModel, Field
 from src.core.memory import get_memory_content
+
+class WriteResult(BaseModel):
+    content: str = Field(description="The final drafted content in markdown format.")
+    outline: List[str] = Field(description="The outline used for the content.")
+    tone: str = Field(description="The tone used for the writing.")
 
 def get_writer_system_prompt() -> str:
     """
@@ -15,8 +22,13 @@ Instructions:
 6. Save the final drafted content as a markdown file under the `./workspace` directory (e.g., `workspace/blog_post.md`).
 7. Strictly do NOT write files outside `./workspace` or to `/tmp/`.
 
-Follow any conventions listed in AGENTS.md below."""
+Follow any conventions listed in AGENTS.md below.
 
+Your final response must be a structured object containing:
+- content: The final drafted content in markdown format.
+- outline: The outline used for the content.
+- tone: The tone used for the writing.
+"""
     agents_md = get_memory_content()
     if agents_md:
         prompt += f"\n\n=== Shared Data / AGENTS.md ===\n{agents_md}"

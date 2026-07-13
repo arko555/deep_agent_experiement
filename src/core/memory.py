@@ -89,6 +89,19 @@ def get_skills_summary() -> str:
         return "No specialized skills available."
     return "\n".join(summary)
 
+def get_tools_summary(tools_dict: Dict) -> str:
+    """Generates a summary of available tools for the system prompt."""
+    if not tools_dict:
+        return "No tools available."
+
+    summary = []
+    for name, tool_obj in tools_dict.items():
+        # LangChain tools have a 'description' attribute
+        description = getattr(tool_obj, 'description', 'No description provided.')
+        summary.append(f"- **{name}**: {description}")
+
+    return "\n".join(summary)
+
 def get_memory_content() -> str:
     path = "./AGENTS.md"
     if os.path.exists(path):
@@ -99,7 +112,7 @@ def get_memory_content() -> str:
             pass
     return ""
 
-def get_system_prompt(role: Optional[str] = None) -> str:
+def get_system_prompt(role: Optional[str] = None, tools_dict: Optional[Dict] = None) -> str:
     if role in ("research", "researcher"):
         from src.nodes.research import get_researcher_system_prompt
         return get_researcher_system_prompt()
@@ -108,8 +121,10 @@ def get_system_prompt(role: Optional[str] = None) -> str:
         return get_writer_system_prompt()
 
     skills_summary = get_skills_summary()
+    tools_summary = get_tools_summary(tools_dict) if tools_dict else "No tools available."
+
     prompt = f"""You are a generic Deep Agent, an expert orchestrator designed to perform any task.
-Your primary goal is to use the provided skill library to handle specialized requirements on-demand.
+Your primary goal is to use the provided skill library and tools to handle specialized requirements on-demand.
 
 1. **Strategic Planning**: Use `write_todos` to map out your approach for complex requests.
 2. **On-Demand Skills**: You have access to a library of skills in the `skills/` directory.
@@ -119,6 +134,9 @@ Your primary goal is to use the provided skill library to handle specialized req
 Available Skills:
 {skills_summary}
 
+Available Tools:
+{tools_summary}
+
 3. **Generic Subagents**: Use the `task` tool with the 'general-purpose' subagent to handle independent, complex, or context-heavy sub-tasks.
    - The 'general-purpose' subagent is also generic and can load the same skills.
 4. **NO /tmp/ FOLDER**: NEVER save files to the `/tmp/` directory. This is a critical requirement.
@@ -126,10 +144,10 @@ Available Skills:
 6. **Isolated Context**: Use subagents to keep the main conversation thread clean and focused on high-level orchestration.
 7. **Shared Data**: Refer to `AGENTS.md` for project conventions and mission statements.
 
-Follow the instructions in the loaded SKILL.md exactly once they are retrieved. If no skill exists for a task, proceed using your general knowledge and reasoning."""
+Follow the instructions in the loaded SKILL.md exactly once they are retrieved."""
 
     agents_md = get_memory_content()
     if agents_md:
         prompt += f"\n\n=== Shared Data / AGENTS.md ===\n{agents_md}"
-        
+
     return prompt

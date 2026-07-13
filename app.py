@@ -74,6 +74,20 @@ st.markdown("""
         padding: 5px 0;
         border-bottom: 1px solid #21262d;
     }
+    .audit-log-entry {
+        font-family: monospace;
+        font-size: 0.85em;
+        padding: 4px;
+        border-bottom: 1px solid #21262d;
+    }
+    .audit-timestamp {
+        color: #8b949e;
+        margin-right: 8px;
+    }
+    .audit-action {
+        color: #58a6ff;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -87,6 +101,12 @@ if "current_plan" not in st.session_state:
     st.session_state.current_plan = []
 if "workspace_files" not in st.session_state:
     st.session_state.workspace_files = []
+if "audit_log" not in st.session_state:
+    st.session_state.audit_log = []
+if "token_usage" not in st.session_state:
+    st.session_state.token_usage = {"total": 0}
+if "iteration_count" not in st.session_state:
+    st.session_state.iteration_count = 0
 
 # --- Helper Functions ---
 def update_workspace_files():
@@ -104,7 +124,6 @@ def get_skill_info(skill_path):
     if os.path.exists(skill_md):
         with open(skill_md, "r") as f:
             content = f.read()
-            # Simple YAML-ish header parser
             if content.startswith("---"):
                 parts = content.split("---")
                 if len(parts) >= 3:
@@ -117,13 +136,28 @@ def get_skill_info(skill_path):
                     return info
     return None
 
+def add_audit_entry(action: str, details: str):
+    st.session_state.audit_log.append({
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "action": action,
+        "details": details
+    })
+
 # --- Sidebar ---
 with st.sidebar:
-    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200) # Placeholder or actual logo
+    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200) # Placeholder
     st.title("Deep Agent Context")
-    
+
     st.divider()
-    
+
+    # Governance Dashboard
+    st.subheader("🛡️ Governance")
+    col1, col2 = st.columns(2)
+    col1.metric("Iterations", st.session_state.iteration_count)
+    col2.metric("Tokens", f"{st.session_state.token_usage.get('total', 0):,}")
+
+    st.divider()
+
     # Dynamic Skills
     st.subheader("🛠️ Active Skills")
     skills_dir = "./skills"
@@ -139,7 +173,24 @@ with st.sidebar:
                         <div class="skill-desc">{info.get('description', '')}</div>
                     </div>
                     """, unsafe_allow_html=True)
-    
+
+    st.divider()
+
+    # Audit Log
+    st.subheader("📜 Audit Log")
+    if not st.session_state.audit_log:
+        st.caption("No actions recorded yet.")
+    else:
+        audit_container = st.container(height=200)
+        with audit_container:
+            for entry in reversed(st.session_state.audit_log):
+                st.markdown(f"""
+                <div class="audit-log-entry">
+                    <span class="audit-timestamp">[{entry['timestamp']}]</span>
+                    <span class="audit-action">{entry['action']}</span>: {entry['details']}
+                </div>
+                """, unsafe_allow_html=True)
+
     st.divider()
 
     # Memory / Conventions
@@ -166,8 +217,7 @@ with st.sidebar:
                         st.code(file_text.read(), language="markdown")
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
-                
-                # Download button
+
                 with open(file_path, "rb") as file_bytes:
                     st.download_button(
                         label="Download",
@@ -175,7 +225,7 @@ with st.sidebar:
                         file_name=f,
                         mime="text/markdown"
                     )
-    
+
     if st.button("Clear Workspace"):
         workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
         for f in os.listdir(workspace_dir):
@@ -214,51 +264,43 @@ if prompt := st.chat_input("What would you like me to do?"):
     with st.chat_message("assistant"):
         thinking_container = st.container()
         status_placeholder = st.empty()
-        
+
         # --- Thinking Process Visualization ---
-        # Note: We use st.status to show the "Thinking" state and internal steps
         with st.status("Agent is thinking...", expanded=True) as status:
             full_response = ""
-            
+
             # DeepAgent streaming
             try:
-                # We expect the stream to yield state updates or events
-                # LangGraph stream("values") yields the full state at each step
-                # stream("updates") yields only the changes
                 for event in st.session_state.agent.stream(
-                    {"messages": [("user", prompt)]}, 
+                    {"messages": [("user", prompt)]},
                     stream_mode="updates"
                 ):
-                    # event is usually a dict: { 'node_name': { 'key': 'value' } }
                     for node_name, data in event.items():
                         if not isinstance(data, dict):
                             continue
-                            
+
                         # --- Handle Thinking / Reasoning ---
                         if "messages" in data:
                             messages = data["messages"]
-                            # LangGraph may return an Overwrite object which is not iterable
                             if not isinstance(messages, list):
-                                # If it has a .value property (like from langgraph.constants.Overwrite)
                                 if hasattr(messages, "value") and isinstance(messages.value, list):
                                     messages = messages.value
                                 else:
                                     messages = []
 
                             for msg in messages:
-                                # If it's an AI Message with content, it might be a thought or final answer
                                 if hasattr(msg, "content") and msg.content:
                                     if node_name == "agent":
                                         st.markdown(f"**Agent Thought:** {msg.content}")
                                     else:
                                         full_response = msg.content
-                                
-                                # --- Handle Tool Calls ---
+
                                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                                     for tc in msg.tool_calls:
                                         tool_name = tc.get("name")
                                         tool_args = tc.get("args", {})
-                                        
+                                        tool_id = tc.get("id")
+
                                         if tool_name == "task":
                                             subagent = tool_args.get("subagent_type", "unknown")
                                             st.write(f"👥 **Delegating to Subagent:** `{subagent}`")
@@ -274,6 +316,18 @@ if prompt := st.chat_input("What would you like me to do?"):
                                             if tool_args:
                                                 st.caption(f"Args: `{tool_args}`")
 
+                                        # Log tool call
+                                        add_audit_entry("Tool Call", f"{tool_name}({tool_args})")
+
+                                        # HITL check
+                                        if tool_name in ["write_file", "edit_file"]:
+                                            st.warning(f"⚠️ **Action Required:** Approval needed for `{tool_name}`")
+                                            # In a real app, we'd pause here. For now, we'll just show it.
+                                            # We'll simulate approval for this demo.
+                                            if st.button(f"Approve {tool_name}", key=f"approve_{tool_id}"):
+                                                add_audit_entry("Approval", f"Approved {tool_name}")
+                                                st.rerun()
+
                         # --- Handle Todo Updates directly ---
                         if "todos" in data:
                             st.session_state.current_plan = data["todos"]
@@ -282,6 +336,19 @@ if prompt := st.chat_input("What would you like me to do?"):
                                 st.subheader("📋 Current Plan")
                                 for i, t in enumerate(st.session_state.current_plan):
                                     st.checkbox(str(t), key=f"plan_update_{i}_{time.time()}", value=False, disabled=True)
+
+                        # --- Handle Audit Log updates ---
+                        if "audit_log" in data:
+                            # data["audit_log"] is the new entry
+                            st.session_state.audit_log.append(data["audit_log"])
+
+                        # --- Handle Token Usage ---
+                        if "token_usage" in data:
+                            st.session_state.token_usage.update(data["token_usage"])
+
+                        # --- Handle Iteration Count ---
+                        if "iteration_count" in data:
+                            st.session_state.iteration_count = data["iteration_count"]
 
                 status.update(label="Process Complete!", state="complete", expanded=False)
             except Exception as e:
@@ -294,4 +361,3 @@ if prompt := st.chat_input("What would you like me to do?"):
         st.markdown(full_response)
         st.session_state.messages.append({"role": "assistant", "content": full_response})
         update_workspace_files()
-
