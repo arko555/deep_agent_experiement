@@ -13,20 +13,33 @@ def write_todos(todos: List[str]) -> str:
     """
     return f"Updated todo list with {len(todos)} items."
 
-def call_orchestrator(state: AgentState, model, tools: list) -> dict:
+def call_orchestrator(state: AgentState, model, tools: list, max_history_messages: int = 20) -> dict:
     """
     Executes the main orchestrator agent step.
-    
+
     Args:
         state: The current AgentState.
         model: The LLM instance to invoke.
         tools: The list of tools bound to the LLM.
-        
+        max_history_messages: Maximum number of conversation messages to keep.
+
     Returns:
         A dict updating `next_message`.
     """
     system_prompt = get_system_prompt()
-    formatted_messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    messages = state["messages"]
+    # Truncate old messages to prevent exceeding context limits
+    if len(messages) > max_history_messages:
+        messages = messages[-max_history_messages:]
+    formatted_messages = [SystemMessage(content=system_prompt)] + messages
     model_with_tools = model.bind_tools(tools)
-    response = model_with_tools.invoke(formatted_messages)
-    return {"next_message": response}
+    for attempt in range(3):
+        try:
+            response = model_with_tools.invoke(formatted_messages)
+            break
+        except Exception as e:
+            if attempt == 2:
+                raise
+            import time
+            time.sleep(2 ** attempt)
+    return {"next_message": response, "messages": [response]}

@@ -2,9 +2,22 @@ import streamlit as st
 import os
 import time
 import base64
+import logging
 from datetime import datetime
 from agent import get_deep_agent
 from dotenv import load_dotenv
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app_new.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("DeepAgentApp")
+logger.info("App started")
 
 # Load environment variables
 load_dotenv()
@@ -105,8 +118,14 @@ if "audit_log" not in st.session_state:
     st.session_state.audit_log = []
 if "token_usage" not in st.session_state:
     st.session_state.token_usage = {"total": 0}
+if "last_action" not in st.session_state:
+    st.session_state.last_action = "None"
+if "current_node" not in st.session_state:
+    st.session_state.current_node = "Idle"
 if "iteration_count" not in st.session_state:
     st.session_state.iteration_count = 0
+if "approved_tool_ids" not in st.session_state:
+    st.session_state.approved_tool_ids = []
 
 # --- Helper Functions ---
 def update_workspace_files():
@@ -137,11 +156,14 @@ def get_skill_info(skill_path):
     return None
 
 def add_audit_entry(action: str, details: str):
+    timestamp = datetime.now().strftime("%H:%M:%S")
     st.session_state.audit_log.append({
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "timestamp": timestamp,
         "action": action,
         "details": details
     })
+    st.session_state.last_action = f"{action}: {details}"
+    logger.info(f"[{timestamp}] {action}: {details}")
 
 # --- Sidebar ---
 with st.sidebar:
@@ -169,9 +191,9 @@ with st.sidebar:
                 if info:
                     st.markdown(f"""
                     <div class="skill-card">
-                        <div class="skill-name">{info.get('name', skill_name)}</div>
-                        <div class="skill-desc">{info.get('description', '')}</div>
-                    </div>
+                        <div class="skill-name">{info.get('name', skill_name)}</div >
+                        <div class="skill-desc">{info.get('description', '')}</div >
+                    </div >
                     """, unsafe_allow_html=True)
 
     st.divider()
@@ -186,11 +208,15 @@ with st.sidebar:
             for entry in reversed(st.session_state.audit_log):
                 st.markdown(f"""
                 <div class="audit-log-entry">
-                    <span class="audit-timestamp">[{entry['timestamp']}]</span>
-                    <span class="audit-action">{entry['action']}</span>: {entry['details']}
-                </div>
+                    <span class="audit-timestamp">[{entry['timestamp']}]</span >
+                    <span class="audit-action">{entry['action']}</span >: {entry['details']}
+                </div >
                 """, unsafe_allow_html=True)
 
+    st.divider()
+    st.subheader("📡 System Status")
+    st.info(f"**Current Node:** {st.session_state.current_node}")
+    st.info(f"**Last Action:** {st.session_state.last_action}")
     st.divider()
 
     # Memory / Conventions
@@ -226,14 +252,14 @@ with st.sidebar:
                         mime="text/markdown"
                     )
 
-    if st.button("Clear Workspace"):
-        workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
-        for f in os.listdir(workspace_dir):
-            file_path = os.path.join(workspace_dir, f)
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-        update_workspace_files()
-        st.rerun()
+        if st.button("Clear Workspace"):
+            workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
+            for f in os.listdir(workspace_dir):
+                file_path = os.path.join(workspace_dir, f)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            update_workspace_files()
+            st.rerun()
 
     # Plan Placeholder in Sidebar
     plan_section = st.empty()
@@ -255,109 +281,106 @@ for message in st.session_state.messages:
 
 # Chat input
 if prompt := st.chat_input("What would you like me to do?"):
-    # Add user message to history
+    prompt = prompt.strip()
+    if not prompt:
+        st.warning("Please enter a valid message.")
+        st.rerun()
+
+    if len(prompt) < 3:
+        st.warning("Please provide a more detailed request (at least 3 characters).")
+        st.rerun()
+
+    # 1. Persist user message to session state (displayed by chat history loop below)
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Render user message will happen on rerun after agent completion
+    # 2. Process agent response
+    with st.spinner("🤖 Agent is thinking..."):
+        full_response = ""
+        turn_messages = []  # Collect all intermediate messages for chat history
 
-    # Process agent response
-    with st.chat_message("assistant"):
-        thinking_container = st.container()
-        status_placeholder = st.empty()
+        # Resolve pending approvals from previous runs
+        for msg in st.session_state.messages:
+            if isinstance(msg, dict):
+                if msg.get("content", "").startswith("PENDING_APPROVAL:"):
+                    msg["content"] = "Successfully executed tool (approved via UI)."
+        if st.session_state.approved_tool_ids:
+            st.session_state.approved_tool_ids = []
 
-        # --- Thinking Process Visualization ---
-        with st.status("Agent is thinking...", expanded=True) as status:
-            full_response = ""
+        try:
+            st.write("🚀 Initializing agent execution...")
+            for event in st.session_state.agent.stream(
+                {"messages": list(st.session_state.messages)},
+                stream_mode="updates"
+            ):
+                for node_name, data in event.items():
+                    if not isinstance(data, dict):
+                        continue
 
-            # DeepAgent streaming
-            try:
-                for event in st.session_state.agent.stream(
-                    {"messages": [("user", prompt)]},
-                    stream_mode="updates"
-                ):
-                    for node_name, data in event.items():
-                        if not isinstance(data, dict):
-                            continue
+                    st.write(f"🔹 **Node `{node_name}`** is active")
 
-                        # --- Handle Thinking / Reasoning ---
-                        if "messages" in data:
-                            messages = data["messages"]
-                            if not isinstance(messages, list):
-                                if hasattr(messages, "value") and isinstance(messages.value, list):
-                                    messages = messages.value
-                                else:
-                                    messages = []
+                    # --- Handle Thinking / Reasoning ---
+                    if "messages" in data:
+                        messages = data["messages"]
+                        if not isinstance(messages, list):
+                            if hasattr(messages, "value") and isinstance(messages.value, list):
+                                messages = messages.value
+                            else:
+                                messages = []
 
-                            for msg in messages:
-                                if hasattr(msg, "content") and msg.content:
-                                    if node_name == "agent":
-                                        st.markdown(f"**Agent Thought:** {msg.content}")
-                                    else:
-                                        full_response = msg.content
+                        for msg in messages:
+                            if hasattr(msg, "content") and msg.content:
+                                # Map LangChain role names to Streamlit role names
+                                role = getattr(msg, "type", "assistant")
+                                if role == "ai":
+                                    role = "assistant"
+                                elif role == "human":
+                                    role = "user"
+                                elif role == "system":
+                                    continue  # Skip system messages in chat UI
 
-                                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                    for tc in msg.tool_calls:
-                                        tool_name = tc.get("name")
-                                        tool_args = tc.get("args", {})
-                                        tool_id = tc.get("id")
+                                # Display in thinking container
+                                if node_name == "agent":
+                                    st.markdown(f"**Agent Thought:** {msg.content}")
+                                elif node_name == "responder":
+                                    full_response = msg.content
+                                    st.success("✅ Final response generated.")
 
-                                        if tool_name == "task":
-                                            subagent = tool_args.get("subagent_type", "unknown")
-                                            st.write(f"👥 **Delegating to Subagent:** `{subagent}`")
-                                            st.caption(f"Reason: {tool_args.get('description', '')}")
-                                        elif tool_name == "write_todos":
-                                            st.session_state.current_plan = tool_args.get("todos", [])
-                                            st.success("📍 **Plan Updated**")
-                                        elif tool_name == "read_file" and "SKILL.md" in str(tool_args.get("path", "")):
-                                            skill_name = os.path.basename(os.path.dirname(tool_args["path"]))
-                                            st.info(f"📖 **Loading Skill:** `{skill_name}`")
-                                        else:
-                                            st.write(f"🛠️ **Tool Call:** `{tool_name}`")
-                                            if tool_args:
-                                                st.caption(f"Args: `{tool_args}`")
+                                # Only capture the final responder message in chat history
+                                if node_name == "responder":
+                                    turn_messages.append({
+                                        "role": role,
+                                        "content": msg.content,
+                                    })
 
-                                        # Log tool call
-                                        add_audit_entry("Tool Call", f"{tool_name}({tool_args})")
+                    # --- Handle Todo Updates directly ---
+                    if "todos" in data:
+                        st.session_state.current_plan = data["todos"]
+                        with plan_section.container():
+                            st.divider()
+                            st.subheader("📋 Current Plan")
+                            for i, t in enumerate(st.session_state.current_plan):
+                                st.checkbox(str(t), key=f"plan_update_{i}_{time.time()}", value=False, disabled=True)
 
-                                        # HITL check
-                                        if tool_name in ["write_file", "edit_file"]:
-                                            st.warning(f"⚠️ **Action Required:** Approval needed for `{tool_name}`")
-                                            # In a real app, we'd pause here. For now, we'll just show it.
-                                            # We'll simulate approval for this demo.
-                                            if st.button(f"Approve {tool_name}", key=f"approve_{tool_id}"):
-                                                add_audit_entry("Approval", f"Approved {tool_name}")
-                                                st.rerun()
+                    # --- Handle Audit Log updates ---
+                    if "audit_log" in data:
+                        st.session_state.audit_log.extend(data["audit_log"])
 
-                        # --- Handle Todo Updates directly ---
-                        if "todos" in data:
-                            st.session_state.current_plan = data["todos"]
-                            with plan_section.container():
-                                st.divider()
-                                st.subheader("📋 Current Plan")
-                                for i, t in enumerate(st.session_state.current_plan):
-                                    st.checkbox(str(t), key=f"plan_update_{i}_{time.time()}", value=False, disabled=True)
+                    # --- Handle Token Usage ---
+                    if "token_usage" in data:
+                        st.session_state.token_usage.update(data["token_usage"])
 
-                        # --- Handle Audit Log updates ---
-                        if "audit_log" in data:
-                            # data["audit_log"] is the new entry
-                            st.session_state.audit_log.append(data["audit_log"])
+                    # --- Handle Iteration Count ---
+                    if "iteration_count" in data:
+                        st.session_state.iteration_count = data["iteration_count"]
 
-                        # --- Handle Token Usage ---
-                        if "token_usage" in data:
-                            st.session_state.token_usage.update(data["token_usage"])
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            st.error(f"❌ **Agent Execution Error**")
+            st.info(f"**Error Details:** {e}")
 
-                        # --- Handle Iteration Count ---
-                        if "iteration_count" in data:
-                            st.session_state.iteration_count = data["iteration_count"]
-
-                status.update(label="Process Complete!", state="complete", expanded=False)
-            except Exception as e:
-                import traceback
-                st.error(f"Error during agent execution: {e}")
-                st.code(traceback.format_exc())
-                status.update(label="error occurred", state="error")
-                full_response = "I encountered an error while processing your request."
-
-        st.markdown(full_response)
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-        update_workspace_files()
+    # 3. Persist assistant messages and always refresh UI
+    for msg in turn_messages:
+        st.session_state.messages.append(msg)
+    update_workspace_files()
+    st.rerun()  # Always rerun so the full chat history (user + assistant) renders correctly

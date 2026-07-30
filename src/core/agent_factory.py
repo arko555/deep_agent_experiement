@@ -5,12 +5,13 @@ import pkgutil
 import sys
 from typing import Annotated, List, Literal, TypedDict, Optional, Dict
 from datetime import datetime
+import time
 
 from dotenv import load_dotenv
 
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
+from langchain_openrouter import ChatOpenRouter
 from langchain_ollama import ChatOllama
 from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage, AIMessage, HumanMessage
 from langchain_core.tools import tool
@@ -29,15 +30,60 @@ from src.nodes.write import WriteResult
 
 load_dotenv()
 
+# --- Cached Compiled Graph ---
+# Compile once, reuse across all invocations (including recursive subagents).
+# Safe because node lambdas call get_model() at runtime, not compile time.
+_compiled_graph = None
+
+def _execute_task(subagent_type: str, description: str, recursion_depth: int):
+    """
+    Execute a subagent task with recursion depth enforcement.
+
+    Called from local_tools_node (not as a LangChain tool invoke) so that
+    we have access to the graph state for depth tracking.
+    """
+    MAX_RECURSION = 3
+
+    if subagent_type in ["research", "researcher"]:
+        model = get_model().with_structured_output(ResearchResult)
+        res = model.invoke([HumanMessage(content=description)])
+        return str(res)
+    elif subagent_type in ["write", "writer"]:
+        model = get_model().with_structured_output(WriteResult)
+        res = model.invoke([HumanMessage(content=description)])
+        return str(res)
+    else:
+        # General-purpose subagent — use the cached compiled graph
+        sub_agent = get_deep_agent()
+        res = sub_agent.invoke({
+            "messages": [HumanMessage(content=description)],
+            "current_plan": [],
+            "workspace_files": [],
+            "recursion_depth": recursion_depth + 1,
+            "audit_log": [],
+            "token_usage": {},
+            "iteration_count": 0,
+            "max_iterations": 50,
+        })
+        return res["messages"][-1].content
+
+
 # --- Model Selection ---
 def get_model():
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
 
     if anthropic_key:
         return ChatAnthropic(
             model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
+            temperature=0,
+        )
+    elif openrouter_key:
+        return ChatOpenRouter(
+            model=os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+            api_key=openrouter_key,
             temperature=0,
         )
     elif openai_key:
@@ -110,11 +156,7 @@ def edit_file(path: str, search_text: str, replace_text: str) -> str:
             return f"Error: '{search_text}' not found in {clean_path}"
         new_content = content.replace(search_text, replace_text)
         with open(clean_path, "w") as f:
-            new_content = new_content
-            new_content = new_content.replace(search_text, replace_text) # Fixing a potential logic error in my thought
-            new_content = content.replace(search_text, replace_text)
-            with open(clean_path, "w") as f:
-                f.write(new_content)
+            f.write(new_content)
         return f"Successfully updated {clean_path}"
     except Exception as e:
         return f"Error editing file {path}: {str(e)}"
@@ -127,28 +169,10 @@ def task(subagent_type: str, description: str) -> str:
         subagent_type: The type/role of subagent (e.g. 'general-purpose', 'research', 'writer').
         description: The task description for the subagent.
     """
-    from src.core.agent_factory import get_model
-
-    sub_agent = get_deep_agent()
-
-    if subagent_type in ["research", "researcher"]:
-        model = get_model().with_structured_output(ResearchResult)
-    elif subagent_type in ["write", "writer"]:
-        model = get_model().with_structured_output(WriteResult)
-    else:
-        model = None
-
-    if model:
-        res = model.invoke([HumanMessage(content=description)])
-        return str(res)
-    else:
-        res = sub_agent.invoke({
-            "messages": [HumanMessage(content=description)],
-            "current_plan": [],
-            "workspace_files": [],
-            "subagent_role": subagent_type
-        })
-        return res["messages"][-1].content
+    # Note: This tool is handled specially in local_tools_node for recursion
+    # depth enforcement. The invoke path is kept for discovery but execution
+    # goes through _execute_task in the tools node.
+    return _execute_task(subagent_type, description, 0)
 
 @tool
 def list_tools() -> str:
@@ -206,6 +230,7 @@ def local_tools_node(state: AgentState):
     audit_entry = {
         "timestamp": datetime.now().isoformat(),
         "action": "tool_call",
+        "details": "",
         "tool_calls": []
     }
 
@@ -216,64 +241,116 @@ def local_tools_node(state: AgentState):
 
         audit_entry["tool_calls"].append({"name": tool_name, "args": tool_args})
 
-        if tool_name in current_tools:
+        if tool_name == "task":
+            # Handle task specially: enforce recursion depth from state.
+            # The task tool is still registered (for LLM discovery) but we
+            # execute it here so we can pass recursion_depth from state.
+            current_depth = state.get("recursion_depth", 0)
+            if current_depth >= 3:
+                result = (
+                    f"Error: Maximum recursion depth (3) reached. "
+                    f"Cannot delegate further subagents. "
+                    f"Handle this task directly or consolidate remaining work."
+                )
+            else:
+                subagent_type = tool_args.get("subagent_type", "general-purpose")
+                description = tool_args.get("description", "")
+                result = _execute_task(subagent_type, description, current_depth)
+        elif tool_name in current_tools:
             tool_func = current_tools[tool_name]
-            try:
-                result = tool_func.invoke(tool_args)
+            result = None
+            for attempt in range(3):
+                try:
+                    result = tool_func.invoke(tool_args)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        result = f"Error executing tool {tool_name}: {str(e)}"
+                    else:
+                        import time
+                        time.sleep(2 ** attempt)
+
+            if result is not None:
                 if tool_name == "write_todos":
                     updates["current_plan"] = tool_args.get("todos", [])
 
                 if tool_name in ["write_file", "edit_file"]:
                     result = f"PENDING_APPROVAL: {result}"
-
-            except Exception as e:
-                result = f"Error executing tool {tool_name}: {str(e)}"
         else:
-            result = f"Tool {tool_name} not found."
+            result = f"Tool '{tool_name}' not found."
 
         tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_id, name=tool_name))
 
     updates["messages"] = tool_messages
     updates["workspace_files"] = get_workspace_files()
-    updates["audit_log"] = audit_entry
+    updates["audit_log"] = [audit_entry]
     updates["iteration_count"] = state.get("iteration_count", 0) + 1
+    updates["recursion_depth"] = state.get("recursion_depth", 0) + 1
     return updates
+
+# --- Retry wrapper for API calls ---
+def _invoke_with_retry(model_with_tools, messages, max_retries=3, base_delay=2.0):
+    """Invoke an LLM with exponential backoff retry on transient failures."""
+    for attempt in range(max_retries):
+        try:
+            return model_with_tools.invoke(messages)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            time.sleep(delay)
+    raise RuntimeError("Exhausted all retries")
+
 
 # --- Routing logic ---
 def route_from_orchestrator(state: AgentState):
     next_msg = state.get("next_message")
     if not next_msg:
-        return "responder"
+        return "END"
 
     if hasattr(next_msg, "tool_calls") and next_msg.tool_calls:
         return "agent"
 
-    # If no tool calls, check if we need a critic or plan checker
-    # For simplicity, we'll always run critic if there's a message,
-    # but we'll use the critic node to decide if we go to responder.
-    # Actually, let's use the critic/plan_checker as conditional edges.
-
+    # No tool calls → check plan first, then critic
+    plan = state.get("current_plan", [])
+    if plan:
+        return "plan_checker"
     return "critic"
+
+
+def _get_content_text(content):
+    """Extract text from multimodal content (string or list of dicts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                return item.get("text", "")
+    return str(content)
+
 
 def route_from_critic(state: AgentState):
     next_msg = state.get("next_message")
     if not next_msg:
-        return "responder"
+        return "responder"  # approved — pass original message through
 
-    if "APPROVED" in next_msg.content.upper():
-        return "orchestrator"
+    content = _get_content_text(next_msg.content if hasattr(next_msg, "content") else "")
+    if "APPROVED" in content.upper():
+        return "responder"  # approved → deliver final answer
     else:
-        return "orchestrator" # In a real implementation, we'd route back to agent
+        return "orchestrator"  # rejected → orchestrator reformulates
+
 
 def route_from_plan_checker(state: AgentState):
     next_msg = state.get("next_message")
     if not next_msg:
-        return "orchestrator"
+        return "critic"  # no plan or compliant → continue to critic for quality review
 
-    if "COMPLIANT" in next_msg.content.upper():
-        return "orchestrator"
+    content = _get_content_text(next_msg.content if hasattr(next_msg, "content") else "")
+    if "COMPLIANT" in content.upper():
+        return "critic"  # compliant → critic checks quality
     else:
-        return "orchestrator"
+        return "orchestrator"  # non-compliant → orchestrator reformulates
 
 # --- Graph Construction ---
 def get_all_tools() -> Dict[str, tool]:
@@ -291,6 +368,11 @@ def get_all_tools() -> Dict[str, tool]:
     return {**built_in_tools, **dynamic_tools}
 
 def get_deep_agent():
+    """Return the compiled deep agent graph (cached after first call)."""
+    global _compiled_graph
+    if _compiled_graph is not None:
+        return _compiled_graph
+
     workspace_root = os.getenv("WORKSPACE_ROOT", "./workspace")
     if not os.path.exists(workspace_root):
         os.makedirs(workspace_root)
@@ -316,13 +398,30 @@ def get_deep_agent():
         {
             "agent": "agent",
             "critic": "critic",
+            "plan_checker": "plan_checker",
             "responder": "responder"
         }
     )
 
     workflow.add_edge("agent", "tools")
     workflow.add_edge("tools", "orchestrator")
-    workflow.add_edge("critic", "orchestrator")
+    workflow.add_conditional_edges(
+        "critic",
+        route_from_critic,
+        {
+            "responder": "responder",
+            "orchestrator": "orchestrator"
+        }
+    )
+    workflow.add_conditional_edges(
+        "plan_checker",
+        route_from_plan_checker,
+        {
+            "critic": "critic",
+            "orchestrator": "orchestrator"
+        }
+    )
     workflow.add_edge("responder", END)
 
-    return workflow.compile()
+    _compiled_graph = workflow.compile()
+    return _compiled_graph

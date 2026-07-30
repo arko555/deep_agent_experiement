@@ -7,7 +7,7 @@ class AgentState(TypedDict):
     current_plan: List[str]                       # todo list (updated by write_todos)
     workspace_files: List[str]                    # synced after every tool execution
     next_message: Optional[BaseMessage]           # staging area for LLM response
-    subagent_role: Optional[str]                  # "research", "writer", or None
+    recursion_depth: int                          # tracks subagent nesting depth
     audit_log: Annotated[List[Dict], add]        # structured log of actions and decisions
     token_usage: Dict[str, int]                  # tracking API consumption
     iteration_count: int                          # current loop count

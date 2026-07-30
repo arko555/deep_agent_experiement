@@ -1,45 +1,5 @@
 import os
-import json
 from typing import Dict, List, Optional
-from datetime import datetime
-
-class MemoryManager:
-    def __init__(self, workspace_root: str = "./workspace"):
-        self.workspace_root = workspace_root
-        self.memory_dir = os.path.join(self.workspace_root, ".memory")
-        os.makedirs(self.memory_dir, exist_ok=True)
-
-    def _get_thread_path(self, thread_id: str) -> str:
-        return os.path.join(self.memory_dir, f"thread_{thread_id}.json")
-
-    def _get_entity_path(self, entity_id: str) -> str:
-        return os.path.join(self.memory_dir, f"entity_{entity_id}.json")
-
-    def save_thread_memory(self, thread_id: str, messages: List[Dict]) -> None:
-        path = self._get_thread_path(thread_id)
-        with open(path, "w") as f:
-            json.dump({"timestamp": datetime.now().isoformat(), "messages": messages}, f)
-
-    def get_thread_memory(self, thread_id: str) -> List[Dict]:
-        path = self._get_thread_path(thread_id)
-        if not os.path.exists(path):
-            return []
-        with open(path, "r") as f:
-            data = json.load(f)
-            return data.get("messages", [])
-
-    def save_entity_memory(self, entity_id: str, data: Dict) -> None:
-        path = self._get_entity_path(entity_id)
-        with open(path, "w") as f:
-            json.dump({"timestamp": datetime.now().isoformat(), "data": data}, f)
-
-    def get_entity_memory(self, entity_id: str) -> Optional[Dict]:
-        path = self._get_entity_path(entity_id)
-        if not os.path.exists(path):
-            return None
-        with open(path, "r") as f:
-            data = json.load(f)
-            return data.get("data")
 
 
 # --- Context and Skills Loading Helpers ---
@@ -124,7 +84,11 @@ def get_system_prompt(role: Optional[str] = None, tools_dict: Optional[Dict] = N
     tools_summary = get_tools_summary(tools_dict) if tools_dict else "No tools available."
 
     prompt = f"""You are a generic Deep Agent, an expert orchestrator designed to perform any task.
-Your primary goal is to use the provided skill library and tools to handle specialized requirements on-demand.
+
+**Conversational Guidance:**
+- If the user sends a simple greeting (e.g., "hello", "hi", "good morning"), respond warmly and briefly, then ask how you can help.
+- If the user asks a straightforward question that doesn't require tools, answer directly.
+- For complex, multi-step tasks, follow the planning workflow below.
 
 1. **Strategic Planning**: Use `write_todos` to map out your approach for complex requests.
 2. **On-Demand Skills**: You have access to a library of skills in the `skills/` directory.

@@ -1,0 +1,28 @@
+2026-07-25 01:58:28,727 - DeepAgentApp - INFO - App started
+2026-07-25 01:58:31,471 - DeepAgentApp - INFO - App started
+2026-07-25 01:58:31,530 - DeepAgentApp - INFO - App started
+2026-07-25 01:58:34,472 - DeepAgentApp - INFO - App started
+2026-07-25 01:58:34,531 - DeepAgentApp - INFO - App started
+2026-07-25 01:59:36,044 - DeepAgentApp - INFO - App started
+2026-07-25 01:59:42,332 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:00:33,487 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:00:33,562 - DeepAgentApp - INFO - App started
+2026-07-25 02:03:31,007 - DeepAgentApp - INFO - App started
+2026-07-25 02:56:20,441 - DeepAgentApp - INFO - App started
+2026-07-25 02:56:23,908 - DeepAgentApp - INFO - App started
+2026-07-25 02:56:33,056 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:57:23,384 - DeepAgentApp - INFO - App started
+2026-07-25 02:57:37,255 - DeepAgentApp - INFO - App started
+2026-07-25 02:57:46,565 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:57:49,782 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:57:53,689 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:58:36,178 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:58:44,253 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 02:58:54,667 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 03:00:03,831 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 03:00:50,059 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 03:01:12,243 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 200 OK"
+2026-07-25 03:01:12,274 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 400 Bad Request"
+2026-07-25 03:01:13,303 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 400 Bad Request"
+2026-07-25 03:01:15,332 - httpx - INFO - HTTP Request: POST http://localhost:8001/v1/messages "HTTP/1.1 400 Bad Request"
+2026-07-25 03:01:15,398 - DeepAgentApp - INFO - App started
