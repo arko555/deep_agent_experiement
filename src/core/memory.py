@@ -1,8 +1,39 @@
 import os
+import hashlib
 from typing import Dict, List, Optional
 
 
-# --- Context and Skills Loading Helpers ---
+# ---------------------------------------------------------------------------
+# Caching helpers (3.5: memoize with filesystem-change invalidation)
+# ---------------------------------------------------------------------------
+
+def _dir_tree_hash(directory: str) -> str:
+    """Return a hex digest of (mtime, size) for every file under *directory*."""
+    parts = []
+    if not os.path.exists(directory):
+        return hashlib.md5(b"missing").hexdigest()
+    for root, _dirs, files in os.walk(directory):
+        for fname in files:
+            fp = os.path.join(root, fname)
+            try:
+                stat = os.stat(fp)
+                parts.append(f"{fp}:{stat.st_mtime}:{stat.st_size}")
+            except OSError:
+                parts.append(f"{fp}:missing")
+    return hashlib.md5("\n".join(parts).encode()).hexdigest() if parts else hashlib.md5(b"empty").hexdigest()
+
+
+# Module-level cache stores
+_skills_cache: Optional[str] = None
+_skills_cache_hash: str = ""
+
+_tools_cache: Optional[str] = None
+_tools_cache_key: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Workspace & Skills
+# ---------------------------------------------------------------------------
 
 def get_workspace_files() -> List[str]:
     workspace_dir = "./workspace"
@@ -14,6 +45,7 @@ def get_workspace_files() -> List[str]:
             rel_path = os.path.relpath(os.path.join(root, f), workspace_dir)
             files.append(rel_path)
     return sorted(files)
+
 
 def get_skill_info(skill_path: str) -> Optional[dict]:
     skill_md = os.path.join(skill_path, "SKILL.md")
@@ -35,32 +67,64 @@ def get_skill_info(skill_path: str) -> Optional[dict]:
             pass
     return None
 
+
 def get_skills_summary() -> str:
-    skills_dir = "./skills"
+    """Return a markdown summary of available skills (cached via mtime hash)."""
+    global _skills_cache, _skills_cache_hash
+
+    current_hash = _dir_tree_hash("./skills")
+    if _skills_cache is not None and current_hash == _skills_cache_hash:
+        return _skills_cache
+
     summary = []
+    skills_dir = "./skills"
     if os.path.exists(skills_dir):
         for skill_name in os.listdir(skills_dir):
             skill_path = os.path.join(skills_dir, skill_name)
             if os.path.isdir(skill_path):
                 info = get_skill_info(skill_path)
                 if info:
-                    summary.append(f"- **{info.get('name', skill_name)}**: {info.get('description', '').strip()}")
-    if not summary:
-        return "No specialized skills available."
-    return "\n".join(summary)
+                    summary.append(
+                        f"- **{info.get('name', skill_name)}**: {info.get('description', '').strip()}"
+                    )
+    result = "\n".join(summary) if summary else "No specialized skills available."
+
+    _skills_cache = result
+    _skills_cache_hash = current_hash
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tools Summary
+# ---------------------------------------------------------------------------
 
 def get_tools_summary(tools_dict: Dict) -> str:
-    """Generates a summary of available tools for the system prompt."""
+    """Return a markdown summary of available tools (cached via tool-name set)."""
+    global _tools_cache, _tools_cache_key
+
+    # Build a cache key from the set of tool names.
+    # When a different set of tools is passed, the cache is invalidated.
+    key = ",".join(sorted(tools_dict.keys())) if tools_dict else ""
+    if _tools_cache is not None and key == _tools_cache_key:
+        return _tools_cache
+
     if not tools_dict:
-        return "No tools available."
+        result = "No tools available."
+    else:
+        summary = []
+        for name, tool_obj in tools_dict.items():
+            description = getattr(tool_obj, "description", "No description provided.")
+            summary.append(f"- **{name}**: {description}")
+        result = "\n".join(summary)
 
-    summary = []
-    for name, tool_obj in tools_dict.items():
-        # LangChain tools have a 'description' attribute
-        description = getattr(tool_obj, 'description', 'No description provided.')
-        summary.append(f"- **{name}**: {description}")
+    _tools_cache = result
+    _tools_cache_key = key
+    return result
 
-    return "\n".join(summary)
+
+# ---------------------------------------------------------------------------
+# Memory & System Prompt
+# ---------------------------------------------------------------------------
 
 def get_memory_content() -> str:
     path = "./AGENTS.md"
@@ -71,6 +135,7 @@ def get_memory_content() -> str:
         except Exception:
             pass
     return ""
+
 
 def get_system_prompt(role: Optional[str] = None, tools_dict: Optional[Dict] = None) -> str:
     if role in ("research", "researcher"):

@@ -46,16 +46,16 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 
 ---
 
-## Phase 3: Medium — Maintainability & Architecture
-- ⬜ **3.1** Extract routing functions → `src/core/routing.py`
-- ⬜ **3.2** Extract tool definitions → `src/core/tools.py`
-- ⬜ **3.3** Extract retry wrapper → `src/core/utils.py`
-- ⬜ **3.4** Fix dynamic tool loading — use `importlib.util.spec_from_file_location` instead of modifying `sys.path`
-- ⬜ **3.5** Add caching for skills/tools summaries (memoize with filesystem change invalidation)
-- ⬜ **3.6** Fix guardrails inconsistency — consistent fallback behavior between read and write paths
-- ⬜ **3.7** Add LangGraph checkpointing (`MemorySaver`) for state persistence
+## Phase 3: Medium — Maintainability & Architecture ✅
+- ✅ **3.1** Extract routing functions → `src/core/routing.py`
+- ✅ **3.2** Extract tool definitions → `src/core/tools.py`
+- ✅ **3.3** Extract retry wrapper → `src/core/utils.py`
+- ✅ **3.4** Fix dynamic tool loading — use `importlib.util.spec_from_file_location` instead of modifying `sys.path`
+- ✅ **3.5** Add caching for skills/tools summaries (memoize with filesystem change invalidation)
+- ✅ **3.6** Fix guardrails inconsistency — consistent fallback behavior between read and write paths
+- ✅ **3.7** Add LangGraph checkpointing (`MemorySaver`) for state persistence
 
-**Files affected:** `src/core/agent_factory.py`, new `src/core/routing.py`, new `src/core/tools.py`, new `src/core/utils.py`, `src/core/memory.py`, `src/core/guardrails.py`
+**Files changed:** `src/core/agent_factory.py`, `src/core/routing.py`, new `src/core/tools.py`, `src/core/utils.py`, `src/core/memory.py`, `src/core/guardrails.py`, `src/nodes/plan.py`
 
 ---
 
@@ -108,3 +108,4 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 | Date | Phase | What |
 |------|-------|------|
 | 2026-07-29 | Phase 1 | Recursion depth enforcement, graph caching, critic/plan_checker routing fix, responder fallback |
+| 2026-08-14 | Phase 3 | Extract routing/tools/utils modules, importlib dynamic loading, skills caching, guardrails consistency, LangGraph checkpointing |
