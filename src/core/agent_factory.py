@@ -102,6 +102,10 @@ def local_tools_node(state: AgentState):
         "tool_calls": [],
     }
 
+    # Depth only increases when a subagent is actually spawned, so ordinary
+    # tool loops don't exhaust the delegation budget.
+    recursion_depth = state.get("recursion_depth", 0)
+
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
@@ -113,8 +117,7 @@ def local_tools_node(state: AgentState):
             # Handle task specially: enforce recursion depth from state.
             # The task tool is still registered (for LLM discovery) but we
             # execute it here so we can pass recursion_depth from state.
-            current_depth = state.get("recursion_depth", 0)
-            if current_depth >= 3:
+            if recursion_depth >= 3:
                 result = (
                     f"Error: Maximum recursion depth (3) reached. "
                     f"Cannot delegate further subagents. "
@@ -123,7 +126,8 @@ def local_tools_node(state: AgentState):
             else:
                 subagent_type = tool_args.get("subagent_type", "general-purpose")
                 description = tool_args.get("description", "")
-                result = _execute_task(subagent_type, description, current_depth)
+                result = _execute_task(subagent_type, description, recursion_depth)
+                recursion_depth += 1
         elif tool_name in current_tools:
             tool_func = current_tools[tool_name]
             # Inline retry for tool execution: returns an error string on
@@ -155,8 +159,7 @@ def local_tools_node(state: AgentState):
     updates["messages"] = tool_messages
     updates["workspace_files"] = get_workspace_files()
     updates["audit_log"] = [audit_entry]
-    updates["iteration_count"] = state.get("iteration_count", 0) + 1
-    updates["recursion_depth"] = state.get("recursion_depth", 0) + 1
+    updates["recursion_depth"] = recursion_depth
     return updates
 
 
@@ -195,6 +198,7 @@ def get_deep_agent():
             "critic": "critic",
             "plan_checker": "plan_checker",
             "responder": "responder",
+            "end": END,
         },
     )
 

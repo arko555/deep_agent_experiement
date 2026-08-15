@@ -1,26 +1,25 @@
-"""Routing functions for the deep agent graph."""
+"""Routing functions for the deep agent graph.
+
+Routers branch on explicit state fields (``review_verdict``, tool calls,
+plan presence) rather than inspecting message content, so routing can never
+be fooled by a verdict keyword appearing inside a response.
+"""
 
 from src.state import AgentState
-
-
-def _get_content_text(content):
-    """Extract text from multimodal content (string or list of dicts)."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                return item.get("text", "")
-    return str(content)
 
 
 def route_from_orchestrator(state: AgentState):
     next_msg = state.get("next_message")
     if not next_msg:
-        return "END"
+        return "end"
 
     if hasattr(next_msg, "tool_calls") and next_msg.tool_calls:
         return "agent"
+
+    # Budget exhausted: deliver the orchestrator's stop message instead of
+    # burning more reviewer cycles on it.
+    if state.get("iteration_count", 0) >= state.get("max_iterations", 10):
+        return "responder"
 
     plan = state.get("current_plan", [])
     if plan:
@@ -29,24 +28,14 @@ def route_from_orchestrator(state: AgentState):
 
 
 def route_from_critic(state: AgentState):
-    next_msg = state.get("next_message")
-    if not next_msg:
+    # The critic node sets ``review_verdict`` explicitly.
+    if state.get("review_verdict") == "approved":
         return "responder"
-
-    content = _get_content_text(next_msg.content if hasattr(next_msg, "content") else "")
-    if "APPROVED" in content.upper():
-        return "responder"
-    else:
-        return "orchestrator"
+    return "orchestrator"
 
 
 def route_from_plan_checker(state: AgentState):
-    next_msg = state.get("next_message")
-    if not next_msg:
+    # The plan checker sets ``review_verdict`` explicitly.
+    if state.get("review_verdict") == "compliant":
         return "critic"
-
-    content = _get_content_text(next_msg.content if hasattr(next_msg, "content") else "")
-    if "COMPLIANT" in content.upper():
-        return "critic"
-    else:
-        return "orchestrator"
+    return "orchestrator"

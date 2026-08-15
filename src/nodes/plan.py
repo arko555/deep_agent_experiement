@@ -1,8 +1,8 @@
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import AgentState
 from src.core.memory import get_system_prompt
-from src.core.utils import invoke_with_retry
+from src.core.utils import invoke_with_retry, get_message_text
 
 
 def call_orchestrator(state: AgentState, model, tools: list, max_history_messages: int = 20) -> dict:
@@ -31,12 +31,32 @@ def call_orchestrator(state: AgentState, model, tools: list, max_history_message
     # Truncate old messages to prevent exceeding context limits
     if len(messages) > max_history_messages:
         messages = messages[-max_history_messages:]
-    formatted_messages = [SystemMessage(content=system_prompt)] + messages
+    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+
+    # Consume staged review feedback (critic rejection / plan violation):
+    # present it as the latest instruction so the model can revise. The
+    # response below overwrites next_message, so the feedback is not
+    # replayed on the next turn.
+    staged = state.get("next_message")
+    if staged is not None:
+        feedback = get_message_text(getattr(staged, "content", ""))
+        if feedback:
+            formatted_messages.append(HumanMessage(
+                content=(
+                    "Your previous response was rejected by review. "
+                    f"Address the following feedback and produce a revised response:\n\n{feedback}"
+                )
+            ))
+
     model_with_tools = model.bind_tools(tools)
     response = invoke_with_retry(model_with_tools, formatted_messages)
 
-    # Token usage tracking from response metadata
-    updates = {"next_message": response}
+    # The orchestrator owns the loop counter: every LLM turn is one
+    # iteration, whether or not tools were involved.
+    updates = {
+        "next_message": response,
+        "iteration_count": state.get("iteration_count", 0) + 1,
+    }
     try:
         usage = getattr(response, "usage_metadata", None)
         if usage:
