@@ -42,19 +42,14 @@ def validate_and_normalize_path(
                 f"Access denied to path '{path}'. "
                 "Paths must be relative and stay within the repository."
             )
-        # Non-strict read: redirect to a safe repo-relative path.
-        # For absolute paths, keep the basename; for ".." traversal, log and
-        # return the original relative portion that stays within the repo.
-        if os.path.isabs(path):
-            logger.warning(
-                "Absolute path '%s' redirected to '%s' (read mode).",
-                path,
-                os.path.basename(clean_path),
-            )
-            return os.path.basename(clean_path)
-        # ".." traversal on a read path: log and allow the caller to decide.
-        logger.warning("Path traversal detected in '%s'; returning normalized path.", path)
-        return clean_path
+        # Non-strict read: redirect to a safe repo-relative basename,
+        # consistent with the write path's fallback.
+        logger.warning(
+            "Suspicious path '%s' redirected to '%s' (read mode).",
+            path,
+            os.path.basename(clean_path),
+        )
+        return os.path.basename(clean_path)
 
     # --- Enforce workspace boundary when required -----------------------------
     if must_be_in_workspace:

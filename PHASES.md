@@ -33,14 +33,14 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 
 ---
 
-## Phase 2: High Priority — State Integrity
-- ⬜ **2.1** Stop polluting message history — orchestrator returns only `next_message`, not appending to `messages`
-- ⬜ **2.2** Wire up `max_iterations` enforcement in orchestrator (reject with error message)
-- ⬜ **2.3** Wire up `token_usage` tracking (populate from LLM response metadata)
-- ⬜ **2.4** Merge identical `agent` and `responder` nodes into distinct behaviors:
+## Phase 2: High Priority — State Integrity ✅
+- ✅ **2.1** Stop polluting message history — orchestrator returns only `next_message`, not appending to `messages`
+- ✅ **2.2** Wire up `max_iterations` enforcement in orchestrator (reject with error message)
+- ✅ **2.3** Wire up `token_usage` tracking (populate from LLM response metadata)
+- ✅ **2.4** Merge identical `agent` and `responder` nodes into distinct behaviors:
   - `agent` = staging pass-through (moves `next_message` → `messages`)
   - `responder` = final answer formatter (extracts and formats the response)
-- ⬜ **2.5** Fix `internet_search` return format — return structured markdown, not Python `repr()`
+- ✅ **2.5** Fix `internet_search` return format — return structured markdown, not Python `repr()`
 
 **Files affected:** `src/nodes/plan.py`, `src/nodes/review.py`, `src/core/agent_factory.py`, `src/core/rag.py`
 
@@ -109,3 +109,4 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 |------|-------|------|
 | 2026-07-29 | Phase 1 | Recursion depth enforcement, graph caching, critic/plan_checker routing fix, responder fallback |
 | 2026-08-14 | Phase 3 | Extract routing/tools/utils modules, importlib dynamic loading, skills caching, guardrails consistency, LangGraph checkpointing |
+| 2026-08-16 | Phase 2 | next_message staging (no message-history pollution), max_iterations + token_usage enforcement, distinct agent/responder nodes, markdown internet_search, review_verdict-based routing |

@@ -99,12 +99,14 @@ def get_skills_summary() -> str:
 # ---------------------------------------------------------------------------
 
 def get_tools_summary(tools_dict: Dict) -> str:
-    """Return a markdown summary of available tools (cached via tool-name set)."""
+    """Return a markdown summary of available tools (cached via tool-name set + filesystem hash)."""
     global _tools_cache, _tools_cache_key
 
-    # Build a cache key from the set of tool names.
-    # When a different set of tools is passed, the cache is invalidated.
-    key = ",".join(sorted(tools_dict.keys())) if tools_dict else ""
+    # Build a cache key from the set of tool names plus a hash of the dynamic
+    # tools directory, so edits to tool files (e.g. description changes)
+    # invalidate the cache the same way the skills cache does.
+    names = ",".join(sorted(tools_dict.keys())) if tools_dict else ""
+    key = f"{names}|{_dir_tree_hash('./tools')}"
     if _tools_cache is not None and key == _tools_cache_key:
         return _tools_cache
 

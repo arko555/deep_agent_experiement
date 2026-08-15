@@ -16,26 +16,30 @@ def call_agent_node(state: AgentState) -> dict:
 
 def call_responder_node(state: AgentState) -> dict:
     """
-    Final answer node. Extracts the approved response and delivers it.
+    Final answer node. Extracts the approved response and formats it for delivery.
 
     Priority:
     1. next_message — explicitly staged final answer (survives critic approval)
     2. messages[-1] — defensive fallback: last AI message in history
     """
     next_msg = state.get("next_message")
-    if next_msg is not None:
-        return {"messages": [next_msg], "next_message": None}
-
-    # Defensive fallback: use the last AI message in conversation history.
-    messages = state.get("messages", [])
-    if messages:
+    if next_msg is None:
+        # Defensive fallback: use the last AI message in conversation history.
+        messages = state.get("messages", [])
         # Find the last AI message (skip tool/system messages)
-        last_ai = next((m for m in reversed(messages)
-                        if isinstance(m, AIMessage)), None)
-        if last_ai:
-            return {"messages": [last_ai], "next_message": None}
+        next_msg = next((m for m in reversed(messages)
+                         if isinstance(m, AIMessage)), None)
 
-    return {}
+    if next_msg is None:
+        return {}
+
+    # Format: normalize to a plain-text AIMessage so downstream consumers
+    # (UI, chat history) always receive string content, even when the staged
+    # message carries multimodal content.
+    return {
+        "messages": [AIMessage(content=get_message_text(next_msg.content))],
+        "next_message": None,
+    }
 
 def call_critic_node(state: AgentState, model) -> dict:
     """

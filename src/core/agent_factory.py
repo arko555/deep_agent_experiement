@@ -130,20 +130,12 @@ def local_tools_node(state: AgentState):
                 recursion_depth += 1
         elif tool_name in current_tools:
             tool_func = current_tools[tool_name]
-            # Inline retry for tool execution: returns an error string on
-            # failure rather than raising, so the graph can continue.
-            result = None
-            for attempt in range(3):
-                try:
-                    result = tool_func.invoke(tool_args)
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        result = f"Error executing tool {tool_name}: {str(e)}"
-                    else:
-                        import time
-
-                        time.sleep(2**attempt)
+            # Shared retry wrapper (exponential backoff); returns an error
+            # string on failure rather than raising, so the graph can continue.
+            try:
+                result = invoke_with_retry(tool_func, tool_args)
+            except Exception as e:
+                result = f"Error executing tool {tool_name}: {str(e)}"
 
             if result is not None:
                 if tool_name == "write_todos":
