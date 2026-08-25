@@ -1,8 +1,10 @@
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import AgentState
+from src.core.config import get_max_iterations
 from src.core.memory import get_system_prompt
 from src.core.utils import invoke_with_retry, get_message_text
+from src.core.summarization import compress_messages
 
 
 def call_orchestrator(state: AgentState, model, tools: list, max_history_messages: int = 20) -> dict:
@@ -18,9 +20,9 @@ def call_orchestrator(state: AgentState, model, tools: list, max_history_message
     Returns:
         A dict updating `next_message`.
     """
-    # Enforce max_iterations guard
+    # Enforce max_iterations guard (state value wins; config is the fallback).
     iteration_count = state.get("iteration_count", 0)
-    max_iterations = state.get("max_iterations", 10)
+    max_iterations = state.get("max_iterations") or get_max_iterations()
     if iteration_count >= max_iterations:
         from langchain_core.messages import AIMessage
         error_msg = AIMessage(content="Maximum iterations reached. Stopping to prevent runaway execution.")
@@ -28,10 +30,10 @@ def call_orchestrator(state: AgentState, model, tools: list, max_history_message
 
     system_prompt = get_system_prompt()
     messages = state["messages"]
-    # Truncate old messages to prevent exceeding context limits
-    if len(messages) > max_history_messages:
-        messages = messages[-max_history_messages:]
-    formatted_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    # Compress old messages into a summary instead of silent truncation (5.4).
+    # This preserves context the agent would otherwise lose.
+    compressed = compress_messages(messages, max_history=max_history_messages)
+    formatted_messages = [SystemMessage(content=system_prompt)] + list(compressed)
 
     # Consume staged review feedback (critic rejection / plan violation):
     # present it as the latest instruction so the model can revise. The

@@ -3,7 +3,9 @@ import os
 import time
 import base64
 import logging
+import uuid
 from datetime import datetime
+from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
 
@@ -124,8 +126,10 @@ if "current_node" not in st.session_state:
     st.session_state.current_node = "Idle"
 if "iteration_count" not in st.session_state:
     st.session_state.iteration_count = 0
-if "approved_tool_ids" not in st.session_state:
-    st.session_state.approved_tool_ids = []
+# One checkpoint thread per browser session; the checkpointer holds the
+# conversation history so each turn only sends the new user message.
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
 # --- Helper Functions ---
 def update_workspace_files():
@@ -298,18 +302,15 @@ if prompt := st.chat_input("What would you like me to do?"):
         full_response = ""
         turn_messages = []  # Collect all intermediate messages for chat history
 
-        # Resolve pending approvals from previous runs
-        for msg in st.session_state.messages:
-            if isinstance(msg, dict):
-                if msg.get("content", "").startswith("PENDING_APPROVAL:"):
-                    msg["content"] = "Successfully executed tool (approved via UI)."
-        if st.session_state.approved_tool_ids:
-            st.session_state.approved_tool_ids = []
-
         try:
             st.write("🚀 Initializing agent execution...")
+            # Only the new user message goes to the graph — the checkpointer
+            # holds conversation history under this session's thread. The
+            # iteration budget resets each turn so multi-turn chats don't
+            # exhaust it.
             for event in st.session_state.agent.stream(
-                {"messages": list(st.session_state.messages)},
+                {"messages": [HumanMessage(content=prompt)], "iteration_count": 0},
+                config={"configurable": {"thread_id": st.session_state.thread_id}},
                 stream_mode="updates"
             ):
                 for node_name, data in event.items():

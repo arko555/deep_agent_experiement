@@ -1,7 +1,7 @@
 [project]
 name = "deep-agents-langchain"
 version = "0.1.0"
-description = "Add your description here"
+description = "Deep agent workflow with LangGraph — multi-agent delegation, review, and HITL"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,7 +11,66 @@ dependencies = [
     "langchain-ollama>=1.1.0",
     "langchain-openai>=1.1.12",
     "python-dotenv>=1.2.2",
-    "streamlit>=1.55.0",
     "tavily-python>=0.7.23",
     "langchain-openrouter>=0.2.6",
 ]
+
+[project.optional-dependencies]
+ui = [
+    "streamlit>=1.55.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.12",
+]
+
+# ---------------------------------------------------------------------------
+# 5.2: Linting / Formatting
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",       # pycodestyle errors
+    "W",       # pycodestyle warnings
+    "F",       # pyflakes
+    "UP",      # pyupgrade
+    "B",       # flake8-bugbear
+    "C4",      # flake8-comprehensions
+    "TCH",     # flake8-type-checking
+    "RET",     # flake8-return
+    "RUF",     # ruff-specific rules
+]
+ignore = [
+    "B905",    # strict mode on sudo (not relevant)
+    "C408",    # unnecessary dict call (readable in context)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__ files are common
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false       # gradual adoption — don't block dev
+check_unsemetic_casts = false
+explicit_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["langchain.*", "langgraph.*", "streamlit"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# 5.1: pytest configuration
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers -v"
