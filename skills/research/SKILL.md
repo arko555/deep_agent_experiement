@@ -18,8 +18,15 @@ This skill provides structured web research capabilities. It handles breaking do
 1. Parse the research query to identify key topics and missing information.
 2. Use the `internet_search` tool to gather initial results.
 3. If results are insufficient, try alternative search queries.
-4. Synthesize the findings into a clear, structured summary.
+4. Synthesize the findings into a clear, structured summary, prioritizing factual accuracy and depth.
 5. Save the detailed findings to the `./workspace` directory as a markdown file.
+
+## Completion
+End with a final markdown summary containing:
+- A comprehensive summary of the findings
+- Key facts and findings as a bulleted list
+- The sources used
+- A confidence score (0-1) in the findings
 
 ## Examples
 ### Input

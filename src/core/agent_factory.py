@@ -5,6 +5,7 @@ Routing, tools, and retry logic are imported from their dedicated modules.
 """
 
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -23,7 +24,12 @@ from langgraph.checkpoint.memory import MemorySaver
 # pyrefly: ignore [missing-import]
 from src.state import AgentState
 # pyrefly: ignore [missing-import]
-from src.core.config import get_max_parallel_tasks, get_subagent_timeout_seconds
+from src.core.config import (
+    get_max_parallel_tasks,
+    get_max_subagent_depth,
+    get_subagent_timeout_seconds,
+)
+from src.core.subagents import is_parallelizable
 from src.core.memory import get_workspace_files, get_system_prompt
 from src.core.routing import (
     route_from_orchestrator,
@@ -254,9 +260,9 @@ def local_tools_node(state: AgentState):
         tool_args = tc["args"]
         audit_entry["tool_calls"].append({"name": "task", "args": tool_args})
 
-        if recursion_depth >= 3:
+        if recursion_depth >= get_max_subagent_depth():
             result = (
-                f"Error: Maximum recursion depth (3) reached. "
+                f"Error: Maximum subagent depth ({get_max_subagent_depth()}) reached. "
                 f"Cannot delegate further subagents. "
                 f"Handle this task directly or consolidate remaining work."
             )
@@ -270,26 +276,34 @@ def local_tools_node(state: AgentState):
                 "tool_id": tc["id"],
             })
 
-    # Group tasks by type: research/writer agents can run in parallel with
-    # each other; general-purpose agents share state so they run sequentially.
+    # Group tasks by the registry's parallelizable flag (6.1): those types run
+    # concurrently; everything else (general-purpose, unknown types) runs
+    # sequentially.
     independent_tasks = [t for t in tasks_to_parallelize
-                        if t["subagent_type"] in ("research", "writer", "researcher")]
+                        if is_parallelizable(t["subagent_type"])]
     sequential_tasks = [t for t in tasks_to_parallelize
-                       if t["subagent_type"] not in ("research", "writer", "researcher")]
+                       if not is_parallelizable(t["subagent_type"])]
 
     def _run_task(task_info):
         result, usage, write_ops = _execute_task(
             task_info["subagent_type"],
             task_info["description"],
             recursion_depth,
+            current_tools,
         )
         return (task_info["tool_id"], result, usage, write_ops)
 
+    # One shared wall-clock deadline for the whole batch (6.6): each future
+    # only gets the remaining time, so a hung batch costs one timeout, not
+    # N x timeout.
+    batch_deadline = time.monotonic() + get_subagent_timeout_seconds()
+
     def _resolve_task(future, task_info):
-        """Collect one task result with a wall-clock guard. A failed or hung
-        task yields an error string instead of dropping its siblings' results."""
+        """Collect one task result with the shared batch deadline. A failed or
+        hung task yields an error string instead of dropping its siblings'
+        results."""
         try:
-            return future.result(timeout=get_subagent_timeout_seconds())
+            return future.result(timeout=max(0.0, batch_deadline - time.monotonic()))
         except Exception as e:
             return (task_info["tool_id"], f"Error executing subagent task: {e}", {}, [])
 

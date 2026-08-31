@@ -10,11 +10,12 @@ import inspect
 import uuid
 from typing import List, Literal, Dict
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 
 from src.core.guardrails import validate_and_normalize_path
 from src.core.rag import internet_search as raw_internet_search
+from src.core.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
 
 # ---------------------------------------------------------------------------
 # Built-in Tools
@@ -92,18 +93,39 @@ def edit_file(path: str, search_text: str, replace_text: str) -> str:
         return f"Error editing file {path}: {str(e)}"
 
 
-@tool
-def task(subagent_type: Literal["general-purpose", "research", "writer"], description: str) -> str:
-    """Delegate a complex sub-task to a specialized or general-purpose subagent.
+# subagent_type values and the tool description are driven by the SUBAGENTS
+# registry (6.1) — adding a type there updates the schema automatically.
+_SubagentType = Literal[(*SUBAGENTS.keys(),)]  # type: ignore[valid-type]
 
-    Args:
-        subagent_type: The type/role of subagent ('general-purpose', 'research', or 'writer').
-        description: The task description for the subagent.
-    """
-    # Note: This tool is handled specially in local_tools_node for recursion
-    # depth enforcement. The invoke path is kept for discovery but execution
-    # goes through _execute_task in the tools node.
-    return _execute_task(subagent_type, description, 0)[0]
+
+def _task_impl(subagent_type: _SubagentType,  # type: ignore[valid-type]
+               description: str) -> str:
+    # The `task` tool is executed by the tools node (local_tools_node), which
+    # enforces recursion depth and aggregates child token usage/writes. A
+    # direct invoke has no graph state and would skip the depth guard, so it
+    # is refused outright (6.4) rather than executed at depth 0.
+    return ("Error: the task tool must be executed by the tools node so subagent "
+            "recursion depth can be enforced; it cannot be invoked directly.")
+
+
+def _build_task_docstring() -> str:
+    types = "\n".join(
+        f"- **{name}**: {spec.description}" for name, spec in SUBAGENTS.items()
+    )
+    return f"""Delegate a complex sub-task to a specialized or general-purpose subagent.
+
+Available subagent types:
+{types}
+
+Args:
+    subagent_type: The type/role of the subagent (one of: {', '.join(SUBAGENTS)}).
+    description: The task description for the subagent. Name a unique output path
+        under ./workspace (e.g., workspace/<topic>.md) for each file to produce.
+"""
+
+
+_task_impl.__doc__ = _build_task_docstring()
+task = tool(_task_impl)
 
 
 @tool
@@ -121,7 +143,8 @@ def list_tools() -> str:
 # Subagent Executor
 # ---------------------------------------------------------------------------
 
-def _execute_task(subagent_type: str, description: str, recursion_depth: int):
+def _execute_task(subagent_type: str, description: str, recursion_depth: int,
+                  tools_dict: dict | None = None):
     """
     Execute a subagent task.
 
@@ -129,81 +152,81 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int):
     the caller has access to the graph state for depth tracking and can
     aggregate the child's token usage back into the parent.
 
+    Dispatch is driven by the SUBAGENTS registry (6.1): kind="tool_loop"
+    types run a restricted tool loop with their SKILL.md-derived prompt;
+    kind="graph" types run the full cached compiled graph.
+
+    Args:
+        subagent_type: Type/alias as issued in the task tool call.
+        description: The task description for the subagent.
+        recursion_depth: Parent's nesting level; the child runs at +1.
+        tools_dict: Tools visible to the parent this turn, used to resolve
+            the spec's restricted tool names. Falls back to get_all_tools().
+
     Returns:
         (result_text, child_token_usage, child_write_ops) where
         child_token_usage is {"input": n, "output": n} and child_write_ops
         is the list of file-write operations the subagent performed (for the
         parent's pending_writes audit trail).
     """
-    if subagent_type in ["research", "researcher"]:
-        # Researcher runs a real tool loop with a restricted read/search/write
-        # toolset and its own role system prompt.
-        from src.core.subagents import run_tool_loop
-        from src.nodes.research import get_researcher_system_prompt
-
-        text, usage, write_ops = run_tool_loop(
-            get_researcher_system_prompt(),
-            description,
-            [internet_search, read_file, write_file],
-        )
-        return text, usage, write_ops
-    elif subagent_type in ["write", "writer"]:
-        # Writer runs a real tool loop with file tools and its role prompt.
-        from src.core.subagents import run_tool_loop
-        from src.nodes.write import get_writer_system_prompt
-
-        text, usage, write_ops = run_tool_loop(
-            get_writer_system_prompt(),
-            description,
-            [read_file, write_file, edit_file],
-        )
-        return text, usage, write_ops
-    elif subagent_type in ["general-purpose", "general"]:
-        # General-purpose subagent — use the cached compiled graph
-        from langchain_core.messages import AIMessage
-        from src.core.agent_factory import get_deep_agent
-        from src.core.config import get_max_iterations
-        from src.core.utils import get_message_text
-
-        sub_agent = get_deep_agent()
-        # Fresh checkpoint thread per subagent invocation: the checkpointer
-        # requires a thread_id, and reusing the parent's thread would merge
-        # child state into the parent's checkpoint (and vice versa).
-        res = sub_agent.invoke(
-            {
-                "messages": [HumanMessage(content=description)],
-                "current_plan": [],
-                "workspace_files": [],
-                "recursion_depth": recursion_depth + 1,
-                "audit_log": [],
-                "token_usage": {},
-                "iteration_count": 0,
-                "max_iterations": get_max_iterations(),
-            },
-            config={"configurable": {"thread_id": f"subagent-{uuid.uuid4()}"}}
-        )
-        # Extract the last non-empty AI message (the responder's final
-        # answer) rather than messages[-1], which could be a ToolMessage.
-        final = next(
-            (m for m in reversed(res.get("messages", []))
-             if isinstance(m, AIMessage) and get_message_text(m.content)),
-            None,
-        )
-        text = (
-            get_message_text(final.content)
-            if final is not None
-            else "Error: subagent produced no final answer."
-        )
-        # The child's full graph already tracked its own writes; surface them
-        # to the parent's audit trail.
-        return text, res.get("token_usage", {}) or {}, res.get("pending_writes", []) or []
-    else:
+    spec = resolve_subagent(subagent_type)
+    if spec is None:
         return (
             f"Error: Unknown subagent_type '{subagent_type}'. "
-            f"Use 'general-purpose', 'research', or 'writer'.",
+            f"Use one of: {', '.join(SUBAGENTS)}.",
             {},
             [],
         )
+
+    if spec.kind == "tool_loop":
+        # Restricted tool loop with the spec's toolset (resolved by name) and
+        # a prompt derived from its SKILL.md + shared completion contract.
+        toolset = tools_dict if tools_dict is not None else get_all_tools()
+        loop_tools = [toolset[name] for name in spec.tools if name in toolset]
+        text, usage, write_ops = run_tool_loop(
+            build_role_prompt(spec),
+            description,
+            loop_tools,
+        )
+        return text, usage, write_ops
+
+    # kind == "graph": general-purpose subagent — use the cached compiled graph
+    from src.core.agent_factory import get_deep_agent
+    from src.core.config import get_max_iterations
+    from src.core.utils import get_message_text
+
+    sub_agent = get_deep_agent()
+    # Fresh checkpoint thread per subagent invocation: the checkpointer
+    # requires a thread_id, and reusing the parent's thread would merge
+    # child state into the parent's checkpoint (and vice versa).
+    res = sub_agent.invoke(
+        {
+            "messages": [HumanMessage(content=description)],
+            "current_plan": [],
+            "workspace_files": [],
+            "recursion_depth": recursion_depth + 1,
+            "audit_log": [],
+            "token_usage": {},
+            "iteration_count": 0,
+            "max_iterations": get_max_iterations(),
+        },
+        config={"configurable": {"thread_id": f"subagent-{uuid.uuid4()}"}}
+    )
+    # Extract the last non-empty AI message (the responder's final
+    # answer) rather than messages[-1], which could be a ToolMessage.
+    final = next(
+        (m for m in reversed(res.get("messages", []))
+         if isinstance(m, AIMessage) and get_message_text(m.content)),
+        None,
+    )
+    text = (
+        get_message_text(final.content)
+        if final is not None
+        else "Error: subagent produced no final answer."
+    )
+    # The child's full graph already tracked its own writes; surface them
+    # to the parent's audit trail.
+    return text, res.get("token_usage", {}) or {}, res.get("pending_writes", []) or []
 
 
 # ---------------------------------------------------------------------------

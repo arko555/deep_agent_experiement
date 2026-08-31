@@ -1,4 +1,9 @@
-"""Subagent executors for the `task` tool.
+"""Subagent registry and executors for the `task` tool.
+
+SUBAGENTS is the single source of truth for subagent types: it drives the
+`task` tool schema (the allowed subagent_type values), `_execute_task`
+dispatch, the parallel-vs-sequential split in the tools node, and role
+prompt construction. Adding a subagent type = adding one SUBAGENTS entry.
 
 Research and writer subagents run a minimal tool loop (model + bound tools)
 so they can actually search, read, and write files instead of answering in a
@@ -6,9 +11,104 @@ single completion. The general-purpose subagent reuses the full compiled
 graph and is handled in ``tools._execute_task``.
 """
 
+from dataclasses import dataclass
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from src.core.memory import get_memory_content, get_skill_body
 from src.core.utils import get_message_text, invoke_with_retry
+
+
+# ---------------------------------------------------------------------------
+# Subagent Registry (6.1)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SubagentSpec:
+    """One subagent type, as registered in SUBAGENTS."""
+
+    description: str   # surfaced in the `task` tool schema
+    kind: str          # "tool_loop" (restricted tools) or "graph" (full graph)
+    parallelizable: bool = False  # may run concurrently with sibling tasks
+    aliases: tuple = ()            # accepted alternate names for subagent_type
+    skill: str | None = None       # skills/<skill>/SKILL.md — prompt source (tool_loop only)
+    tools: tuple = ()              # tool names for the restricted toolset (tool_loop only)
+
+
+SUBAGENTS: dict[str, SubagentSpec] = {
+    "general-purpose": SubagentSpec(
+        description="Full deep agent with all tools; use for complex or context-heavy sub-tasks.",
+        kind="graph",
+        parallelizable=False,
+        aliases=("general",),
+    ),
+    "research": SubagentSpec(
+        description="Web research: searches the internet and writes findings to a workspace file.",
+        kind="tool_loop",
+        parallelizable=True,
+        aliases=("researcher",),
+        skill="research",
+        tools=("internet_search", "read_file", "write_file"),
+    ),
+    "writer": SubagentSpec(
+        description="Content writer: reads workspace notes and saves the draft to a file.",
+        kind="tool_loop",
+        parallelizable=True,
+        skill="writer",
+        tools=("read_file", "write_file", "edit_file"),
+    ),
+}
+
+
+def resolve_subagent(subagent_type: str) -> SubagentSpec | None:
+    """Resolve a subagent type or alias to its spec; None if unknown."""
+    for name, spec in SUBAGENTS.items():
+        if subagent_type == name or subagent_type in spec.aliases:
+            return spec
+    return None
+
+
+def is_parallelizable(subagent_type: str) -> bool:
+    """Whether tasks of this type may run concurrently with sibling tasks.
+
+    Unknown types are not parallelizable (they run sequentially, where the
+    unknown-type error is produced).
+    """
+    spec = resolve_subagent(subagent_type)
+    return bool(spec and spec.parallelizable)
+
+
+# ---------------------------------------------------------------------------
+# Role Prompts (6.2: SKILL.md + shared completion contract)
+# ---------------------------------------------------------------------------
+
+COMPLETION_CONTRACT = """You are a specialized subagent delegated a task by the parent orchestrator.
+Complete the task using only the tools provided to you.
+
+Ground rules:
+- Save any file output to the exact path named in your task description, under
+  `./workspace`. If the task does not name a path, choose a unique filename based on
+  your topic (e.g., `workspace/<topic>.md`) — never reuse a shared default
+  filename, as other subagents may run in parallel.
+- Strictly do NOT write files outside `./workspace` or to `/tmp/`.
+
+When you are done, stop calling tools and end with a short completion summary containing:
+- The path(s) of the file(s) you saved under `./workspace` (if any)
+- A concise summary of what you did and the key results"""
+
+
+def build_role_prompt(spec: SubagentSpec) -> str:
+    """System prompt for a tool-loop subagent: shared completion contract,
+    then the subagent's role instructions from its SKILL.md, then AGENTS.md."""
+    parts = [COMPLETION_CONTRACT]
+    if spec.skill:
+        body = get_skill_body(spec.skill)
+        if body:
+            parts.append(f"=== Your role skill (skills/{spec.skill}/SKILL.md) ===\n{body}")
+    agents_md = get_memory_content()
+    if agents_md:
+        parts.append(f"=== Shared Data / AGENTS.md ===\n{agents_md}")
+    return "\n\n".join(parts)
 
 
 def _extract_usage(response):

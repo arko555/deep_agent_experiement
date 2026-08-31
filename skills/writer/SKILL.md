@@ -20,6 +20,12 @@ This skill provides advanced writing capabilities, focusing on clarity, engageme
 5. Format the output using GitHub Flavored Markdown.
 6. Save the final draft to the `./workspace` directory.
 
+## Completion
+End with a short summary containing:
+- The path of the file you saved under ./workspace
+- The outline used for the content
+- The tone used for the writing
+
 ## Examples
 ### Input
 "Write a blog post about the benefits of AI agents based on the research in research.md"

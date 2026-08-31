@@ -21,6 +21,17 @@ def get_max_iterations() -> int:
     return _env_int("AGENT_MAX_ITERATIONS", 25)
 
 
+def get_max_subagent_depth() -> int:
+    """Maximum subagent nesting level for `task` delegation.
+
+    Semantics: a parent at depth D spawns children at D+1, and delegation is
+    rejected when the parent's depth >= this limit. So the deepest subagent
+    sits at depth == limit and cannot delegate further — a top-level agent
+    (depth 0) can nest `limit` levels of subagents deep.
+    """
+    return _env_int("AGENT_MAX_SUBAGENT_DEPTH", 3)
+
+
 def get_max_parallel_tasks() -> int:
     """Concurrency cap for independent research/writer subagent tasks."""
     return max(1, _env_int("MAX_PARALLEL_TASKS", 4))

@@ -137,18 +137,18 @@ Goal: make this a *proper* multi-agent system — first-class tools and subagent
 
 ---
 
-## Phase 6: First-Class Subagent System ⬜
+## Phase 6: First-Class Subagent System ✅
 
 Make subagents data, not code paths: one registry drives the `task` tool schema, dispatch, parallelism, and prompts.
 
-- ⬜ **6.1** Subagent registry — `SUBAGENTS` dict in `src/core/subagents.py` (key: type; fields: aliases, description for the task tool, system prompt, tool list, `parallelizable`). Drive from it: the `task` tool docstring/enum, `_execute_task` dispatch, and the parallel-vs-sequential split in `local_tools_node`. Remove the four duplicated string lists (Audit A1).
-- ⬜ **6.2** Single source for role prompts — research/writer prompts derived from `skills/research/SKILL.md` / `skills/writer/SKILL.md` plus a shared completion-contract preamble; retire the duplicated hardcoded prompts in `nodes/research.py` / `nodes/write.py` and the dead `role=` branch of `get_system_prompt` (Audit A1, B-branch).
-- ⬜ **6.3** Configurable depth limit — `AGENT_MAX_SUBAGENT_DEPTH` (default 3) in `config.py` replacing the magic number in `local_tools_node`; document exact semantics (child starts at parent+1; delegation rejected once child would reach the limit ⇒ top-level nests 3 deep) (Audit A3).
-- ⬜ **6.4** Close the `task` bypass — replace the tool body's `_execute_task(..., 0)` fallback with an explicit error ("task must be executed by the tools node") so no invoke path can skip the recursion guard (Audit A2).
-- ⬜ **6.5** Delegation file contract — orchestrator prompt: every `task` description must name a unique output path under `./workspace` (e.g. `workspace/<topic>.md`), removing the parallel-clobber risk from shared suggested filenames (Audit A4).
-- ⬜ **6.6** Shared batch deadline — compute one deadline for the parallel task batch and derive each future's timeout from it, so a hung batch costs one timeout, not N× (Audit A5).
+- ✅ **6.1** Subagent registry — `SUBAGENTS` dict + `SubagentSpec` dataclass in `src/core/subagents.py` (key: type; fields: aliases, description for the task tool, `kind`, tool list, `parallelizable`). Drives from it: the `task` tool enum + docstring (`_SubagentType = Literal[(*SUBAGENTS.keys(),)]`, docstring built per registry entry), `_execute_task` dispatch (`resolve_subagent`), and the parallel-vs-sequential split in `local_tools_node` (`is_parallelizable`). All four duplicated string lists removed (Audit A1).
+- ✅ **6.2** Single source for role prompts — research/writer prompts are `COMPLETION_CONTRACT` + their `skills/<role>/SKILL.md` body (+ AGENTS.md), built by `build_role_prompt(spec)`; role-specific completion details moved into the SKILL.md files. `nodes/research.py` / `nodes/write.py` deleted; dead `role=` branch of `get_system_prompt` removed (Audit A1, B-branch).
+- ✅ **6.3** Configurable depth limit — `AGENT_MAX_SUBAGENT_DEPTH` (default 3) via `config.get_max_subagent_depth()`, replacing the magic number in `local_tools_node`; semantics documented in the config docstring (child runs at parent+1; delegation rejected when parent depth ≥ limit ⇒ top-level nests `limit` deep) (Audit A3).
+- ✅ **6.4** Close the `task` bypass — tool body now returns an explicit error ("must be executed by the tools node") instead of `_execute_task(..., 0)`; no invoke path can skip the recursion guard (Audit A2).
+- ✅ **6.5** Delegation file contract — orchestrator prompt: every `task` description must name a unique output path under `./workspace`; the shared completion contract tells subagents to use the named path or pick a unique filename, removing the shared-default-filename clobber risk (Audit A4).
+- ✅ **6.6** Shared batch deadline — one `time.monotonic()` deadline per task batch in `local_tools_node`; each `future.result()` gets only the remaining time, so a hung batch costs one timeout, not N× (Audit A5).
 
-**Files affected:** `src/core/subagents.py`, `src/core/tools.py`, `src/core/agent_factory.py`, `src/core/config.py`, `src/nodes/research.py`, `src/nodes/write.py`, `src/core/memory.py`
+**Files changed:** `src/core/subagents.py` (registry + prompt builder), `src/core/tools.py`, `src/core/agent_factory.py`, `src/core/config.py`, `src/core/memory.py`; deleted `src/nodes/research.py`, `src/nodes/write.py`; role specifics added to `skills/research/SKILL.md`, `skills/writer/SKILL.md`
 
 **Success criteria:** adding a fourth subagent type = editing one registry entry (verified by inspection); `pytest` green; new unit test asserting the registry drives tool schema, dispatch, and parallel grouping.
 
@@ -227,7 +227,7 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 
 ### Key Design Decisions
 
-1. **Recursion depth**: Hard limit of 3 levels. `recursion_depth` incremented on each `task` call.
+1. **Recursion depth**: Configurable via `AGENT_MAX_SUBAGENT_DEPTH` (default 3). Child runs at parent+1; delegation rejected when parent depth ≥ limit (top-level nests `limit` deep).
 2. **Message history**: Orchestrator writes to `next_message` only. `agent` node moves to `messages`. `responder` extracts final answer.
 3. **Subagent types**: Research/writer run real tool loops with restricted toolsets (`internet_search`/files for research, file tools for writer) and their role system prompts. General-purpose uses the full cached graph (with recursion limit). All subagent token usage is aggregated into the parent's `token_usage`.
 4. **Critic/plan_checker**: Route back to orchestrator on rejection, not to agent→tools (which can't handle critique text).
@@ -254,3 +254,4 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 | 2026-08-18 | Phase 5 | pytest test framework (routing/guardrails/state/summarization tests), ruff+mypy linting config in pyproject.toml, streamlit moved to optional `[ui]` dependency, conversation summarization replaces silent message truncation when max_history_messages reached |
 | 2026-08-19 | Critical Fixes | Removed HITL/interrupt (incompatible with Streamlit — web framework can't block/resume), writes execute immediately with audit-only tracking, added `reset_deep_agent()` for cache invalidation, reflection clears `review_verdict` to prevent routing corruption |
 | 2026-08-25 | Gap Audit | Verified gaps vs "proper multi-agent system": scattered subagent definitions (A1), live `task` bypass (A2), unsandboxed `read_file` incl. `.env` (B8), orchestrator prompt claiming "No tools available." (C11), reviewers bypassing retry (C12), stub observability (C13), dead state fields/routing fn (C14); added Phases 6–9 and optional Phase 10 |
+| 2026-08-31 | Phase 6 | First-class subagent system: `SUBAGENTS` registry drives task schema/dispatch/parallel grouping; role prompts = completion contract + SKILL.md (duplicated node prompts deleted); `AGENT_MAX_SUBAGENT_DEPTH` config; direct `task` invoke refused; delegation file contract in orchestrator prompt; shared batch deadline for parallel tasks |
