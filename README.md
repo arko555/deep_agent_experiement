@@ -1,60 +1,88 @@
-# Deep Agent Demo — Modular LangGraph Architecture
+# Deep Agent — Modular LangGraph Architecture
 
-A production-grade **Deep Agent** framework built with LangChain and LangGraph. This project demonstrates a modular, hierarchical multi-agent system designed for high-reliability tasks requiring complex reasoning, specialized expertise, and strict governance.
+A production-grade **Deep Agent** built with LangChain and LangGraph. One orchestrator LLM plans, delegates to subagents, and routes its own work through adversarial reviewers before delivering a final answer.
 
 ---
 
 ## 🌟 Why This Architecture?
 
-Standard LLM implementations often suffer from "context drift," where the model loses track of the original goal, or "hallucination," where it generates incorrect information without verification. The **Deep Agent** architecture solves these problems through several key design patterns:
+Standard LLM implementations suffer from "context drift" (losing the goal) and unverified answers. The Deep Agent architecture solves these through:
 
-### 🚀 Key Benefits
-
-*   **High Accuracy & Reliability**: 
-    *   **Adversarial Review**: A dedicated "Critic" node challenges the agent's reasoning before a final answer is delivered.
-    *   **Plan Adherence**: A "Plan Checker" ensures the agent is actually completing the tasks it set for itself.
-    *   **Structured Communication**: Subagents communicate via strict Pydantic schemas, preventing the "unstructured noise" that often breaks complex agentic loops.
+*   **High Accuracy & Reliability**:
+    *   **Adversarial Review**: A dedicated **Critic** node challenges the agent's reasoning before a final answer is delivered; a **Plan Checker** verifies the agent actually completes the tasks it set for itself.
+    *   **Self-Correction**: After 4+ iterations of critic rejections, a **Reflection** node breaks the loop and generates a revised strategy instead of spinning forever.
 *   **Enterprise-Grade Governance**:
-    *   **Human-in-the-Loop (HITL)**: Critical actions like writing or editing files are paused for user approval, preventing unintended side effects.
-    **Auditability**: Every single tool call, subagent delegation, and reasoning step is recorded in a structured `audit_log` for full transparency.
-    *   **Resource Management**: Built-in tracking for token usage and iteration counts prevents runaway costs and infinite loops.
-*   **Infinite Extensibility**:
-    *   **Dynamic Skill Loading**: Add new capabilities simply by dropping a `SKILL.md` file into the `skills/` directory—no code changes required.
-    *   **Modular Nodes**: New specialized roles (e.g., "Coder", "Legal Reviewer") can be added as new nodes in the LangGraph without refactoring the core orchestrator.
-
----
-
-## 🛠️ Adaptability: Real-World Scenarios
-
-This architecture is designed to be adapted to various complex workflows:
-
-*   **Automated Research & Reporting**: Use the `research` and `writer` subagents to perform deep web searches and synthesize them into professional markdown reports.
-*   **Software Engineering Assistant**: Extend the `tools/` directory with code execution and file manipulation tools to create an agent that can plan, write, and test code within a secure workspace.
-*   **Content Creation Pipeline**: Orchestrate a workflow where one agent researches a topic, another outlines it, a third writes the draft, and a fourth performs a final editorial review.
-*   **Data Analysis & Synthesis**: Integrate data retrieval tools and a "Data Analyst" subagent to transform raw data into structured insights and visualizations.
+    *   **Auditability**: Every tool call, subagent delegation, and review decision is recorded in a structured `audit_log`.
+    *   **Sandboxed file access**: Writes are forced into `./workspace`; reads use a default-deny allowlist (`AGENTS.md`, `workspace/`, `skills/`) — the agent cannot read `.env` or source files.
+    *   **Resource Management**: Iteration and token budgets prevent runaway loops; subagent delegation is depth-capped.
+*   **Extensibility**:
+    *   **Dynamic skills**: Drop a `SKILL.md` into `skills/` — no code changes required.
+    *   **Registry-driven subagents**: Add a new agent type with one `SubagentSpec` entry (`src/core/subagents.py`).
+    *   **External integrations**: Attach tools from MCP servers and remote agents via A2A, both config-driven (see [External integrations](#-external-integrations)).
 
 ---
 
 ## 🏗️ Architecture Deep Dive
 
-The system operates as a **Stateful Orchestration Loop**. Instead of a single long prompt, the task is decomposed into a series of discrete, verifiable steps.
+The system is a **stateful LangGraph state machine**. The orchestrator never appends to `messages` itself — each LLM turn is staged in `next_message`; the `agent` node moves staging into `messages` before tools run. Reviewer rejections also stage their critique as explicit revision feedback for the next orchestrator turn.
 
-### 1. The Orchestration Loop
-The central `orchestrator` acts as the "brain." It doesn't do the heavy lifting; instead, it:
-1.  **Plans**: Uses the `write_todos` tool to create a roadmap.
-2.  **Delegates**: Uses the `task` tool to spawn specialized subagents.
-3.  **Verifies**: Passes the results through a **Critic** and **Plan Checker** to ensure the work meets the required standards.
+Conversation history is owned by a **checkpointer** (`MemorySaver`). Callers pass only the new `HumanMessage`, `iteration_count: 0`, and a `configurable.thread_id`; the rest of the history comes from the checkpoint. Each UI session, CLI process, and subagent graph invocation uses its own thread id.
 
-### 2. The Role of State (`AgentState`)
-The `AgentState` is the "shared memory" and "control plane" of the entire system. It flows through every node in the graph and contains:
-*   **`messages`**: The full conversation history.
-*   **`current_plan`**: The dynamic list of tasks the agent is working through.
-*   **`audit_log`**: A structured record of every action taken.
-*   **`workspace_files`**: A real-time view of the files created or modified in the `./workspace/` directory.
+### The Orchestration Loop
+The `orchestrator` is the "brain":
+1.  **Plans** — creates a roadmap with the `write_todos` tool.
+2.  **Delegates** — spawns subagents via the `task` tool (research, writer, general-purpose, or remote A2A agents).
+3.  **Verifies** — results pass through the **Critic** and **Plan Checker** before delivery.
 
-### 3. Dynamic Capabilities
-*   **Skills (`skills/`)**: These are "on-demand" instructions. The agent only loads a skill's full instructions when it realizes it needs that specific expertise, keeping the main context window clean and focused.
-*   **Tools (`tools/`)**: These are the agent's "hands." They allow the agent to interact with the real world (web search, file system, etc.) within a strictly guarded environment.
+### AgentState
+Shared state flows through every node: `messages` (append-only), `current_plan`, `next_message` (staging), `review_verdict` (explicit routing signal), `recursion_depth`, `pending_writes` / `audit_log` (audit), `workspace_files`, `token_usage`, `iteration_count` / `max_iterations`.
+
+### Subagents are data, not code paths
+`SUBAGENTS` in `src/core/subagents.py` is the single source of truth: it drives the `task` tool's schema and docstring, dispatch, parallel-vs-sequential split, and prompt construction. Three kinds:
+
+| Type | Kind | What it does | Parallelizable |
+|------|------|--------------|----------------|
+| `research` | `tool_loop` | Web research with a restricted toolset (`internet_search`, `fetch_url`, file tools) + `skills/research/SKILL.md` prompt | ✅ |
+| `writer` | `tool_loop` | Draft writing with file tools + `skills/writer/SKILL.md` prompt | ✅ |
+| `general-purpose` | `graph` | Re-invokes the full compiled graph at `depth + 1` | ❌ (shared state) |
+| `<name>` (configured) | `a2a` | Calls a remote agent over the A2A protocol (`A2A_AGENTS` env var) | ✅ |
+
+Parallelizable tasks run in a `ThreadPoolExecutor` under **one shared deadline for the whole batch** (a hung batch costs one timeout, not N×); results are collected in submission order. Child token usage and file writes fold back into the parent's `token_usage` / `pending_writes`.
+
+### Built-in tools
+`write_todos`, `internet_search` (Tavily), `fetch_url`, `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `task`, `list_tools` — plus dynamic tools from `tools/*.py` and MCP tools. Name-collision precedence: **built-ins > MCP > dynamic file tools**.
+
+---
+
+## 🔄 Graph Flow
+
+Routing branches on **explicit state fields** (`next_message.tool_calls`, `review_verdict`, `current_plan`, `iteration_count`) — never on message text (see `src/core/routing.py`).
+
+```text
+START → orchestrator
+  │
+  ├─ has tool_calls                    → agent → tools → orchestrator
+  ├─ no tool_calls, budget exhausted   → responder → END
+  ├─ no tool_calls, current_plan set   → plan_checker
+  │                                      ├─ compliant     → critic
+  │                                      └─ non-compliant → orchestrator (reformulate)
+  └─ no tool_calls, no plan            → critic
+                                           ├─ approved                 → responder → END
+                                           ├─ rejected, iter < 4      → orchestrator (reformulate)
+                                           └─ rejected, iter >= 4     → reflection → orchestrator
+```
+
+Notes:
+- `tools` execute file writes immediately; `pending_writes` tracks them for audit only. There is **no** human-in-the-loop approval gate (LangGraph `interrupt()` was removed — it is incompatible with Streamlit's request-response model).
+- The **responder** delivers the final answer and clears staging.
+
+---
+
+## 🔌 External integrations
+
+**MCP tools** — set `MCP_SERVERS` to a JSON object describing MCP servers; their tools load into `get_all_tools()` alongside built-ins with no per-server code changes. Read at call time; changes apply on the next invocation. The async-only MCP SDK is bridged to the synchronous graph via `src/core/async_bridge.py` (a persistent event loop on a daemon thread — don't replace it with per-call `asyncio.run`).
+
+**A2A subagents** — set `A2A_AGENTS` to a JSON object of remote agents; each becomes a `kind="a2a"` entry in the registry, invocable through `task` and parallelized under the shared batch deadline. Read at **import** time (it feeds the `task` tool's static type enum), so changing A2A agents needs a process restart — unlike `MCP_SERVERS`.
 
 ---
 
@@ -63,50 +91,27 @@ The `AgentState` is the "shared memory" and "control plane" of the entire system
 | File | Role |
 |------|------|
 | `agent.py` | Thin facade — re-exports `get_deep_agent()` |
-| `app.py` | Streamlit UI — renders chat, thinking process, audit logs, and HITL controls |
-| `src/state.py` | `AgentState` — shared state including `audit_log`, `token_usage`, and `current_plan` |
-| `src/core/agent_factory.py` | Core: LLM selection, tool definitions, `StateGraph` construction, and routing logic |
-| `src/core/memory.py` | Loads `AGENTS.md`, scans `skills/` metadata, and manages system prompts |
+| `main.py` | CLI REPL over the cached compiled graph |
+| `app.py` | Streamlit UI — chat, action log, plan, skills, workspace files (the `ui` extra) |
+| `src/state.py` | `AgentState` TypedDict |
+| `src/core/agent_factory.py` | Graph construction, `tools` node (task batch execution), model selection + caching |
+| `src/core/subagents.py` | `SUBAGENTS` registry + `SubagentSpec`; role prompt builder |
+| `src/core/routing.py` | Conditional edges (explicit-state routing) |
+| `src/core/tools.py` | Built-in tools, `task` tool, dynamic-tool loader, MCP tiering |
+| `src/core/config.py` | All budgets/limits, read from env at call time |
+| `src/core/memory.py` | `AGENTS.md` + `skills/` scanning, system prompts |
+| `src/core/guardrails.py` | Path validation — write sandbox + default-deny read allowlist |
+| `src/core/mcp_client.py` | MCP server tool loading (cached by config hash) |
+| `src/core/a2a_client.py` | A2A remote-agent calls |
+| `src/core/async_bridge.py` | Sync-over-async bridge for the async-only SDKs |
 | `src/core/rag.py` | `internet_search()` — wraps Tavily API |
-| `src/core/guardrails.py` | `validate_and_normalize_path()` — enforces read/write boundaries |
-| `src/nodes/plan.py` | `call_orchestrator()` node; `write_todos` tool |
-| `src/nodes/research.py` | System prompt factory for the **Researcher** subagent (returns structured `ResearchResult`) |
-| `src/nodes/write.py` | System prompt factory for the **Writer** subagent (returns structured `WriteResult`) |
-| `src/nodes/review.py` | `call_agent_node`, `call_responder_node`, `call_critic_node`, and `call_plan_checker_node` |
-| `skills/` | Directory containing `SKILL.md` files for dynamic capability loading |
-| `tools/` | Directory for custom, dynamically loaded LangChain tools |
-| `AGENTS.md` | Shared project conventions and entity definitions injected into prompts |
-
----
-
-## 🔄 Graph Construction
-
-The LangGraph `StateGraph` implements a reasoning loop with validation:
-
-```text
-START
-  │
-  ▼
-[orchestrator]  ──── LLM decides: tool calls? ────┐
-  │                                                │
-  │ No (final answer)              Yes (tool calls)│
-  ▼                                                ▼
-[critic] <────────────────────────────────────── [agent]
-  │                                                │
-  │ Approved?                                      ▼
-  │                                             [tools]
-  ▼                                                │
-[responder] <──────────────────────────────────────┘
-  │
-  ▼
- END
-```
-
-### Routing Logic
-1.  **Orchestrator** $\rightarrow$ **Agent**: If `tool_calls` are present.
-2.  **Orchestrator** $\rightarrow$ **Critic**: If no tool calls, to validate the proposed response.
-3.  **Critic** $\rightarrow$ **Orchestrator**: If the response is flagged for review or needs refinement.
-4.  **Critic** $\rightarrow$ **Responder**: If the response is "APPROVED".
+| `src/core/summarization.py` | Conversation summarization when history grows large |
+| `src/core/utils.py` | Shared LLM retry wrapper |
+| `src/nodes/plan.py` | `orchestrator` node; `write_todos` tool |
+| `src/nodes/review.py` | `agent`, `critic`, `plan_checker`, `reflection`, `responder` nodes |
+| `skills/` | `SKILL.md` files for subagent role prompts |
+| `tools/` | Custom dynamically-loaded LangChain tools |
+| `AGENTS.md` | Shared conventions injected into prompts |
 
 ---
 
@@ -114,49 +119,77 @@ START
 
 ### Prerequisites
 - [uv](https://github.com/astral-sh/uv) package manager
-- Anthropic, OpenAI, or Ollama API Key
-- Tavily API Key (for web search)
+- At least one LLM provider key: Anthropic, OpenRouter, OpenAI, or Google (Ollama also supported for local models)
+- Tavily API key (for web search — the `research` subagent uses it)
 
 ### Setup
 ```bash
-# 1. Install dependencies
-uv sync
+# 1. Install dependencies (add --extra ui for the Streamlit app)
+uv sync --extra dev
+uv sync --extra ui
 
-# 2. Configure environment
-cp .env.example .env
-# Edit .env with your API keys
+# 2. Create .env in the repo root with your keys
 ```
 
+There is no `.env.example`; create `.env` directly:
+
+```dotenv
+ANTHROPIC_API_KEY=sk-...
+TAVILY_API_KEY=tvly-...
+```
+
+### Configuration (all optional — sensible defaults)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `*_MODEL` | provider default | Override the chosen model (`ANTHROPIC_MODEL`, `OPENAI_MODEL`, …) |
+| `TAVILY_API_KEY` | — | Web search tool |
+| `WORKSPACE_ROOT` | `./workspace` | Relocate the workspace directory |
+| `AGENT_MAX_ITERATIONS` | `25` | Orchestrator loop budget per turn |
+| `AGENT_MAX_SUBAGENT_DEPTH` | `3` | Max delegation nesting (child runs at parent+1) |
+| `MAX_PARALLEL_TASKS` | `4` | Concurrent subagent tasks |
+| `SUBAGENT_TIMEOUT_SECONDS` | `600` | Shared deadline per task batch |
+| `OBSERVABILITY=1` | off | Attach the `DeepAgentTracer` callback handler to all models |
+| `MCP_SERVERS` | — | JSON object of MCP servers (read at call time) |
+| `A2A_AGENTS` | — | JSON object of remote agents (read at import — restart to change) |
+
+Model provider priority: **Anthropic → OpenRouter → OpenAI → Google → Ollama** (first key present wins).
+
 ### Running the Application
-**Streamlit UI (Recommended):**
+
+**CLI REPL:**
+```bash
+uv run python main.py
+```
+
+**Streamlit UI:**
 ```bash
 uv run streamlit run app.py
 ```
 
-**CLI Usage:**
+**Programmatically** (the checkpointer owns history — pass only the new message plus a fresh iteration budget and a thread id):
+
 ```python
-from agent import get_deep_agent
 from langchain_core.messages import HumanMessage
+from agent import get_deep_agent
 
 agent = get_deep_agent()
-result = agent.invoke({
-    "messages": [HumanMessage(content="Research the latest trends in AI agents.")],
-    "current_plan": [],
-    "workspace_files": [],
-    "audit_log": [],
-    "token_usage": {},
-    "iteration_count": 0,
-    "max_iterations": 10,
-    "max_tokens": 5000
-})
-print(result["messages"][-1].content)
+config = {"configurable": {"thread_id": "my-thread"}}
+
+result = agent.invoke(
+    {"messages": [HumanMessage(content="Research AI agents and draft a blog post.")],
+     "iteration_count": 0},
+    config=config,
+)
 ```
+
+> Don't pass full `messages` from a new caller — the history comes from the checkpoint. Subagent invocations use their own thread ids to avoid cross-contaminating checkpoints.
 
 ---
 
 ## ➕ Adding Skills
 
-Create a new directory under `skills/` following the [Agent Skills spec](https://agentskills.io/specification):
+Create a new directory under `skills/`:
 
 ```text
 skills/
@@ -179,23 +212,32 @@ description: >
 2. Step two...
 ```
 
-The agent automatically discovers new skills at runtime — no code changes needed.
+The agent discovers new skills at runtime — no code changes needed (summaries are cached and invalidated on filesystem changes).
+
+## ➕ Adding Subagents
+
+Add one `SubagentSpec` entry to `_BUILTIN_SUBAGENTS` in `src/core/subagents.py`:
+
+```python
+"translator": SubagentSpec(
+    description="Translates workspace documents; reads the source file and writes the translation.",
+    kind="tool_loop",
+    parallelizable=True,
+    skill="translator",
+    tools=("read_file", "write_file"),
+),
+```
+
+The `task` tool schema, docstring, dispatch, and parallel grouping all pick it up automatically.
 
 ---
 
-## 🧪 How to Test
+## 🧪 Testing & Development
 
-Submit a complex prompt that requires multiple skills:
-> *"Research the impact of multi-agent systems on software engineering and draft a 500-word blog post."*
+```bash
+uv run pytest                # 148 tests — no API keys or network needed
+uv run ruff check .          # lint
+uv run mypy src              # type check
+```
 
-Watch in the Streamlit sidebar:
-- **Current Plan** — updates as `write_todos` is called
-- **Active Skills** — lists discovered skills from `skills/`
-- **Workspace Files** — shows files written to `./workspace/`
-- **Shared Memory** — contents of `AGENTS.md`
-
----
-
-## 📋 Project Conventions
-
-See [`AGENTS.md`](./AGENTS.md) for shared project context, entity roles, and conventions that are automatically injected into every agent's system prompt.
+Tests use `tests/fake_models.py::ScriptedChatModel`, a deterministic fake LLM installed via `monkeypatch`, so the whole graph runs with no real API calls. External-integration tests patch the async bridge with plain event loops, so no MCP/A2A servers are spawned.

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync --extra dev          # runtime deps + pytest/ruff/mypy (streamlit is the separate `ui` extra)
-uv run pytest                # full suite (119 tests; no API keys or network needed)
+uv run pytest                # full suite (no API keys or network needed)
 uv run pytest tests/test_routing.py::test_name   # single test
 uv run ruff check .          # lint
 uv run mypy src              # type check
