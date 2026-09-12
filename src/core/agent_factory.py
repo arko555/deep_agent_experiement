@@ -17,6 +17,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langchain_openrouter import ChatOpenRouter
 from langchain_ollama import ChatOllama
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage, AIMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -30,13 +31,13 @@ from src.core.config import (
     get_subagent_timeout_seconds,
 )
 from src.core.subagents import is_parallelizable
+from src.core.mcp_client import clear_mcp_tools_cache
 from src.core.memory import get_workspace_files, get_system_prompt
 from src.core.routing import (
     route_from_orchestrator,
     route_from_critic,
     route_from_plan_checker,
     route_from_reflection,
-    route_after_tools,
 )
 from src.core.utils import invoke_with_retry
 from src.core.tools import get_all_tools, _execute_task
@@ -58,65 +59,61 @@ load_dotenv()
 _compiled_graph = None
 
 
-# --- Observability Hooks (4.4) ---
-# Configurable tracing callbacks for monitoring LLM calls, tool executions,
-# and state transitions. Enable via OBSERVABILITY=1 env var.
+# --- Observability Hooks (4.4, made real in 8.3) ---
+# Real LangChain callback handler for monitoring LLM calls, tool executions,
+# and chain invocations. Enable via OBSERVABILITY=1 env var; attached to model
+# invocations via with_config(callbacks=[...]), so events are recorded
+# wherever the model is invoked (orchestrator, reviewers, subagent loops).
 
-class DeepAgentTracer:
-    """Trace LLM invocations, tool calls, and state transitions for debugging."""
+class DeepAgentTracer(BaseCallbackHandler):
+    """Records LLM invocation, tool call, and chain events for debugging."""
 
     def __init__(self):
+        super().__init__()
         self._events: list[dict] = []
 
-    def on_chat_model_start(self, name: str, messages: list, **kwargs):
+    def _record(self, event_type: str, **data):
+        data.setdefault("timestamp", datetime.now().isoformat())
+        self._events.append({"type": event_type, **data})
+
+    @staticmethod
+    def _name(serialized: dict | None, kwargs) -> str:
+        return (serialized or {}).get("name") or kwargs.get("name") or "unknown"
+
+    # Chat models (ChatAnthropic/ChatOpenAI/etc. all emit chat_model events)
+    def on_chat_model_start(self, serialized: dict, messages: list, **kwargs):
         self._record(
-            type="chat_model_start",
-            name=name,
-            message_count=len(messages),
-            timestamp=datetime.now().isoformat(),
+            "chat_model_start",
+            name=self._name(serialized, kwargs),
+            message_count=len(messages or []),
         )
 
-    def on_chat_model_end(self, name: str, **kwargs):
-        self._record(
-            type="chat_model_end",
-            name=name,
-            timestamp=datetime.now().isoformat(),
-        )
+    def on_chat_model_end(self, response, **kwargs):
+        self._record("chat_model_end")
 
-    def on_tool_start(self, name: str, args: dict, **kwargs):
-        self._record(
-            type="tool_start",
-            name=name,
-            args=args,
-            timestamp=datetime.now().isoformat(),
-        )
+    # Non-chat LLMs, for parity (on_llm_* fires for BaseLLM subclasses)
+    def on_llm_start(self, serialized: dict, prompts: list, **kwargs):
+        self._record("llm_start", name=self._name(serialized, kwargs))
 
-    def on_tool_end(self, name: str, output: str, **kwargs):
-        self._record(
-            type="tool_end",
-            name=name,
-            output_length=len(str(output)),
-            timestamp=datetime.now().isoformat(),
-        )
+    def on_llm_end(self, response, **kwargs):
+        self._record("llm_end")
 
-    def on_chain_start(self, name: str, inputs: dict, **kwargs):
-        self._record(
-            type="chain_start",
-            name=name,
-            input_keys=list(inputs.keys()) if isinstance(inputs, dict) else [],
-            timestamp=datetime.now().isoformat(),
-        )
+    # Tool executions
+    def on_tool_start(self, serialized: dict, input_str: str, **kwargs):
+        self._record("tool_start", name=self._name(None, kwargs))
 
-    def on_chain_end(self, name: str, outputs: dict, **kwargs):
-        self._record(
-            type="chain_end",
-            name=name,
-            output_keys=list(outputs.keys()) if isinstance(outputs, dict) else [],
-            timestamp=datetime.now().isoformat(),
-        )
+    def on_tool_end(self, output, **kwargs):
+        self._record("tool_end", name=self._name(None, kwargs),
+                     output_length=len(str(output)))
 
-    def _record(self, **data):
-        self._events.append(data)
+    # Chain / graph steps
+    def on_chain_start(self, serialized: dict, inputs: dict, **kwargs):
+        keyset = list(inputs.keys()) if isinstance(inputs, dict) else []
+        self._record("chain_start", name=self._name(serialized, kwargs),
+                     input_keys=keyset)
+
+    def on_chain_end(self, outputs, **kwargs):
+        self._record("chain_end")
 
     def get_events(self) -> list[dict]:
         return list(self._events)
@@ -133,39 +130,69 @@ def get_tracer() -> DeepAgentTracer | None:
     return _tracer
 
 
+def _maybe_attach_callbacks(model):
+    """Wrap a model with the observability callback when enabled (8.3).
+
+    ``with_config`` merges the callbacks into every downstream invoke, so
+    orchestrator, reviewer, and subagent-loop calls all record events without
+    each call site passing callbacks itself.
+    """
+    if _tracer is not None:
+        return model.with_config(callbacks=[_tracer])
+    return model
+
+
 # --- Model Selection ---
 def get_model():
+    """Return the configured model, with the observability callback attached
+    when OBSERVABILITY=1 (8.3). Provider clients are cached per configuration
+    (8.5); the callback wrap is cheap and applied per call."""
+    return _maybe_attach_callbacks(_get_cached_model())
+
+
+_model_cache: dict[tuple, object] = {}
+
+
+def _cache_key(provider: str, model_name: str) -> tuple:
+    return (provider, model_name)
+
+
+def _get_cached_model():
+    """Build one provider client per (provider, model) configuration.
+
+    The cache lives for the process lifetime and is cleared by
+    reset_deep_agent(), so a config change requires an explicit reset — same
+    contract as the compiled-graph cache."""
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
     openrouter_key = os.getenv("OPENROUTER_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
 
     if anthropic_key:
-        return ChatAnthropic(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"),
-            temperature=0,
-        )
+        key = _cache_key("anthropic", os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
+        if key not in _model_cache:
+            _model_cache[key] = ChatAnthropic(model=key[1], temperature=0)
+        return _model_cache[key]
     elif openrouter_key:
-        return ChatOpenRouter(
-            model=os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-            api_key=openrouter_key,
-            temperature=0,
-        )
+        key = _cache_key("openrouter", os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"))
+        if key not in _model_cache:
+            _model_cache[key] = ChatOpenRouter(model=key[1], api_key=openrouter_key, temperature=0)
+        return _model_cache[key]
     elif openai_key:
-        return ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-            temperature=0,
-        )
+        key = _cache_key("openai", os.getenv("OPENAI_MODEL", "gpt-4o"))
+        if key not in _model_cache:
+            _model_cache[key] = ChatOpenAI(model=key[1], temperature=0)
+        return _model_cache[key]
     elif google_key:
-        return ChatGoogleGenerativeAI(
-            model=os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"),
-            temperature=0,
-        )
+        key = _cache_key("google", os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"))
+        if key not in _model_cache:
+            _model_cache[key] = ChatGoogleGenerativeAI(model=key[1], temperature=0)
+        return _model_cache[key]
     else:
-        return ChatOllama(
-            model="gemma4:12b-mlx",
-            temperature=0.0,
-        )
+        key = _cache_key("ollama", "gemma4:12b-mlx")
+        if key not in _model_cache:
+            _model_cache[key] = ChatOllama(model="gemma4:12b-mlx", temperature=0.0)
+        return _model_cache[key]
 
 
 # --- Graph Wrapper Nodes ---
@@ -375,15 +402,8 @@ def local_reflection_node(state: AgentState):
 
 # --- Graph Construction ---
 
-def get_deep_agent(
-    enable_observability: bool | None = None,
-):
-    """Return the compiled deep agent graph (cached after first call).
-
-    Args:
-        enable_observability: Whether to enable tracing callbacks. Defaults
-        to the OBSERVABILITY env var.
-    """
+def get_deep_agent():
+    """Return the compiled deep agent graph (cached after first call)."""
     global _compiled_graph
     if _compiled_graph is not None:
         return _compiled_graph
@@ -461,72 +481,22 @@ def get_deep_agent(
     # Responder delivers the final answer.
     workflow.add_edge("responder", END)
 
-    # --- 4.4: Observability — compile with tracing callbacks when enabled ---
+    # --- Compile with checkpointer. Observability (8.3) is attached at the
+    # model level via _maybe_attach_callbacks, so no per-node hooking here. ---
     checkpointer = MemorySaver()
-
-    if enable_observability is None:
-        enable_observability = os.getenv("OBSERVABILITY") == "1"
-
-    if enable_observability:
-        # LangGraph supports trace via the tracer parameter on compile.
-        # We wrap the graph with callback hooks for state transitions.
-        _compiled_graph = workflow.compile(
-            checkpointer=checkpointer,
-        )
-        # Patch in observability by wrapping node invocations.
-        _apply_observability_hooks(_compiled_graph)
-    else:
-        _compiled_graph = workflow.compile(checkpointer=checkpointer)
-
+    _compiled_graph = workflow.compile(checkpointer=checkpointer)
     return _compiled_graph
 
 
 def reset_deep_agent():
-    """Invalidate the cached compiled graph.
+    """Invalidate the cached compiled graph, model clients, and MCP tools.
 
     Call this when tools, skills, system prompts, or model configuration
     change and you need a fresh graph. The next call to ``get_deep_agent()``
-    will compile a new instance.
+    will compile a new instance and rebuild provider clients (8.5) and MCP
+    tools (10.1).
     """
     global _compiled_graph
     _compiled_graph = None
-
-
-def _apply_observability_hooks(graph):
-    """Wrap graph execution with observability hooks for tracing.
-
-    This patches the graph's underlying node execution to emit trace events
-    via the global tracer when observability is enabled.
-    """
-    if _tracer is None:
-        return
-
-    # Store original node functions so we can wrap them.
-    original_nodes = {}
-
-    # LangGraph stores nodes internally; we intercept at the state level
-    # by adding a pre/post hook via the audit_log mechanism already in place.
-    # The tracer captures LLM-level events via LangChain's callback system
-    # and tool-level events via the audit_log.
-    def _trace_state_transition(state_before: AgentState, state_after: AgentState):
-        """Track state changes between graph steps."""
-        changes = {}
-        all_keys = set(list(state_before.keys()) + list(state_after.keys()))
-        for key in all_keys:
-            old_val = state_before.get(key)
-            new_val = state_after.get(key)
-            if old_val != new_val:
-                changes[key] = {
-                    "from": str(old_val)[:200],
-                    "to": str(new_val)[:200],
-                }
-        if changes:
-            _tracer._record(
-                type="state_transition",
-                changed_keys=list(changes.keys()),
-                timestamp=datetime.now().isoformat(),
-            )
-
-    # The hook is registered as a post-processing step on the audit_log.
-    # Since audit_log entries are already emitted by nodes, we augment them.
-    graph._tracer = _tracer
+    _model_cache.clear()
+    clear_mcp_tools_cache()

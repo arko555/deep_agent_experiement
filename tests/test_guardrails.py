@@ -2,7 +2,8 @@
 
 import pytest
 
-from src.core.guardrails import validate_and_normalize_path
+from src.core.guardrails import validate_and_normalize_path, validate_read_path
+from src.core.tools import read_file
 
 
 # ---------------------------------------------------------------------------
@@ -82,3 +83,60 @@ class TestValidatePathNonStrictRedirect:
         result = validate_and_normalize_path("../../etc/hosts")
         # normpath resolves ".." so the basename is "hosts"
         assert result == "hosts"
+
+
+# ---------------------------------------------------------------------------
+# 7.3: Default-deny read allowlist
+# ---------------------------------------------------------------------------
+
+class TestValidateReadPath:
+
+    def test_workspace_path_allowed(self):
+        assert validate_read_path("workspace/a.md") == "workspace/a.md"
+
+    def test_workspace_dot_slash_normalized(self):
+        assert validate_read_path("./workspace/a.md") == "workspace/a.md"
+
+    def test_skills_path_allowed(self):
+        assert validate_read_path("skills/research/SKILL.md") == "skills/research/SKILL.md"
+
+    def test_agents_md_allowed(self):
+        assert validate_read_path("AGENTS.md") == "AGENTS.md"
+
+    def test_dot_slash_agents_md_allowed(self):
+        assert validate_read_path("./AGENTS.md") == "AGENTS.md"
+
+    @pytest.mark.parametrize("path", [
+        ".env",
+        "./.env",
+        "src/core/tools.py",
+        "../../etc/passwd",
+        "/etc/shadow",
+        "workspace/../config.yaml",  # normalizes OUT of the allowlist
+    ])
+    def test_outside_allowlist_denied(self, path):
+        with pytest.raises(ValueError, match="Access denied"):
+            validate_read_path(path)
+
+
+class TestReadFileSandbox:
+
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "notes.md").write_text("hello workspace")
+        (tmp_path / ".env").write_text("SECRET=1")
+
+    def test_read_file_denies_env(self):
+        result = read_file.invoke({"path": "./.env"})
+        assert result.startswith("Access denied")
+        assert "workspace" in result and "skills" in result
+
+    def test_read_file_allows_workspace(self):
+        result = read_file.invoke({"path": "workspace/notes.md"})
+        assert result == "hello workspace"
+
+    def test_read_file_missing_file_still_reports_missing(self):
+        result = read_file.invoke({"path": "workspace/nope.md"})
+        assert "does not exist" in result

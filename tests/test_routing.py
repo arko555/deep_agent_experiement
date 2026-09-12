@@ -4,7 +4,6 @@ import pytest
 
 from src.core.routing import (
     route_from_orchestrator,
-    route_after_tools,
     route_from_critic,
     route_from_reflection,
     route_from_plan_checker,
@@ -25,7 +24,6 @@ def _state(**kwargs):
         "review_verdict": None,
         "recursion_depth": 0,
         "pending_writes": [],
-        "requires_approval": False,
         "audit_log": [],
         "token_usage": {},
         "iteration_count": 0,
@@ -46,7 +44,8 @@ class TestRouteFromOrchestrator:
 
     def test_tool_calls_route_to_agent(self):
         from langchain_core.messages import AIMessage
-        msg = AIMessage(content="hello", tool_calls=[{"name": "search"}])
+        tool_calls = [{"name": "search", "args": {}, "id": "call_1"}]
+        msg = AIMessage(content="hello", tool_calls=tool_calls)
         state = _state(next_message=msg)
         assert route_from_orchestrator(state) == "agent"
 
@@ -84,28 +83,6 @@ class TestRouteFromOrchestrator:
             current_plan=["should not route to checker"],
         )
         assert route_from_orchestrator(state) == "responder"
-
-
-# ---------------------------------------------------------------------------
-# route_after_tools
-# ---------------------------------------------------------------------------
-
-class TestRouteAfterTools:
-
-    def test_always_returns_to_orchestrator(self):
-        """Tools always return to orchestrator; no HITL pause."""
-        state = _state(pending_writes=[])
-        assert route_after_tools(state) == "orchestrator"
-
-    def test_pending_writes_does_not_route_to_file_approval(self):
-        """Pending writes are audit-only; they no longer trigger a HITL pause."""
-        state = _state(pending_writes=[{"tool": "write_file", "tool_id": "1"}])
-        assert route_after_tools(state) == "orchestrator"
-
-    def test_none_pending_writes_returns_to_orchestrator(self):
-        state = _state()
-        del state["pending_writes"]
-        assert route_after_tools(state) == "orchestrator"
 
 
 # ---------------------------------------------------------------------------

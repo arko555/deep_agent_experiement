@@ -2,7 +2,7 @@ from typing import Dict
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from src.state import AgentState
 from src.core.memory import get_memory_content
-from src.core.utils import get_message_text
+from src.core.utils import get_message_text, invoke_with_retry
 
 def call_agent_node(state: AgentState) -> dict:
     """
@@ -69,7 +69,9 @@ def call_critic_node(state: AgentState, model) -> dict:
     if staged is not None:
         review_messages.append(staged)
 
-    response = model.invoke(review_messages)
+    # Shared retry wrapper (8.2): a transient 429 during review should back
+    # off and retry, like the orchestrator and tools paths, not crash the run.
+    response = invoke_with_retry(model, review_messages)
     content_str = get_message_text(response.content)
 
     if content_str.strip().upper().startswith("APPROVED"):
@@ -124,7 +126,7 @@ Instructions:
 """
 
     review_messages = [SystemMessage(content=system_prompt)] + list(messages)
-    response = model.invoke(review_messages)
+    response = invoke_with_retry(model, review_messages)
 
     return {
         "next_message": response,
@@ -158,7 +160,7 @@ def call_plan_checker_node(state: AgentState, model) -> dict:
     if staged is not None:
         review_messages.append(staged)
 
-    response = model.invoke(review_messages)
+    response = invoke_with_retry(model, review_messages)
     content_str = get_message_text(response.content)
 
     if content_str.strip().upper().startswith("COMPLIANT"):

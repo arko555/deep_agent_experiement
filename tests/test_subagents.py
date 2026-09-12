@@ -220,9 +220,8 @@ class TestRegistryDrivesDispatch:
             calls["tools"] = [t.name for t in loop_tools]
             return "done", {"input": 1, "output": 1}, []
 
-        toolset = {t.name: t for t in (
-            tools_mod.internet_search, tools_mod.read_file, tools_mod.write_file
-        )}
+        # Production passes the parent's visible tools (all built-ins here).
+        toolset = tools_mod.get_all_tools()
         with patch.object(tools_mod, "run_tool_loop", side_effect=fake_run):
             text, usage, write_ops = tools_mod._execute_task(
                 "researcher", "find x", 0, toolset)

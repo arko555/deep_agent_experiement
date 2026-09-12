@@ -13,7 +13,7 @@ license: MIT
 This skill provides advanced writing capabilities, focusing on clarity, engagement, and proper formatting.
 
 ## Instructions
-1. Review the input notes or research data provided.
+1. Review the input notes or research data provided — use `list_files` to see what is in `./workspace` and `search_files` to locate a specific note; never guess paths.
 2. Define an outline for the content (Introduction, Body, Conclusion).
 3. Use a tone appropriate for the target audience (e.g., technical but accessible).
 4. Ensure all claims are backed by the provided data.

@@ -16,10 +16,11 @@ This skill provides structured web research capabilities. It handles breaking do
 
 ## Instructions
 1. Parse the research query to identify key topics and missing information.
-2. Use the `internet_search` tool to gather initial results.
-3. If results are insufficient, try alternative search queries.
-4. Synthesize the findings into a clear, structured summary, prioritizing factual accuracy and depth.
-5. Save the detailed findings to the `./workspace` directory as a markdown file.
+2. Use the `internet_search` tool to gather initial results (results are ~300-char snippets).
+3. For pages that matter, use `fetch_url` to get the full page content before summarizing them.
+4. If results are insufficient, try alternative search queries.
+5. Synthesize the findings into a clear, structured summary, prioritizing factual accuracy and depth.
+6. Check what already exists in `./workspace` with `list_files` (and `search_files` to locate a specific note), then save your findings as a markdown file there — never guess a path that may already be taken by another subagent.
 
 ## Completion
 End with a final markdown summary containing:

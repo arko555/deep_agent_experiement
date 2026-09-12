@@ -67,7 +67,7 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 
 **Files affected:** `src/nodes/review.py`, `src/core/agent_factory.py`, `src/core/routing.py`
 
-> ⚠️ **Audit correction (2026-08-25):** the 4.4 implementation is a stub — `DeepAgentTracer`'s methods are never registered as callbacks and OBSERVABILITY=1 emits zero events. See Gap Audit item C3 and Phase 8.3.
+> ⚠️ **Audit correction (2026-08-25):** the 4.4 implementation is a stub — `DeepAgentTracer`'s methods are never registered as callbacks and OBSERVABILITY=1 emits zero events. See Gap Audit item C3 and Phase 8.3. ✅ Resolved in 8.3 (2026-09-12): `DeepAgentTracer` is a real `BaseCallbackHandler` attached via `get_model()`, recording actual events (fake-model test in `tests/test_observability.py`).
 
 ---
 
@@ -154,13 +154,13 @@ Make subagents data, not code paths: one registry drives the `task` tool schema,
 
 ---
 
-## Phase 7: Tool System Hardening & Workspace Navigation ⬜
+## Phase 7: Tool System Hardening & Workspace Navigation ✅
 
-- ⬜ **7.1** Cache dynamic tool loading — same mtime-hash invalidation pattern as the skills cache; `get_all_tools()` must not re-execute `./tools/*.py` when nothing changed (Audit B6).
-- ⬜ **7.2** Validate dynamic tools — warn on modules that define no `@tool` functions; built-ins win name collisions with a logged warning; unique module names so subdirectories can't collide (Audit B7).
-- ⬜ **7.3** Sandbox reads (default-deny) — restrict `read_file` to an allowlist: `./workspace`, `./skills`, `./AGENTS.md`; deny everything else with a message stating what's allowed; symmetric with the write sandbox. Tests in `test_guardrails.py` (Audit B8).
-- ⬜ **7.4** Navigation tools — add `list_files` (workspace tree) and `search_files` (substring match across workspace files); wire both into research/writer toolsets via the registry so subagents stop guessing paths (Audit B9).
-- ⬜ **7.5** *(optional)* `fetch_url` — full page fetch for the research subagent so research goes beyond 300-char snippets (httpx; response size cap + timeout; add dependency) (Audit B10).
+- ✅ **7.1** Cache dynamic tool loading — same mtime-hash invalidation pattern as the skills cache; `get_all_tools()` must not re-execute `./tools/*.py` when nothing changed (Audit B6).
+- ✅ **7.2** Validate dynamic tools — warn on modules that define no `@tool` functions; built-ins win name collisions with a logged warning; unique module names so subdirectories can't collide (Audit B7).
+- ✅ **7.3** Sandbox reads (default-deny) — restrict `read_file` to an allowlist: `./workspace`, `./skills`, `./AGENTS.md`; deny everything else with a message stating what's allowed; symmetric with the write sandbox. Tests in `test_guardrails.py` (Audit B8).
+- ✅ **7.4** Navigation tools — add `list_files` (workspace tree) and `search_files` (substring match across workspace files); wire both into research/writer toolsets via the registry so subagents stop guessing paths (Audit B9).
+- ✅ **7.5** *(optional)* `fetch_url` — full page fetch for the research subagent so research goes beyond 300-char snippets (httpx; response size cap + timeout; add dependency) (Audit B10).
 
 **Files affected:** `src/core/tools.py`, `src/core/guardrails.py`, `src/core/subagents.py` (registry toolsets), `tests/test_guardrails.py`, `pyproject.toml` (7.5 only)
 
@@ -168,26 +168,26 @@ Make subagents data, not code paths: one registry drives the `task` tool schema,
 
 ---
 
-## Phase 8: Correctness & Consistency ⬜
+## Phase 8: Correctness & Consistency ✅
 
-- ⬜ **8.1** Truthful orchestrator prompt — pass the real tools dict into `get_system_prompt(tools_dict=...)` so "Available Tools" reflects what's actually bound; remove or wire the dead `role=` branch. Test: with tools present, the prompt contains no `No tools available.` (Audit C11).
-- ⬜ **8.2** Shared retry on all LLM calls — route critic / plan_checker / reflection through `invoke_with_retry` like the orchestrator and tools paths do (Audit C12).
-- ⬜ **8.3** Observability: make it real or remove it — either implement `DeepAgentTracer` as a proper `BaseCallbackHandler` passed via invoke/stream `config={"callbacks": [...]}` so OBSERVABILITY=1 records real events (with a test using a fake model), or delete the class, the hooks, and the 4.4 ✅ claim. No more stubs (Audit C13).
-- ⬜ **8.4** Remove dead state/code — drop `AgentState.max_tokens` and `requires_approval` (never read in production) and the unused `route_after_tools` function with its tests; if a token *budget* is actually wanted later, that's a new feature with its own phase, not a dead field (Audit C14).
-- ⬜ **8.5** Cache model instances — build one provider client per model configuration, reused by orchestrator/reviewers/subagent loops, invalidated by `reset_deep_agent()` (Audit C15).
+- ✅ **8.1** Truthful orchestrator prompt — pass the real tools dict into `get_system_prompt(tools_dict=...)` so "Available Tools" reflects what's actually bound; remove or wire the dead `role=` branch. Test: with tools present, the prompt contains no `No tools available.` (Audit C11). (`role=` branch was already removed in 6.2.)
+- ✅ **8.2** Shared retry on all LLM calls — route critic / plan_checker / reflection through `invoke_with_retry` like the orchestrator and tools paths do (Audit C12).
+- ✅ **8.3** Observability: make it real or remove it — `DeepAgentTracer` is now a real `BaseCallbackHandler`, attached via `_maybe_attach_callbacks` (`model.with_config(callbacks=[...])`) inside `get_model()`, so OBSERVABILITY=1 records real chat/tool/chain events on every model path (orchestrator, reviewers, subagent loops). Verified by fake-model test; stub `_apply_observability_hooks` deleted. (Audit C13)
+- ✅ **8.4** Remove dead state/code — drop `AgentState.max_tokens` and `requires_approval` (never read in production) and the unused `route_after_tools` function with its tests (Audit C14).
+- ✅ **8.5** Cache model instances — `_get_cached_model()` builds one provider client per (provider, model) configuration, reused by orchestrator/reviewers/subagent loops, cleared by `reset_deep_agent()` (Audit C15).
 
-**Files affected:** `src/nodes/plan.py`, `src/core/memory.py`, `src/nodes/review.py`, `src/core/agent_factory.py`, `src/state.py`, `src/core/routing.py`, `tests/test_routing.py` (8.4)
+**Files affected:** `src/nodes/plan.py`, `src/core/memory.py` (no change needed — 8.1 only required the caller), `src/nodes/review.py`, `src/core/agent_factory.py`, `src/state.py`, `src/core/routing.py`, `tests/test_routing.py`, new `tests/test_plan.py`, `tests/test_review.py`, `tests/test_observability.py`; `tests/test_state.py` fixtures updated (8.4)
 
 **Success criteria:** prompt assertion test passes; fake-model test — one transient failure then success in each reviewer path completes instead of crashing; OBSERVABILITY=1 run either records events (asserted by test) or the feature is removed and this doc updated to match.
 
 ---
 
-## Phase 9: Multi-Agent Integration Tests ⬜
+## Phase 9: Multi-Agent Integration Tests ✅
 
 Current tests cover nodes and routing in isolation; the delegation contract itself is untested end-to-end.
 
-- ⬜ **9.1** Graph-level delegation test — fake orchestrator emitting `task` tool calls through the compiled graph: assert ToolMessage results returned, child token usage aggregated into parent `token_usage`, child file writes merged into `pending_writes`, and depth rejection at the configured limit (Audit D16).
-- ⬜ **9.2** Parallel batch behavior — two research tasks in one turn: deterministic ToolMessage ordering, distinct output files on disk, and the shared deadline from 6.6 honored (Audit A4/A5).
+- ✅ **9.1** Graph-level delegation test — fake orchestrator emitting `task` tool calls through the compiled graph: assert ToolMessage results returned, child token usage aggregated into parent `token_usage`, child file writes merged into `pending_writes`, and depth rejection at the configured limit (Audit D16).
+- ✅ **9.2** Parallel batch behavior — two research tasks in one turn: deterministic ToolMessage ordering, distinct output files on disk, and the shared deadline from 6.6 honored (Audit A4/A5).
 
 **Files affected:** new `tests/test_delegation.py`, fake-model test helpers under `tests/`
 
@@ -195,15 +195,27 @@ Current tests cover nodes and routing in isolation; the delegation contract itse
 
 ---
 
-## Phase 10: Optional Stretch — External Tools via MCP ⬜
+## Phase 10: External Tools via MCP + Remote Subagents via A2A ✅
 
-Only if external tool sources are wanted; skip otherwise.
+- ✅ **10.1** MCP tool connectivity — `src/core/mcp_client.py` loads tools from configured MCP servers (`MCP_SERVERS` env var, JSON) into the same registry as built-ins, with config-hash caching and `clear_mcp_tools_cache()` wired into `reset_deep_agent()`. Tools appear in `list_tools` and are callable by the orchestrator and subagent toolsets with no per-server code changes. Precedence: built-ins > MCP > dynamic file tools, with logged warnings on collision.
+- ✅ **10.2** A2A remote subagents — `src/core/a2a_client.py` calls remote agents over the A2A protocol; configured via the `A2A_AGENTS` env var (JSON) and registered as `kind="a2a"` entries in `SUBAGENTS`, so they are invocable through the `task` tool and ride the existing parallel batch + shared deadline path.
+- ✅ **10.3** Sync bridge — `src/core/async_bridge.py` drives the async-only SDKs from the entirely synchronous graph (persistent event loop on a daemon thread, started lazily).
 
-- ⬜ **10.1** MCP tool connectivity — use `langchain-mcp-adapters` to load tools from configured MCP servers into the same registry with the same caching/validation treatment as built-ins (Phases 6.1/7.1/7.2). One configuration point (server commands/URLs), one place tools become visible to the orchestrator and subagent toolsets.
+**Files changed:** new `src/core/async_bridge.py`, `src/core/mcp_client.py`, `src/core/a2a_client.py`; `src/core/config.py` (`_env_json`, `get_mcp_servers`, `get_a2a_agents`), `src/core/subagents.py` (`SubagentSpec.url`, `kind="a2a"`, config-driven registry), `src/core/tools.py` (MCP tier, A2A dispatch), `src/core/agent_factory.py` (reset clears the MCP cache), `pyproject.toml`; new `tests/test_async_bridge.py`, `tests/test_mcp.py`, `tests/test_a2a.py`
 
-**Files affected:** `src/core/tools.py`, `src/core/config.py`, `pyproject.toml`
+**Success criteria:** an MCP server's tools appear in `list_tools` and are callable with no per-server code changes (verified with a fake client); a configured A2A agent appears in the `task` tool's enum and dispatches to the remote agent (verified with a fake A2A client, plus an import-time subprocess test).
 
-**Success criteria:** an MCP server's tools appear in `list_tools` and are callable by the orchestrator with no code changes per server.
+### The async problem (why 10.3 exists)
+
+Both SDKs are **async-only**, and the graph is **100% synchronous** (`invoke_with_retry` calls `.invoke()`, `local_tools_node` uses `ThreadPoolExecutor`). MCP tools are built with `coroutine=` and no sync `func`, so `tool.invoke()` raises `NotImplementedError` — settled upstream (issue #29; the sync-bridge PR #601 was closed unmerged). So MCP tools are re-wrapped as sync `StructuredTool`s that drive the original coroutine through the bridge, leaving every existing call site unchanged.
+
+### Known limitations
+
+- MCP `get_tools()` is connection-based, so a **stdio MCP server spawns a subprocess per tool call**. Correct and loop-agnostic, but slow.
+- MCP tool names are config-derived, so they are not auto-inherited by subagent toolsets — a `SubagentSpec.tools` tuple must name them explicitly to reach a subagent.
+- `A2A_AGENTS` is read at **import** time (it feeds the `task` tool's static type enum; `subagents.py` calls `load_dotenv()` itself, since it is imported before `agent_factory`'s). Changing A2A agents therefore needs a process restart, unlike `MCP_SERVERS`, which is read at call time.
+- A remote A2A agent reports no token usage and no local file writes, so it contributes nothing to `token_usage` or `pending_writes`.
+- `langchain-mcp-adapters` is upstream-deprecated in favour of `langchain[mcp]` (beta, equally async-only); the `<0.4` pin isolates that future migration to `mcp_client.py`.
 
 ---
 
@@ -255,3 +267,5 @@ START → orchestrator → {agent | critic | plan_checker | responder}
 | 2026-08-19 | Critical Fixes | Removed HITL/interrupt (incompatible with Streamlit — web framework can't block/resume), writes execute immediately with audit-only tracking, added `reset_deep_agent()` for cache invalidation, reflection clears `review_verdict` to prevent routing corruption |
 | 2026-08-25 | Gap Audit | Verified gaps vs "proper multi-agent system": scattered subagent definitions (A1), live `task` bypass (A2), unsandboxed `read_file` incl. `.env` (B8), orchestrator prompt claiming "No tools available." (C11), reviewers bypassing retry (C12), stub observability (C13), dead state fields/routing fn (C14); added Phases 6–9 and optional Phase 10 |
 | 2026-08-31 | Phase 6 | First-class subagent system: `SUBAGENTS` registry drives task schema/dispatch/parallel grouping; role prompts = completion contract + SKILL.md (duplicated node prompts deleted); `AGENT_MAX_SUBAGENT_DEPTH` config; direct `task` invoke refused; delegation file contract in orchestrator prompt; shared batch deadline for parallel tasks |
+| 2026-09-12 | Phases 7–9 | Phase 7 verified complete (dynamic-tool cache + validation, read-sandbox allowlist, list_files/search_files/fetch_url). Phase 8: truthful "Available Tools" in orchestrator prompt (8.1), reviewers routed through `invoke_with_retry` (8.2), `DeepAgentTracer` made a real `BaseCallbackHandler` attached via `get_model()` with the stub hooking deleted (8.3), dead state fields + `route_after_tools` removed (8.4), per-configuration model client cache cleared by `reset_deep_agent()` (8.5). Phase 9: graph-level delegation tests — ToolMessage results, child token-usage aggregation, `pending_writes` merge, depth cap, parallel ordering + shared batch deadline (`tests/test_delegation.py`, fake model in `tests/fake_models.py`). Also fixed 3 pre-existing test failures (strict-mode `..` check, tool-call fixture shape, summarization keep-count clamp) |
+| 2026-09-12 | Phase 10 | MCP tool connectivity + A2A remote subagents. Sync bridge (`async_bridge.py`) drives the async-only SDKs from the synchronous graph; MCP tools wrapped as sync `StructuredTool`s and cached by config hash, merged into `get_all_tools()` as a third tier; A2A agents config-driven into the `SUBAGENTS` registry as `kind="a2a"` so they are invocable via `task` and parallelize under the shared batch deadline. 29 new tests (fake MCP/A2A clients, real protobuf chunks, import-time subprocess check). Found and fixed a real bug in the process: `INPUT_REQUIRED`/`AUTH_REQUIRED` are non-terminal but never self-resolve, so polling them would hang the caller |

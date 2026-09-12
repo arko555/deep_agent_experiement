@@ -13,10 +13,20 @@ graph and is handled in ``tools._execute_task``.
 
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from src.core.config import get_a2a_agents
 from src.core.memory import get_memory_content, get_skill_body
 from src.core.utils import get_message_text, invoke_with_retry
+
+# A2A subagent types come from configuration, but the `task` tool's type enum
+# is built statically from this registry — so `.env` must be loaded before the
+# registry is assembled. Import order is tools -> subagents, which runs before
+# the load_dotenv() in agent_factory, hence the explicit call here. Consequence:
+# changing the configured A2A agents requires a process restart.
+load_dotenv()
 
 
 # ---------------------------------------------------------------------------
@@ -28,14 +38,15 @@ class SubagentSpec:
     """One subagent type, as registered in SUBAGENTS."""
 
     description: str   # surfaced in the `task` tool schema
-    kind: str          # "tool_loop" (restricted tools) or "graph" (full graph)
+    kind: str          # "tool_loop" (restricted tools), "graph" (full graph), or "a2a" (remote agent)
     parallelizable: bool = False  # may run concurrently with sibling tasks
     aliases: tuple = ()            # accepted alternate names for subagent_type
     skill: str | None = None       # skills/<skill>/SKILL.md — prompt source (tool_loop only)
     tools: tuple = ()              # tool names for the restricted toolset (tool_loop only)
+    url: str | None = None         # remote agent base URL (a2a only)
 
 
-SUBAGENTS: dict[str, SubagentSpec] = {
+_BUILTIN_SUBAGENTS: dict[str, SubagentSpec] = {
     "general-purpose": SubagentSpec(
         description="Full deep agent with all tools; use for complex or context-heavy sub-tasks.",
         kind="graph",
@@ -48,16 +59,37 @@ SUBAGENTS: dict[str, SubagentSpec] = {
         parallelizable=True,
         aliases=("researcher",),
         skill="research",
-        tools=("internet_search", "read_file", "write_file"),
+        tools=("internet_search", "fetch_url", "read_file", "write_file",
+               "list_files", "search_files"),
     ),
     "writer": SubagentSpec(
         description="Content writer: reads workspace notes and saves the draft to a file.",
         kind="tool_loop",
         parallelizable=True,
         skill="writer",
-        tools=("read_file", "write_file", "edit_file"),
+        tools=("read_file", "write_file", "edit_file", "list_files", "search_files"),
     ),
 }
+
+
+def _a2a_specs() -> dict[str, SubagentSpec]:
+    """Build a spec per configured remote A2A agent (the `A2A_AGENTS` env var).
+
+    Remote calls are independent of each other, so they are parallelizable and
+    ride the same batch deadline as the other parallelizable types.
+    """
+    return {
+        name: SubagentSpec(
+            description=config.get("description") or f"Remote A2A agent at {config['url']}.",
+            kind="a2a",
+            parallelizable=True,
+            url=config["url"],
+        )
+        for name, config in get_a2a_agents().items()
+    }
+
+
+SUBAGENTS: dict[str, SubagentSpec] = {**_BUILTIN_SUBAGENTS, **_a2a_specs()}
 
 
 def resolve_subagent(subagent_type: str) -> SubagentSpec | None:

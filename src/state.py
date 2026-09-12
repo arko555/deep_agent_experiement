@@ -10,9 +10,7 @@ class AgentState(TypedDict):
     review_verdict: Optional[str]                 # explicit verdict set by critic/plan_checker ("approved"|"rejected"|"compliant"|"violation")
     recursion_depth: int                          # tracks subagent nesting depth
     pending_writes: List[Dict]                    # staged write_file/edit_file ops awaiting human approval
-    requires_approval: bool                       # False for subagents (auto-approve workspace writes)
     audit_log: Annotated[List[Dict], add]        # structured log of actions and decisions
     token_usage: Dict[str, int]                  # tracking API consumption
     iteration_count: int                          # current loop count
     max_iterations: int                           # limit on loops
-    max_tokens: int                               # budget limit

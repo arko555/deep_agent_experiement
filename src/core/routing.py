@@ -29,16 +29,6 @@ def route_from_orchestrator(state: AgentState):
     return "critic"
 
 
-def route_after_tools(state: AgentState):
-    """Always return to orchestrator after tools execute.
-
-    Write operations (write_file, edit_file) execute immediately in the
-    tools node and are tracked in ``pending_writes`` for audit purposes only.
-    No HITL pause — the graph continues unblocked.
-    """
-    return "orchestrator"
-
-
 
 def route_from_critic(state: AgentState):
     # The critic node sets ``review_verdict`` explicitly.

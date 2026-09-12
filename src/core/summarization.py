@@ -64,8 +64,10 @@ def compress_messages(
     if len(messages) <= max_history:
         return list(messages)
 
-    # Messages to keep intact (most recent).
-    keep_count = max(min_keep, max_history // 2)
+    # Messages to keep intact (most recent). Clamped so the returned list
+    # stays within max_history + 1 items (summary included) and there is
+    # always at least one old message to summarize.
+    keep_count = min(max(min_keep, max_history // 2), max(0, max_history - 1))
     recent = list(messages[-keep_count:])
 
     # Messages to summarize (oldest).

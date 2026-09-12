@@ -28,7 +28,10 @@ def call_orchestrator(state: AgentState, model, tools: list, max_history_message
         error_msg = AIMessage(content="Maximum iterations reached. Stopping to prevent runaway execution.")
         return {"next_message": error_msg}
 
-    system_prompt = get_system_prompt()
+    # Pass the real tools so "Available Tools" matches what's actually bound
+    # this turn (8.1) — previously the prompt always claimed no tools.
+    tools_dict = {t.name: t for t in tools}
+    system_prompt = get_system_prompt(tools_dict=tools_dict)
     messages = state["messages"]
     # Compress old messages into a summary instead of silent truncation (5.4).
     # This preserves context the agent would otherwise lose.

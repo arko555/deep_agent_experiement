@@ -8,11 +8,16 @@ from typing import Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 def _dir_tree_hash(directory: str) -> str:
-    """Return a hex digest of (mtime, size) for every file under *directory*."""
+    """Return a hex digest of (mtime, size) for every file under *directory*.
+
+    ``__pycache__`` is ignored so bytecode written by dynamic module loading
+    doesn't churn the hash.
+    """
     parts = []
     if not os.path.exists(directory):
         return hashlib.md5(b"missing").hexdigest()
-    for root, _dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fname in files:
             fp = os.path.join(root, fname)
             try:

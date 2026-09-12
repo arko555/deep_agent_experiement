@@ -24,12 +24,10 @@ class TestAgentStateDefaults:
             "review_verdict",
             "recursion_depth",
             "pending_writes",
-            "requires_approval",
             "audit_log",
             "token_usage",
             "iteration_count",
             "max_iterations",
-            "max_tokens",
         ]
         # Just verify the TypedDict definition lists these keys.
         from typing import get_type_hints
@@ -52,12 +50,10 @@ def _build_state(**overrides):
         "review_verdict": None,
         "recursion_depth": 0,
         "pending_writes": [],
-        "requires_approval": False,
         "audit_log": [],
         "token_usage": {"input": 0, "output": 0, "total": 0},
         "iteration_count": 0,
         "max_iterations": 10,
-        "max_tokens": 100000,
     }
     state.update(overrides)
     return state

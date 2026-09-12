@@ -5,17 +5,23 @@ Import from here rather than duplicating inline in agent_factory.
 """
 
 import os
-import importlib
+import logging
+import importlib.util
 import inspect
 import uuid
-from typing import List, Literal, Dict
+from typing import List, Literal
 
+import httpx
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 
-from src.core.guardrails import validate_and_normalize_path
+from src.core.guardrails import validate_and_normalize_path, validate_read_path
+from src.core.mcp_client import load_mcp_tools
+from src.core.memory import _dir_tree_hash, get_workspace_files
 from src.core.rag import internet_search as raw_internet_search
 from src.core.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Built-in Tools
@@ -50,13 +56,15 @@ def internet_search(
 
 @tool
 def read_file(path: str) -> str:
-    """Read the content of a file. Use this to load SKILL.md dynamically or inspect workspace files."""
+    """Read a file. Only AGENTS.md and files under ./workspace or ./skills are readable."""
     try:
-        clean_path = validate_and_normalize_path(path, must_be_in_workspace=False)
+        clean_path = validate_read_path(path)
         if not os.path.exists(clean_path):
             return f"Error: File {clean_path} does not exist."
         with open(clean_path, "r") as f:
             return f.read()
+    except ValueError as e:
+        return str(e)
     except Exception as e:
         return f"Error reading file {path}: {str(e)}"
 
@@ -91,6 +99,75 @@ def edit_file(path: str, search_text: str, replace_text: str) -> str:
         return f"Successfully updated {clean_path}"
     except Exception as e:
         return f"Error editing file {path}: {str(e)}"
+
+
+@tool
+def list_files() -> str:
+    """List all files in the `./workspace` directory (relative paths, one per line).
+    Use this to see what research notes or drafts already exist before reading or writing."""
+    files = get_workspace_files()
+    if not files:
+        return "The workspace is empty."
+    return "\n".join(files)
+
+
+@tool
+def search_files(pattern: str, max_matches: int = 30) -> str:
+    """Search for a substring across all text files in `./workspace` and return matching lines.
+
+    Args:
+        pattern: The substring to search for (case-sensitive).
+        max_matches: Maximum number of matches to return (default 30).
+    """
+    files = get_workspace_files()
+    matches = []
+    for rel_path in files:
+        full_path = os.path.join("workspace", rel_path)
+        try:
+            with open(full_path, "r", errors="ignore") as f:
+                for line_no, line in enumerate(f, 1):
+                    if pattern in line:
+                        matches.append(f"{rel_path}:{line_no}: {line.rstrip()}")
+                        if len(matches) >= max_matches:
+                            break
+        except OSError:
+            continue
+        if len(matches) >= max_matches:
+            break
+    if not matches:
+        return f"No matches for '{pattern}' in workspace."
+    note = "" if len(matches) < max_matches else f"\n(truncated at {max_matches} matches)"
+    return "\n".join(matches) + note
+
+
+FETCH_URL_TIMEOUT_SECONDS = 15
+FETCH_URL_MAX_BYTES = 1_000_000  # ~1 MB; larger responses are truncated
+
+
+@tool
+def fetch_url(url: str) -> str:
+    """Fetch the full page content of a URL as text, for research beyond snippets.
+
+    Args:
+        url: The http(s) URL to fetch.
+    """
+    try:
+        with httpx.Client(timeout=FETCH_URL_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                chunks = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total <= FETCH_URL_MAX_BYTES:
+                        chunks.append(chunk)
+        truncated = total > FETCH_URL_MAX_BYTES
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+    except httpx.HTTPError as e:
+        return f"Error fetching {url}: {e}"
+    if truncated:
+        return text + f"\n[truncated: response exceeded {FETCH_URL_MAX_BYTES} bytes]"
+    return text
 
 
 # subagent_type values and the tool description are driven by the SUBAGENTS
@@ -190,6 +267,22 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int,
         )
         return text, usage, write_ops
 
+    if spec.kind == "a2a":
+        # Remote agent over the A2A protocol: send the task description and
+        # return its answer. A remote agent reports no token usage, and its
+        # file writes are not visible here, so both come back empty. Failures
+        # raise, and the caller turns them into a task error message.
+        # Imported lazily to keep the a2a SDK off the import path until used.
+        from src.core.a2a_client import call_a2a_agent
+
+        if not spec.url:
+            return (
+                f"Error: A2A subagent '{subagent_type}' has no url configured.",
+                {},
+                [],
+            )
+        return call_a2a_agent(spec.url, description), {}, []
+
     # kind == "graph": general-purpose subagent — use the cached compiled graph
     from src.core.agent_factory import get_deep_agent
     from src.core.config import get_max_iterations
@@ -233,35 +326,70 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int,
 # Dynamic Tool Loading (3.4: importlib instead of sys.path)
 # ---------------------------------------------------------------------------
 
-def load_dynamic_tools(tools_dir: str) -> Dict[str, tool]:
-    """Load tools from a directory using ``importlib.util.spec_from_file_location``.
+# 7.1: cache loaded dynamic tools with the same mtime-hash invalidation as the
+# skills cache, so get_all_tools() does not re-exec ./tools/*.py when unchanged.
+_dynamic_tools_cache: dict[str, BaseTool] | None = None
+_dynamic_tools_cache_key: str = ""
 
-    This avoids polluting ``sys.path`` and prevents import conflicts between
-    dynamically loaded modules and the rest of the application.
+
+def load_dynamic_tools(tools_dir: str) -> dict[str, BaseTool]:
+    """Load ``@tool`` functions from all ``.py`` files under *tools_dir*.
+
+    Uses ``importlib.util.spec_from_file_location`` so nothing is added to
+    ``sys.path``. Modules are exec'd once and cached; the cache is invalidated
+    by a (mtime, size) tree hash of the directory (7.1). Each module gets a
+    unique name derived from its path within *tools_dir*, so files in
+    subdirectories can't collide (7.2). Built-ins win tool-name collisions,
+    reported as a logged warning below.
     """
-    dynamic_tools = {}
-    if not os.path.exists(tools_dir):
-        return dynamic_tools
+    global _dynamic_tools_cache, _dynamic_tools_cache_key
 
-    for entry in os.listdir(tools_dir):
-        if not entry.endswith(".py"):
-            continue
-        filepath = os.path.join(tools_dir, entry)
-        module_name = entry[:-3]
+    # Include the absolute dir in the key: the tree hash covers relative paths
+    # only, so two checkouts with identical ./tools contents must not share cache.
+    key = os.path.abspath(tools_dir) + "|" + _dir_tree_hash(tools_dir)
+    if _dynamic_tools_cache is not None and key == _dynamic_tools_cache_key:
+        return _dynamic_tools_cache
 
-        try:
-            spec = importlib.util.spec_from_file_location(module_name, filepath)
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+    dynamic_tools: dict[str, BaseTool] = {}
+    if os.path.exists(tools_dir):
+        for root, _dirs, files in os.walk(tools_dir):
+            for entry in sorted(files):
+                if not entry.endswith(".py") or entry == "__init__.py":
+                    continue
+                filepath = os.path.join(root, entry)
+                rel_name = os.path.relpath(filepath, tools_dir)[:-3]
+                module_name = "dynamic_tool__" + rel_name.replace(os.sep, "__").replace("/", "__")
 
-            for name, obj in inspect.getmembers(module):
-                if inspect.isfunction(obj) and hasattr(obj, "_is_langchain_tool"):
+                try:
+                    spec = importlib.util.spec_from_file_location(module_name, filepath)
+                    if spec is None or spec.loader is None:
+                        continue
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                except Exception as e:
+                    logger.error("Error loading dynamic tool module %s: %s", entry, e)
+                    continue
+
+                found_tools = {
+                    name: obj for name, obj in inspect.getmembers(module)
+                    if isinstance(obj, BaseTool)
+                }
+                if not found_tools:
+                    logger.warning(
+                        "Dynamic tool module %s defines no @tool functions; ignored.", entry
+                    )
+                    continue
+                for name, obj in found_tools.items():
+                    if name in dynamic_tools:
+                        logger.warning(
+                            "Duplicate dynamic tool name '%s' in %s; keeping first definition.",
+                            name, entry,
+                        )
+                        continue
                     dynamic_tools[name] = obj
-        except Exception as e:
-            print(f"Error loading dynamic tool {entry}: {e}")
 
+    _dynamic_tools_cache = dynamic_tools
+    _dynamic_tools_cache_key = key
     return dynamic_tools
 
 
@@ -269,7 +397,7 @@ def load_dynamic_tools(tools_dir: str) -> Dict[str, tool]:
 # Tool Registry
 # ---------------------------------------------------------------------------
 
-def get_all_tools() -> Dict[str, tool]:
+def get_all_tools() -> dict[str, BaseTool]:
     """Returns a dictionary of all available tools (built-in + dynamic)."""
     built_in_tools = {
         "write_todos": write_todos,
@@ -277,8 +405,22 @@ def get_all_tools() -> Dict[str, tool]:
         "read_file": read_file,
         "write_file": write_file,
         "edit_file": edit_file,
+        "list_files": list_files,
+        "search_files": search_files,
+        "fetch_url": fetch_url,
         "task": task,
         "list_tools": list_tools,
     }
     dynamic_tools = load_dynamic_tools("./tools")
-    return {**built_in_tools, **dynamic_tools}
+    mcp_tools = load_mcp_tools()
+    # Built-ins win name collisions (7.2), with a logged warning per collision.
+    for name in sorted(set(built_in_tools) & set(dynamic_tools)):
+        logger.warning(
+            "Dynamic tool '%s' shadows a built-in tool; the built-in wins.", name
+        )
+    for name in sorted(set(built_in_tools) & set(mcp_tools)):
+        logger.warning(
+            "MCP tool '%s' shadows a built-in tool; the built-in wins.", name
+        )
+    # Precedence: built-ins > MCP > dynamic file tools.
+    return {**dynamic_tools, **mcp_tools, **built_in_tools}
