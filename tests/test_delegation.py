@@ -70,6 +70,42 @@ def patched_model(monkeypatch):
 
 class TestDelegationContract:
 
+    def test_delegation_uses_bound_tool_name(self, sandbox, patched_model):
+        from src.core.tools import task
+
+        class BoundNameModel(ScriptedChatModel):
+            def bind_tools(self, tools, **kwargs):
+                if task in tools:
+                    self.delegation_name = next(t.name for t in tools if t is task)
+                return self
+
+            def invoke(self, messages, **kwargs):
+                if self._detect_role(messages) == "orchestrator" and not self.counts.get(
+                    "orchestrator"
+                ):
+                    self._counts["orchestrator"] = 1
+                    return ai("", tool_calls=[{
+                        "name": self.delegation_name,
+                        "args": {"subagent_type": "research", "description": "Summarize"},
+                        "id": "bound-name",
+                    }])
+                return super().invoke(messages, **kwargs)
+
+        fake = BoundNameModel(
+            scripts={
+                "orchestrator": [ai("Complete.")],
+                "subagent": [ai("Child completed.")],
+                "critic": [ai("APPROVED.")],
+            },
+            default=ai("done"),
+        )
+        patched_model(fake)
+        result = _run_graph(_initial_state("Delegate a summary."), "bound-tool-name")
+        replies = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+        assert replies[0].content == "Child completed."
+        assert fake.delegation_name == "task"
+        assert fake.counts["subagent"] == 1
+
     def test_task_result_tokens_and_writes_flow_back(self, sandbox, patched_model):
         fake = ScriptedChatModel(
             scripts={

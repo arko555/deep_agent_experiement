@@ -2,7 +2,7 @@
 and the navigation tools list_files / search_files / fetch_url (7.4/7.5)."""
 
 import logging
-import types
+import asyncio
 
 import httpx
 import pytest
@@ -145,40 +145,31 @@ class TestNavigationTools:
 # ---------------------------------------------------------------------------
 
 def _install_fake_httpx(monkeypatch, data: bytes, exc=None):
-    class _FakeResponse:
-        def raise_for_status(self):
-            pass
+    from src.core import research_fetch
 
-        def iter_bytes(self):
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
             for i in range(0, len(data), 64):
                 yield data[i:i + 64]
 
-        def __enter__(self):
-            return self
+    async def resolve(host, port):
+        return "93.184.216.34"
 
-        def __exit__(self, *args):
-            return False
+    def handle(request):
+        if exc is not None:
+            raise exc
+        return httpx.Response(200, stream=Body())
 
-    class _FakeClient:
-        def __init__(self, timeout=None, follow_redirects=None):
-            assert timeout == tools_mod.FETCH_URL_TIMEOUT_SECONDS
-            assert follow_redirects is True
+    original = httpx.AsyncClient
 
-        def stream(self, method, url):
-            if exc is not None:
-                raise exc
-            return _FakeResponse()
+    def client(**kwargs):
+        assert kwargs["follow_redirects"] is False
+        assert kwargs["trust_env"] is False
+        return original(**kwargs, transport=httpx.MockTransport(handle))
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-    monkeypatch.setattr(
-        tools_mod, "httpx",
-        types.SimpleNamespace(Client=_FakeClient, HTTPError=httpx.HTTPError),
-    )
+    monkeypatch.setattr(research_fetch, "_resolve_public", resolve)
+    monkeypatch.setattr(research_fetch.httpx, "AsyncClient", client)
+    monkeypatch.setattr(tools_mod, "run_sync", asyncio.run)
 
 
 class TestFetchUrl:
@@ -199,6 +190,16 @@ class TestFetchUrl:
         result = tools_mod.fetch_url.invoke({"url": "http://example.com/down"})
         assert result.startswith("Error fetching")
         assert "boom" in result
+
+    def test_malformed_url_returns_error(self, monkeypatch):
+        _install_fake_httpx(monkeypatch, b"")
+        result = tools_mod.fetch_url.invoke({"url": "http://[invalid"})
+        assert result.startswith("Error fetching")
+
+    def test_timeout_returns_explicit_error(self, monkeypatch):
+        _install_fake_httpx(monkeypatch, b"", exc=TimeoutError())
+        result = tools_mod.fetch_url.invoke({"url": "https://example.com"})
+        assert "total fetch deadline exceeded" in result
 
 
 # ---------------------------------------------------------------------------

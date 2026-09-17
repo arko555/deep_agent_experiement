@@ -1,6 +1,9 @@
 import os
 import hashlib
+from pathlib import Path
 from typing import Dict, List, Optional
+
+from src.core.guardrails import get_workspace_root, validate_read_path
 
 
 # ---------------------------------------------------------------------------
@@ -41,14 +44,28 @@ _tools_cache_key: str = ""
 # ---------------------------------------------------------------------------
 
 def get_workspace_files() -> List[str]:
-    workspace_dir = "./workspace"
-    if not os.path.exists(workspace_dir):
+    """List workspace files relative to the configured root.
+
+    Enumeration uses the shared call-time resolver and does not follow
+    directory symlinks, so links out of the workspace are never listed.
+    """
+    workspace_dir = get_workspace_root()
+    if not workspace_dir.is_dir():
         return []
     files = []
-    for root, dirs, filenames in os.walk(workspace_dir):
-        for f in filenames:
-            rel_path = os.path.relpath(os.path.join(root, f), workspace_dir)
-            files.append(rel_path)
+    for root, dirs, _filenames in os.walk(workspace_dir, followlinks=False):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for f in _filenames:
+            full = Path(root) / f
+            # Files reached through a link chain must still be real files;
+            # links themselves are skipped rather than followed.
+            if full.is_symlink() or not full.is_file():
+                continue
+            try:
+                validate_read_path(str(full))
+            except (OSError, ValueError):
+                continue
+            files.append(full.relative_to(workspace_dir).as_posix())
     return sorted(files)
 
 
@@ -56,6 +73,7 @@ def get_skill_info(skill_path: str) -> Optional[dict]:
     skill_md = os.path.join(skill_path, "SKILL.md")
     if os.path.exists(skill_md):
         try:
+            skill_md = validate_read_path(skill_md)
             with open(skill_md, "r") as f:
                 content = f.read()
                 if content.startswith("---"):
@@ -76,11 +94,13 @@ def get_skill_info(skill_path: str) -> Optional[dict]:
 def get_skill_body(skill_name: str) -> str:
     """Return the markdown body of ``skills/<skill_name>/SKILL.md`` with the
     frontmatter stripped. Returns "" if the file is missing or unreadable."""
-    skill_md = os.path.join("./skills", skill_name, "SKILL.md")
     try:
+        skill_md = validate_read_path(
+            os.path.join("skills", skill_name, "SKILL.md")
+        )
         with open(skill_md) as f:
             content = f.read()
-    except OSError:
+    except (OSError, ValueError):
         return ""
     if content.startswith("---"):
         # Frontmatter is the first "---" block; rejoin the remainder so any
@@ -155,6 +175,7 @@ def get_memory_content() -> str:
     path = "./AGENTS.md"
     if os.path.exists(path):
         try:
+            path = validate_read_path(path)
             with open(path, "r") as f:
                 return f.read()
         except Exception:

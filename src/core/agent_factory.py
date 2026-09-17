@@ -33,6 +33,7 @@ from src.core.config import (
 from src.core.subagents import is_parallelizable
 from src.core.mcp_client import clear_mcp_tools_cache
 from src.core.memory import get_workspace_files, get_system_prompt
+from src.core.guardrails import get_workspace_root
 from src.core.routing import (
     route_from_orchestrator,
     route_from_critic,
@@ -408,7 +409,7 @@ def get_deep_agent():
     if _compiled_graph is not None:
         return _compiled_graph
 
-    workspace_root = os.getenv("WORKSPACE_ROOT", "./workspace")
+    workspace_root = str(get_workspace_root())
     if not os.path.exists(workspace_root):
         os.makedirs(workspace_root)
 
