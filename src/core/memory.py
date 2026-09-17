@@ -8,11 +8,16 @@ from typing import Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 def _dir_tree_hash(directory: str) -> str:
-    """Return a hex digest of (mtime, size) for every file under *directory*."""
+    """Return a hex digest of (mtime, size) for every file under *directory*.
+
+    ``__pycache__`` is ignored so bytecode written by dynamic module loading
+    doesn't churn the hash.
+    """
     parts = []
     if not os.path.exists(directory):
         return hashlib.md5(b"missing").hexdigest()
-    for root, _dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fname in files:
             fp = os.path.join(root, fname)
             try:
@@ -66,6 +71,24 @@ def get_skill_info(skill_path: str) -> Optional[dict]:
         except Exception:
             pass
     return None
+
+
+def get_skill_body(skill_name: str) -> str:
+    """Return the markdown body of ``skills/<skill_name>/SKILL.md`` with the
+    frontmatter stripped. Returns "" if the file is missing or unreadable."""
+    skill_md = os.path.join("./skills", skill_name, "SKILL.md")
+    try:
+        with open(skill_md) as f:
+            content = f.read()
+    except OSError:
+        return ""
+    if content.startswith("---"):
+        # Frontmatter is the first "---" block; rejoin the remainder so any
+        # "---" lines in the body itself survive intact.
+        parts = content.split("---")
+        if len(parts) >= 3:
+            content = "---".join(parts[2:])
+    return content.strip()
 
 
 def get_skills_summary() -> str:
@@ -139,14 +162,7 @@ def get_memory_content() -> str:
     return ""
 
 
-def get_system_prompt(role: Optional[str] = None, tools_dict: Optional[Dict] = None) -> str:
-    if role in ("research", "researcher"):
-        from src.nodes.research import get_researcher_system_prompt
-        return get_researcher_system_prompt()
-    elif role in ("write", "writer"):
-        from src.nodes.write import get_writer_system_prompt
-        return get_writer_system_prompt()
-
+def get_system_prompt(tools_dict: Optional[Dict] = None) -> str:
     skills_summary = get_skills_summary()
     tools_summary = get_tools_summary(tools_dict) if tools_dict else "No tools available."
 
@@ -168,7 +184,12 @@ Available Skills:
 Available Tools:
 {tools_summary}
 
-3. **Generic Subagents**: Use the `task` tool with the 'general-purpose' subagent to handle independent, complex, or context-heavy sub-tasks.
+3. **Subagents**: Use the `task` tool to delegate to specialized subagents
+   (the task tool description lists the available types).
+   - **Delegation file contract**: every task description MUST name a unique output
+     path under `./workspace` for each file the subagent should produce
+     (e.g., `workspace/<topic>.md`). Subagents may run in parallel, so never
+     assign two tasks the same path.
    - The 'general-purpose' subagent is also generic and can load the same skills.
 4. **NO /tmp/ FOLDER**: NEVER save files to the `/tmp/` directory. This is a critical requirement.
 5. **STRICT Workspace Usage**: ALL file outputs, intermediate notes, and final reports MUST be written to the `./workspace/` directory exclusively. Use the `write_file` and `edit_file` tools to manage files within this directory.

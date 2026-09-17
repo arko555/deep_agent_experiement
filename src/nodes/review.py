@@ -2,7 +2,7 @@ from typing import Dict
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from src.state import AgentState
 from src.core.memory import get_memory_content
-from src.core.utils import get_message_text
+from src.core.utils import get_message_text, invoke_with_retry
 
 def call_agent_node(state: AgentState) -> dict:
     """
@@ -69,7 +69,9 @@ def call_critic_node(state: AgentState, model) -> dict:
     if staged is not None:
         review_messages.append(staged)
 
-    response = model.invoke(review_messages)
+    # Shared retry wrapper (8.2): a transient 429 during review should back
+    # off and retry, like the orchestrator and tools paths, not crash the run.
+    response = invoke_with_retry(model, review_messages)
     content_str = get_message_text(response.content)
 
     if content_str.strip().upper().startswith("APPROVED"):
@@ -78,6 +80,59 @@ def call_critic_node(state: AgentState, model) -> dict:
         return {"review_verdict": "approved"}
     # Rejected — stage the critique; the orchestrator consumes it as feedback.
     return {"next_message": response, "review_verdict": "rejected"}
+
+def call_reflection_node(state: AgentState, model) -> dict:
+    """
+    Self-correction / reflection node.
+
+    When the agent is stuck in a loop (many iterations) or has produced
+    repeated failures, this node prompts it to step back, analyze what
+    went wrong, and formulate a revised strategy before retrying.
+
+    Returns:
+    - {"next_message": <reflection>} → routed to orchestrator as strategic guidance
+    """
+    iteration_count = state.get("iteration_count", 0)
+    messages = state.get("messages", [])
+    audit_log = state.get("audit_log", [])
+
+    # Gather context about what has gone wrong.
+    tool_errors = []
+    for entry in audit_log:
+        if entry.get("action") == "tool_call":
+            for tc in entry.get("tool_calls", []):
+                tool_errors.append(f"{tc['name']}({tc.get('args', {})})")
+
+    # Find rejection reasons from the staged message.
+    staged = state.get("next_message")
+    rejection_text = ""
+    if staged is not None:
+        from src.core.utils import get_message_text
+        rejection_text = get_message_text(getattr(staged, "content", ""))
+
+    system_prompt = f"""You are a Reflection Agent. Your job is to analyze why the current approach is failing and devise a new strategy.
+
+Context:
+- Iteration count: {iteration_count}
+- Tools attempted: {tool_errors[:10] if tool_errors else 'None yet'}
+- Review feedback: {rejection_text[:500] if rejection_text else 'No specific rejection'}
+
+The current plan is: {state.get('current_plan', [])}
+
+Instructions:
+1. Identify what is going wrong (e.g., wrong tools, incomplete info, poor structure).
+2. Propose a concrete revised strategy with specific steps.
+3. Be concise — focus on actionable changes, not rehashing the problem.
+"""
+
+    review_messages = [SystemMessage(content=system_prompt)] + list(messages)
+    response = invoke_with_retry(model, review_messages)
+
+    return {
+        "next_message": response,
+        "review_verdict": None,  # Clear verdict so routing resets cleanly.
+    }
+
 
 def call_plan_checker_node(state: AgentState, model) -> dict:
     """
@@ -105,7 +160,7 @@ def call_plan_checker_node(state: AgentState, model) -> dict:
     if staged is not None:
         review_messages.append(staged)
 
-    response = model.invoke(review_messages)
+    response = invoke_with_retry(model, review_messages)
     content_str = get_message_text(response.content)
 
     if content_str.strip().upper().startswith("COMPLIANT"):

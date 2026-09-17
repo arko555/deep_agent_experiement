@@ -32,6 +32,14 @@ def validate_and_normalize_path(
     """
     clean_path = os.path.normpath(path)
 
+    # Strict mode rejects any traversal attempt up front, even when normpath
+    # would collapse it (e.g. "a/../b" normalizes to "b").
+    if strict and ".." in path.replace("\\", "/").split("/"):
+        raise ValueError(
+            f"Access denied to path '{path}'. "
+            "Paths must be relative and stay within the repository."
+        )
+
     # --- Handle traversal / absolute paths consistently -----------------------
     if clean_path.startswith("..") or os.path.isabs(clean_path):
         if must_be_in_workspace:
@@ -57,3 +65,37 @@ def validate_and_normalize_path(
             clean_path = os.path.join("workspace", clean_path)
 
     return clean_path
+
+
+# Default-deny read allowlist (7.3): paths (repo-relative, normalized) that
+# read_file may touch. Symmetric with the write sandbox, which is workspace-only.
+READ_ALLOWLIST_PREFIXES = ("workspace/", "skills/")
+READ_ALLOWLIST_FILES = {"AGENTS.md"}
+
+
+def validate_read_path(path: str) -> str:
+    """
+    Validates a path for reading against the read allowlist (default-deny).
+
+    Only paths that normalize to ``AGENTS.md``, or inside ``workspace/`` or
+    ``skills/``, are allowed. Everything else raises — including absolute
+    paths and ``..`` traversal (normpath collapses both before the check).
+
+    Args:
+        path: The file path to validate.
+
+    Returns:
+        The normalized path, safe to open.
+
+    Raises:
+        ValueError: If the path is outside the read allowlist.
+    """
+    clean_path = os.path.normpath(path)
+    if clean_path in READ_ALLOWLIST_FILES or any(
+        clean_path.startswith(prefix) for prefix in READ_ALLOWLIST_PREFIXES
+    ):
+        return clean_path
+    raise ValueError(
+        f"Access denied: reading '{path}' is not allowed. "
+        "You can only read AGENTS.md, and files under ./workspace or ./skills."
+    )

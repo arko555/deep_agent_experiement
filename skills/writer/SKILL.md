@@ -13,12 +13,18 @@ license: MIT
 This skill provides advanced writing capabilities, focusing on clarity, engagement, and proper formatting.
 
 ## Instructions
-1. Review the input notes or research data provided.
+1. Review the input notes or research data provided — use `list_files` to see what is in `./workspace` and `search_files` to locate a specific note; never guess paths.
 2. Define an outline for the content (Introduction, Body, Conclusion).
 3. Use a tone appropriate for the target audience (e.g., technical but accessible).
 4. Ensure all claims are backed by the provided data.
 5. Format the output using GitHub Flavored Markdown.
 6. Save the final draft to the `./workspace` directory.
+
+## Completion
+End with a short summary containing:
+- The path of the file you saved under ./workspace
+- The outline used for the content
+- The tone used for the writing
 
 ## Examples
 ### Input
