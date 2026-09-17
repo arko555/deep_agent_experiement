@@ -140,6 +140,141 @@ class TestCompressMessagesBehavior:
         assert "Summary" in result[0].content
 
 
+class TestCompressMessagesToolGroups:
+
+    @pytest.mark.parametrize("max_history", [2, 3, 4])
+    def test_cut_inside_multi_tool_group_keeps_all_results(self, max_history):
+        calls = AIMessage(content="", tool_calls=[
+            {"name": "search", "args": {}, "id": call_id}
+            for call_id in ["a", "b", "c"]
+        ])
+        # Results may arrive in a different order than the assistant's calls.
+        group = [calls] + [
+            ToolMessage(content=f"result {call_id}", tool_call_id=call_id)
+            for call_id in ["c", "a", "b"]
+        ]
+        msgs = [HumanMessage(content="older context"), *group]
+        original = list(msgs)
+
+        result = compress_messages(msgs, max_history=max_history)
+
+        assert result[1:] == group
+        assert all(actual is expected for actual, expected in zip(result[1:], group))
+        assert {call["id"] for call in result[1].tool_calls} == {
+            msg.tool_call_id for msg in result[2:]
+        }
+        assert len(result) > max_history  # protocol validity wins over the limit
+        assert msgs == original
+
+    def test_single_result_at_limit_retains_its_call(self):
+        calls = AIMessage(content="", tool_calls=[
+            {"name": "search", "args": {}, "id": "single"},
+        ])
+        msgs = [
+            HumanMessage(content="old"), calls,
+            ToolMessage(content="result", tool_call_id="single"),
+            AIMessage(content="answer"),
+        ]
+
+        result = compress_messages(msgs, max_history=3)
+
+        assert result[1:] == msgs[1:]
+
+    def test_oversized_group_without_older_messages_is_unchanged(self):
+        calls = AIMessage(content="", tool_calls=[
+            {"name": "search", "args": {}, "id": call_id}
+            for call_id in ["a", "b"]
+        ])
+        msgs = [calls] + [
+            ToolMessage(content="result", tool_call_id=call_id)
+            for call_id in ["a", "b"]
+        ]
+
+        result = compress_messages(msgs, max_history=2)
+
+        assert result == msgs
+        assert all(actual is expected for actual, expected in zip(result, msgs))
+
+    def test_boundary_between_exchanges_does_not_retain_old_calls(self):
+        groups = []
+        for prefix in ["old", "recent"]:
+            call_ids = [f"{prefix}-a", f"{prefix}-b"]
+            groups.append([
+                AIMessage(content="", tool_calls=[
+                    {"name": "search", "args": {}, "id": call_id}
+                    for call_id in call_ids
+                ]),
+                *[ToolMessage(content=call_id, tool_call_id=call_id)
+                  for call_id in reversed(call_ids)],
+            ])
+        msgs = groups[0] + groups[1]
+
+        result = compress_messages(msgs, max_history=3)
+
+        assert result[1:] == groups[1]
+        assert "Exchanged 3 messages" in result[0].content
+        assert "2 tool results" in result[0].content
+
+    def test_limit_one_summarizes_entire_tool_group(self):
+        msgs = [
+            AIMessage(content="", tool_calls=[
+                {"name": "search", "args": {}, "id": call_id}
+                for call_id in ["a", "b"]
+            ]),
+            ToolMessage(content="first result", tool_call_id="a"),
+            ToolMessage(content="last result", tool_call_id="b"),
+        ]
+
+        result = compress_messages(msgs, max_history=1)
+
+        assert len(result) == 1
+        assert "Exchanged 3 messages" in result[0].content
+        assert "2 tool results" in result[0].content
+
+    def test_safe_boundary_after_group_summarizes_whole_group(self):
+        calls = AIMessage(content="", tool_calls=[
+            {"name": "search", "args": {}, "id": "old-call"},
+        ])
+        msgs = [
+            HumanMessage(content="old"), calls,
+            ToolMessage(content="old result", tool_call_id="old-call"),
+            AIMessage(content="final answer"),
+        ]
+
+        result = compress_messages(msgs, max_history=2)
+
+        assert result[1:] == msgs[-1:]
+        assert "1 tool results" in result[0].content
+
+
+class TestCompressMessagesLimits:
+
+    @pytest.mark.parametrize("max_history,min_keep", [(0, 8), (-1, 8), (20, -1)])
+    @pytest.mark.parametrize("count", [0, 25])
+    def test_invalid_limits_raise(self, max_history, min_keep, count):
+        msgs = [HumanMessage(content="message") for _ in range(count)]
+        with pytest.raises(ValueError):
+            compress_messages(msgs, max_history=max_history, min_keep=min_keep)
+
+    @pytest.mark.parametrize("min_keep", [0, 8])
+    def test_limit_one_returns_only_summary(self, min_keep):
+        msgs = [
+            HumanMessage(content="first message"),
+            AIMessage(content="last message"),
+        ]
+        result = compress_messages(msgs, max_history=1, min_keep=min_keep)
+        assert len(result) == 1
+        assert "Exchanged 2 messages" in result[0].content
+        assert "first message" in result[0].content
+        assert "last message" in result[0].content
+
+    def test_zero_min_keep_uses_normal_retention(self):
+        msgs = [HumanMessage(content=f"message {i}") for i in range(5)]
+        result = compress_messages(msgs, max_history=2, min_keep=0)
+        assert len(result) == 2
+        assert result[1] is msgs[-1]
+
+
 # ---------------------------------------------------------------------------
 # _summarize_old_messages edge cases
 # ---------------------------------------------------------------------------

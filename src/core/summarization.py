@@ -53,25 +53,47 @@ def compress_messages(
 ) -> list[BaseMessage]:
     """Return the message list, compressing old messages when it exceeds ``max_history``.
 
-    Strategy:
-    1. Keep the last ``min_keep`` messages intact (most recent context).
-    2. Compress everything before those into a single summary HumanMessage.
-    3. Prepend the summary so the full list is at most ``max_history + 1`` items.
+    Keep recent messages and replace older ones with a single summary
+    HumanMessage. ``max_history`` is a soft limit: expand the retained suffix
+    backward to keep each assistant tool-call message and all its corresponding
+    tool results together. If no older complete group can be removed, return
+    the history unchanged rather than adding an empty summary.
 
-    This avoids silent truncation — the agent sees a digest of what happened
-    earlier in the conversation.
+    ``max_history=1`` returns only a summary when compression is needed.
+    Nonpositive ``max_history`` and negative ``min_keep`` raise ValueError.
+    The input history is never modified.
     """
+    if max_history <= 0:
+        raise ValueError("max_history must be positive")
+    if min_keep < 0:
+        raise ValueError("min_keep must be nonnegative")
     if len(messages) <= max_history:
         return list(messages)
 
-    # Messages to keep intact (most recent). Clamped so the returned list
-    # stays within max_history + 1 items (summary included) and there is
-    # always at least one old message to summarize.
-    keep_count = min(max(min_keep, max_history // 2), max(0, max_history - 1))
-    recent = list(messages[-keep_count:])
+    keep_count = min(max(min_keep, max_history // 2), max_history - 1)
+    boundary = len(messages) - keep_count
+    if keep_count:
+        # Only a boundary with no outstanding tool calls is safe. Match IDs
+        # rather than counting results, which may arrive in a different order.
+        safe_boundary = 0
+        pending: set[str] = set()
+        for index, msg in enumerate(messages[:boundary]):
+            if isinstance(msg, AIMessage):
+                pending.update(
+                    call["id"] for call in msg.tool_calls if call["id"] is not None
+                )
+            elif isinstance(msg, ToolMessage):
+                pending.discard(msg.tool_call_id)
+            if not pending:
+                safe_boundary = index + 1
+        boundary = safe_boundary
 
-    # Messages to summarize (oldest).
-    old = list(messages[:-keep_count])
+    if boundary == 0:
+        return list(messages)
+
+    # A zero keep_count uses boundary=len(messages), never a [-0:] slice.
+    recent = list(messages[boundary:])
+    old = list(messages[:boundary])
 
     summary = _summarize_old_messages(old)
 
@@ -79,7 +101,7 @@ def compress_messages(
         "Compressed %d old messages into summary (%.1f chars); keeping %d recent.",
         len(old),
         len(summary.content) if isinstance(summary.content, str) else 0,
-        keep_count,
+        len(recent),
     )
 
     return [summary] + recent

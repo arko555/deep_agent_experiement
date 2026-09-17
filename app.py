@@ -8,6 +8,8 @@ from datetime import datetime
 from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
+from src.core.guardrails import clear_workspace, get_workspace_root, validate_read_path
+from src.core.memory import get_workspace_files, get_memory_content, get_skill_info
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -33,9 +35,7 @@ st.set_page_config(
 )
 
 # Ensure workspace exists
-workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
-if not os.path.exists(workspace_dir):
-    os.makedirs(workspace_dir)
+get_workspace_root().mkdir(parents=True, exist_ok=True)
 
 # --- Custom Styling ---
 st.markdown("""
@@ -133,31 +133,13 @@ if "thread_id" not in st.session_state:
 
 # --- Helper Functions ---
 def update_workspace_files():
-    workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
-    if os.path.exists(workspace_dir):
-        files = []
-        for root, dirs, filenames in os.walk(workspace_dir):
-            for f in filenames:
-                rel_path = os.path.relpath(os.path.join(root, f), workspace_dir)
-                files.append(rel_path)
-        st.session_state.workspace_files = sorted(files)
+    st.session_state.workspace_files = get_workspace_files()
 
-def get_skill_info(skill_path):
-    skill_md = os.path.join(skill_path, "SKILL.md")
-    if os.path.exists(skill_md):
-        with open(skill_md, "r") as f:
-            content = f.read()
-            if content.startswith("---"):
-                parts = content.split("---")
-                if len(parts) >= 3:
-                    header = parts[1]
-                    info = {}
-                    for line in header.split("\n"):
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            info[k.strip()] = v.strip()
-                    return info
-    return None
+
+def read_workspace_bytes(relative_path):
+    path = validate_read_path(str(get_workspace_root() / relative_path))
+    with open(path, "rb") as file_bytes:
+        return file_bytes.read()
 
 def add_audit_entry(action: str, details: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -190,7 +172,7 @@ with st.sidebar:
     if os.path.exists(skills_dir):
         for skill_name in os.listdir(skills_dir):
             skill_path = os.path.join(skills_dir, skill_name)
-            if os.path.isdir(skill_path):
+            if os.path.isdir(skill_path) and not os.path.islink(skill_path):
                 info = get_skill_info(skill_path)
                 if info:
                     st.markdown(f"""
@@ -225,11 +207,10 @@ with st.sidebar:
 
     # Memory / Conventions
     st.subheader("🧠 Shared Memory")
-    memory_file = "./AGENTS.md"
-    if os.path.exists(memory_file):
-        with open(memory_file, "r") as f:
-            st.caption("Context from AGENTS.md")
-            st.markdown(f.read())
+    agents_md = get_memory_content()
+    if agents_md:
+        st.caption("Context from AGENTS.md")
+        st.markdown(agents_md)
 
     st.divider()
 
@@ -241,27 +222,23 @@ with st.sidebar:
     else:
         for f in st.session_state.workspace_files:
             with st.expander(f"📄 {f}"):
-                file_path = os.path.join(os.getenv("WORKSPACE_ROOT", "./workspace"), f)
                 try:
-                    with open(file_path, "r") as file_text:
-                        st.code(file_text.read(), language="markdown")
+                    data = read_workspace_bytes(f)
+                    st.code(data.decode("utf-8", errors="replace"), language="markdown")
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
+                    data = None
 
-                with open(file_path, "rb") as file_bytes:
+                if data is not None:
                     st.download_button(
                         label="Download",
-                        data=file_bytes,
+                        data=data,
                         file_name=f,
                         mime="text/markdown"
                     )
 
         if st.button("Clear Workspace"):
-            workspace_dir = os.getenv("WORKSPACE_ROOT", "./workspace")
-            for f in os.listdir(workspace_dir):
-                file_path = os.path.join(workspace_dir, f)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            clear_workspace()
             update_workspace_files()
             st.rerun()
 

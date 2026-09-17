@@ -15,7 +15,13 @@ import httpx
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool, tool
 
-from src.core.guardrails import validate_and_normalize_path, validate_read_path
+from src.core.async_bridge import run_sync
+from src.core.research_fetch import fetch_public_url
+from src.core.guardrails import (
+    get_workspace_root,
+    validate_and_normalize_path,
+    validate_read_path,
+)
 from src.core.mcp_client import load_mcp_tools
 from src.core.memory import _dir_tree_hash, get_workspace_files
 from src.core.rag import internet_search as raw_internet_search
@@ -119,18 +125,19 @@ def search_files(pattern: str, max_matches: int = 30) -> str:
         pattern: The substring to search for (case-sensitive).
         max_matches: Maximum number of matches to return (default 30).
     """
+    root = get_workspace_root()
     files = get_workspace_files()
     matches = []
     for rel_path in files:
-        full_path = os.path.join("workspace", rel_path)
         try:
+            full_path = validate_read_path(str(root / rel_path))
             with open(full_path, "r", errors="ignore") as f:
                 for line_no, line in enumerate(f, 1):
                     if pattern in line:
                         matches.append(f"{rel_path}:{line_no}: {line.rstrip()}")
                         if len(matches) >= max_matches:
                             break
-        except OSError:
+        except (OSError, ValueError):
             continue
         if len(matches) >= max_matches:
             break
@@ -152,22 +159,13 @@ def fetch_url(url: str) -> str:
         url: The http(s) URL to fetch.
     """
     try:
-        with httpx.Client(timeout=FETCH_URL_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            with client.stream("GET", url) as response:
-                response.raise_for_status()
-                chunks = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total <= FETCH_URL_MAX_BYTES:
-                        chunks.append(chunk)
-        truncated = total > FETCH_URL_MAX_BYTES
-        text = b"".join(chunks).decode("utf-8", errors="replace")
-    except httpx.HTTPError as e:
+        return str(run_sync(fetch_public_url(
+            url, FETCH_URL_TIMEOUT_SECONDS, FETCH_URL_MAX_BYTES
+        )))
+    except TimeoutError:
+        return f"Error fetching {url}: total fetch deadline exceeded"
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as e:
         return f"Error fetching {url}: {e}"
-    if truncated:
-        return text + f"\n[truncated: response exceeded {FETCH_URL_MAX_BYTES} bytes]"
-    return text
 
 
 # subagent_type values and the tool description are driven by the SUBAGENTS
@@ -202,7 +200,7 @@ Args:
 
 
 _task_impl.__doc__ = _build_task_docstring()
-task = tool(_task_impl)
+task = tool("task")(_task_impl)
 
 
 @tool
