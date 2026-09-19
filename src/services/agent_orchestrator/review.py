@@ -1,8 +1,8 @@
 from typing import Dict
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from src.state import AgentState
-from src.core.memory import get_memory_content
-from src.core.utils import get_message_text, invoke_with_retry
+from src.services.agent_orchestrator.state import AgentState
+from src.services.agent_orchestrator.memory import get_memory_content
+from src.utils import get_message_text, invoke_with_retry
 
 def call_agent_node(state: AgentState) -> dict:
     """
@@ -107,7 +107,7 @@ def call_reflection_node(state: AgentState, model) -> dict:
     staged = state.get("next_message")
     rejection_text = ""
     if staged is not None:
-        from src.core.utils import get_message_text
+        from src.utils import get_message_text
         rejection_text = get_message_text(getattr(staged, "content", ""))
 
     system_prompt = f"""You are a Reflection Agent. Your job is to analyze why the current approach is failing and devise a new strategy.

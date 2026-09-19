@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.core.utils import invoke_with_retry, is_transient_error
+from src.utils import invoke_with_retry, is_transient_error
 
 
 class _FakeInvoker:

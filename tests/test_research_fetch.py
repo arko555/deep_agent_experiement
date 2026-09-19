@@ -6,7 +6,7 @@ import socket
 import httpx
 import pytest
 
-from src.core import research_fetch as fetch
+from src.services.tools_integration import research_fetch as fetch
 
 
 class Body(httpx.AsyncByteStream):

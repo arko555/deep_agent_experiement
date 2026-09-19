@@ -3,7 +3,7 @@
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 
-from src.nodes.plan import call_orchestrator
+from src.services.agent_orchestrator.plan import call_orchestrator
 
 
 class _RecordingModel:

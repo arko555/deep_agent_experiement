@@ -1,10 +1,10 @@
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from src.state import AgentState
-from src.core.config import get_max_iterations
-from src.core.memory import get_system_prompt
-from src.core.utils import invoke_with_retry, get_message_text
-from src.core.summarization import compress_messages
+from src.services.agent_orchestrator.state import AgentState
+from src.config import get_max_iterations
+from src.services.agent_orchestrator.memory import get_system_prompt
+from src.utils import invoke_with_retry, get_message_text
+from src.services.session_memory.compression import compress_messages
 
 
 def call_orchestrator(state: AgentState, model, tools: list, max_history_messages: int = 20) -> dict:

@@ -15,17 +15,17 @@ import httpx
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool, tool
 
-from src.core.async_bridge import run_sync
-from src.core.research_fetch import fetch_public_url
-from src.core.guardrails import (
+from src.async_bridge import run_sync
+from src.services.tools_integration.research_fetch import fetch_public_url
+from src.services.agent_orchestrator.guardrails import (
     get_workspace_root,
     validate_and_normalize_path,
     validate_read_path,
 )
-from src.core.mcp_client import load_mcp_tools
-from src.core.memory import _dir_tree_hash, get_workspace_files
-from src.core.rag import internet_search as raw_internet_search
-from src.core.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
+from src.services.tools_integration.mcp_client import load_mcp_tools
+from src.services.agent_orchestrator.memory import _dir_tree_hash, get_workspace_files
+from src.services.tools_integration.rag import internet_search as raw_internet_search
+from src.services.agent_orchestrator.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +271,7 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int,
         # file writes are not visible here, so both come back empty. Failures
         # raise, and the caller turns them into a task error message.
         # Imported lazily to keep the a2a SDK off the import path until used.
-        from src.core.a2a_client import call_a2a_agent
+        from src.services.tools_integration.a2a_client import call_a2a_agent
 
         if not spec.url:
             return (
@@ -282,9 +282,9 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int,
         return call_a2a_agent(spec.url, description), {}, []
 
     # kind == "graph": general-purpose subagent — use the cached compiled graph
-    from src.core.agent_factory import get_deep_agent
-    from src.core.config import get_max_iterations
-    from src.core.utils import get_message_text
+    from src.services.agent_orchestrator.agent_factory import get_deep_agent
+    from src.config import get_max_iterations
+    from src.utils import get_message_text
 
     sub_agent = get_deep_agent()
     # Fresh checkpoint thread per subagent invocation: the checkpointer
@@ -422,3 +422,22 @@ def get_all_tools() -> dict[str, BaseTool]:
         )
     # Precedence: built-ins > MCP > dynamic file tools.
     return {**dynamic_tools, **mcp_tools, **built_in_tools}
+
+
+def create_tool_registry() -> "ToolRegistry":
+    """Build a ToolRegistry populated with all available tools.
+
+    Every tool from get_all_tools() is registered via register_builtin
+    using its underlying callable (tool.func for LangChain
+    StructuredTool instances, the object itself for plain callables).
+
+    Returns:
+        A fully populated ToolRegistry.
+    """
+    from src.services.tools_integration.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    for name, tool in get_all_tools().items():
+        callable_ = getattr(tool, "func", tool)
+        registry.register_builtin(name, callable_)
+    return registry

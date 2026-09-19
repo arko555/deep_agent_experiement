@@ -2,13 +2,13 @@
 
 import pytest
 
-from src.core.routing import (
+from src.services.agent_orchestrator.routing import (
     route_from_orchestrator,
     route_from_critic,
     route_from_reflection,
     route_from_plan_checker,
 )
-from src.core.agent_factory import get_deep_agent, reset_deep_agent
+from src.services.agent_orchestrator.agent_factory import get_deep_agent, reset_deep_agent
 
 
 # ---------------------------------------------------------------------------

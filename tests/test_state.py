@@ -3,7 +3,7 @@
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.state import AgentState
+from src.services.agent_orchestrator.state import AgentState
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +25,7 @@ class TestAgentStateDefaults:
             "recursion_depth",
             "pending_writes",
             "audit_log",
+            "routing_decisions",
             "token_usage",
             "iteration_count",
             "max_iterations",
@@ -51,6 +52,7 @@ def _build_state(**overrides):
         "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
+        "routing_decisions": [],
         "token_usage": {"input": 0, "output": 0, "total": 0},
         "iteration_count": 0,
         "max_iterations": 10,
@@ -63,7 +65,7 @@ class TestStateTransitions:
 
     def test_agent_node_moves_next_message_to_messages(self):
         """Agent node should consume next_message and append to messages."""
-        from src.nodes.review import call_agent_node
+        from src.services.agent_orchestrator.review import call_agent_node
 
         msg = AIMessage(content="staged answer")
         state = _build_state(next_message=msg, messages=[HumanMessage(content="hi")])
@@ -75,7 +77,7 @@ class TestStateTransitions:
         assert result["messages"][0].content == "staged answer"
 
     def test_agent_node_with_no_next_message_returns_empty(self):
-        from src.nodes.review import call_agent_node
+        from src.services.agent_orchestrator.review import call_agent_node
 
         state = _build_state(next_message=None)
         result = call_agent_node(state)
@@ -83,7 +85,7 @@ class TestStateTransitions:
         assert result["next_message"] is None
 
     def test_responder_extracts_from_next_message(self):
-        from src.nodes.review import call_responder_node
+        from src.services.agent_orchestrator.review import call_responder_node
 
         msg = AIMessage(content="final approved answer")
         state = _build_state(next_message=msg)
@@ -95,7 +97,7 @@ class TestStateTransitions:
         assert "final approved answer" in str(result["messages"][0].content)
 
     def test_responder_fallback_to_last_ai_message(self):
-        from src.nodes.review import call_responder_node
+        from src.services.agent_orchestrator.review import call_responder_node
 
         state = _build_state(
             next_message=None,
@@ -113,7 +115,7 @@ class TestStateTransitions:
         assert "the real answer" in str(result["messages"][0].content)
 
     def test_responder_returns_empty_when_no_messages(self):
-        from src.nodes.review import call_responder_node
+        from src.services.agent_orchestrator.review import call_responder_node
 
         state = _build_state(next_message=None, messages=[])
         result = call_responder_node(state)
@@ -147,7 +149,7 @@ class TestStateTransitions:
         assert new_count == 1
 
     def test_max_iterations_guard_prevents_runaway(self):
-        from src.nodes.plan import call_orchestrator
+        from src.services.agent_orchestrator.plan import call_orchestrator
 
         # Use a mock model that never returns tool calls.
         class MockModel:

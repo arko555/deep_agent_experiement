@@ -7,14 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.core.guardrails import (
+from src.services.agent_orchestrator.guardrails import (
     clear_workspace,
     get_workspace_root,
     validate_and_normalize_path,
     validate_read_path,
 )
-from src.core.memory import get_memory_content, get_skill_body, get_workspace_files
-from src.core.tools import edit_file, list_files, read_file, search_files, write_file
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body, get_workspace_files
+from src.services.tools_integration.tools import edit_file, list_files, read_file, search_files, write_file
 
 
 @pytest.fixture(autouse=True)
@@ -229,7 +229,7 @@ def test_internal_symlink_regular_file_is_allowed(tmp_path):
 
 
 def test_search_revalidates_enumerated_paths(tmp_path, monkeypatch):
-    from src.core import tools
+    from src.services.tools_integration import tools
     (tmp_path / "workspace").mkdir()
     (tmp_path / "outside").write_text("do not open")
     (tmp_path / "workspace/link").symlink_to(tmp_path / "outside")
@@ -316,7 +316,7 @@ def test_ui_helpers_share_policy_without_starting_streamlit(tmp_path, monkeypatc
 
 
 def test_graph_initialization_uses_custom_workspace(tmp_path, monkeypatch):
-    from src.core import agent_factory
+    from src.services.agent_orchestrator import agent_factory
     monkeypatch.setenv("WORKSPACE_ROOT", "custom")
     monkeypatch.setattr(agent_factory, "_compiled_graph", None)
     agent_factory.get_deep_agent()

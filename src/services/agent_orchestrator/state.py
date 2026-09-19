@@ -7,10 +7,11 @@ class AgentState(TypedDict):
     current_plan: List[str]                       # todo list (updated by write_todos)
     workspace_files: List[str]                    # synced after every tool execution
     next_message: Optional[BaseMessage]           # staging area for LLM response
-    review_verdict: Optional[str]                 # explicit verdict set by critic/plan_checker ("approved"|"rejected"|"compliant"|"violation")
-    recursion_depth: int                          # tracks subagent nesting depth
-    pending_writes: List[Dict]                    # staged write_file/edit_file ops awaiting human approval
-    audit_log: Annotated[List[Dict], add]        # structured log of actions and decisions
-    token_usage: Dict[str, int]                  # tracking API consumption
+    review_verdict: Optional[str]                 # critic / plan_checker verdict
+    recursion_depth: int                          # subagent nesting level
+    pending_writes: List[Dict]                    # file write operations for audit
+    audit_log: Annotated[List[Dict], add]         # append-only action log
+    routing_decisions: List[Dict]                 # department routing history
+    token_usage: Dict[str, int]                   # tracking API consumption
     iteration_count: int                          # current loop count
     max_iterations: int                           # limit on loops

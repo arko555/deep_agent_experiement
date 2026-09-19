@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.core.guardrails import get_workspace_root, validate_read_path
+from src.services.agent_orchestrator.guardrails import get_workspace_root, validate_read_path
 
 
 # ---------------------------------------------------------------------------

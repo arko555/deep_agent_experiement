@@ -5,7 +5,7 @@ from unittest.mock import patch
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 
-from src.core.subagents import run_tool_loop
+from src.services.agent_orchestrator.subagents import run_tool_loop
 
 
 class _FakeModel:
@@ -43,7 +43,7 @@ class TestRunToolLoop:
 
     def test_returns_final_text_and_empty_write_ops(self):
         model = _FakeModel([_ai("done")])
-        with patch("src.core.agent_factory.get_model", return_value=model):
+        with patch("src.services.agent_orchestrator.agent_factory.get_model", return_value=model):
             text, usage, write_ops = run_tool_loop("sys", "do the thing", [])
         assert text == "done"
         assert usage == {"input": 7, "output": 3}
@@ -56,7 +56,7 @@ class TestRunToolLoop:
                              "id": "1"}]),
             _ai("saved"),
         ])
-        with patch("src.core.agent_factory.get_model", return_value=model):
+        with patch("src.services.agent_orchestrator.agent_factory.get_model", return_value=model):
             text, usage, write_ops = run_tool_loop("sys", "write a file", [write_file])
         assert text == "saved"
         assert len(write_ops) == 1
@@ -69,7 +69,7 @@ class TestRunToolLoop:
             _ai(tool_calls=[{"name": "read_file", "args": {"path": "x"}, "id": "1"}]),
             _ai("done"),
         ])
-        with patch("src.core.agent_factory.get_model", return_value=model):
+        with patch("src.services.agent_orchestrator.agent_factory.get_model", return_value=model):
             _, _, write_ops = run_tool_loop("sys", "read a file", [read_file])
         assert write_ops == []
 
@@ -78,7 +78,7 @@ class TestRunToolLoop:
             _ai(tool_calls=[{"name": "read_file", "args": {"path": "x"}, "id": "1"}]),
             _ai("done"),
         ])
-        with patch("src.core.agent_factory.get_model", return_value=model):
+        with patch("src.services.agent_orchestrator.agent_factory.get_model", return_value=model):
             _, usage, _ = run_tool_loop("sys", "read", [read_file])
         assert usage == {"input": 14, "output": 6}
 
@@ -87,7 +87,7 @@ class TestToolsNodeSubagentAudit:
     """local_tools_node must fold subagent write ops into pending_writes."""
 
     def test_child_write_ops_merged_into_pending_writes(self):
-        from src.core import agent_factory
+        from src.services.agent_orchestrator import agent_factory
 
         def fake_execute(subagent_type, description, depth, tools_dict=None):
             return (
@@ -124,7 +124,7 @@ class TestToolsNodeSubagentAudit:
 
     def test_failed_task_yields_error_not_crash(self):
         """One failing task must not drop its siblings' results."""
-        from src.core import agent_factory
+        from src.services.agent_orchestrator import agent_factory
 
         def fake_execute(subagent_type, description, depth, tools_dict=None):
             # Deterministic per-task outcome (tasks run in a thread pool,
@@ -157,7 +157,7 @@ class TestToolsNodeSubagentAudit:
 
     def test_depth_rejection_uses_configured_limit(self):
         """6.3: the depth limit comes from config, not a magic number."""
-        from src.core import agent_factory
+        from src.services.agent_orchestrator import agent_factory
 
         state = {
             "messages": [AIMessage(
@@ -186,21 +186,21 @@ class TestRegistryDrivesTaskTool:
     direct-invoke bypass is closed."""
 
     def test_task_tool_schema_lists_exactly_the_registry_types(self):
-        from src.core.subagents import SUBAGENTS
-        from src.core.tools import task as task_tool
+        from src.services.agent_orchestrator.subagents import SUBAGENTS
+        from src.services.tools_integration.tools import task as task_tool
 
         schema = task_tool.args_schema.model_json_schema()
         assert set(schema["properties"]["subagent_type"]["enum"]) == set(SUBAGENTS)
 
     def test_task_tool_description_names_every_registry_type(self):
-        from src.core.subagents import SUBAGENTS
-        from src.core.tools import task as task_tool
+        from src.services.agent_orchestrator.subagents import SUBAGENTS
+        from src.services.tools_integration.tools import task as task_tool
 
         for name in SUBAGENTS:
             assert name in task_tool.description
 
     def test_direct_task_invoke_is_refused(self):
-        from src.core.tools import task as task_tool
+        from src.services.tools_integration.tools import task as task_tool
 
         result = task_tool.invoke({"subagent_type": "research", "description": "x"})
         assert "must be executed by the tools node" in result
@@ -210,8 +210,8 @@ class TestRegistryDrivesDispatch:
     """6.1: _execute_task dispatch is driven by the SUBAGENTS registry."""
 
     def test_tool_loop_dispatch_uses_registry_spec(self):
-        import src.core.tools as tools_mod
-        from src.core.subagents import SUBAGENTS
+        import src.services.tools_integration.tools as tools_mod
+        from src.services.agent_orchestrator.subagents import SUBAGENTS
 
         calls = {}
 
@@ -237,8 +237,8 @@ class TestRegistryDrivesDispatch:
         assert "Web Research Skill" in calls["prompt"]
 
     def test_unknown_type_lists_registry_types(self):
-        import src.core.tools as tools_mod
-        from src.core.subagents import SUBAGENTS
+        import src.services.tools_integration.tools as tools_mod
+        from src.services.agent_orchestrator.subagents import SUBAGENTS
 
         error, usage, ops = tools_mod._execute_task("nope", "d", 0)
         assert usage == {} and ops == []
@@ -250,7 +250,7 @@ class TestRegistryDrivesParallelGrouping:
     """6.1: the parallel-vs-sequential split follows the registry flag."""
 
     def test_is_parallelizable_matches_registry(self):
-        from src.core.subagents import SUBAGENTS, is_parallelizable
+        from src.services.agent_orchestrator.subagents import SUBAGENTS, is_parallelizable
 
         for name, spec in SUBAGENTS.items():
             assert is_parallelizable(name) is spec.parallelizable

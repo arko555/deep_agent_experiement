@@ -5,8 +5,8 @@ plan presence) rather than inspecting message content, so routing can never
 be fooled by a verdict keyword appearing inside a response.
 """
 
-from src.core.config import get_max_iterations
-from src.state import AgentState
+from src.config import get_max_iterations
+from src.services.agent_orchestrator.state import AgentState
 
 
 def route_from_orchestrator(state: AgentState):

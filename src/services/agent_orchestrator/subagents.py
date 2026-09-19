@@ -17,9 +17,9 @@ from dotenv import load_dotenv
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.core.config import get_a2a_agents
-from src.core.memory import get_memory_content, get_skill_body
-from src.core.utils import get_message_text, invoke_with_retry
+from src.config import get_a2a_agents
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
+from src.utils import get_message_text, invoke_with_retry
 
 # A2A subagent types come from configuration, but the `task` tool's type enum
 # is built statically from this registry — so `.env` must be loaded before the
@@ -170,7 +170,7 @@ def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterati
         operations it performed (for the parent's audit trail).
     """
     # Lazy import to avoid a circular dependency at module load time.
-    from src.core.agent_factory import get_model
+    from src.services.agent_orchestrator.agent_factory import get_model
 
     model = get_model()
     model_with_tools = model.bind_tools(tools) if tools else model

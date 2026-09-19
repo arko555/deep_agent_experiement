@@ -8,8 +8,8 @@ from datetime import datetime
 from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
-from src.core.guardrails import clear_workspace, get_workspace_root, validate_read_path
-from src.core.memory import get_workspace_files, get_memory_content, get_skill_info
+from src.services.agent_orchestrator.guardrails import clear_workspace, get_workspace_root, validate_read_path
+from src.services.agent_orchestrator.memory import get_workspace_files, get_memory_content, get_skill_info
 
 # --- Logging Configuration ---
 logging.basicConfig(

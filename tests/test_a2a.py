@@ -26,8 +26,8 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 
-from src.core import a2a_client, tools as tools_mod
-from src.core.subagents import SubagentSpec
+from src.services.tools_integration import a2a_client, tools as tools_mod
+from src.services.agent_orchestrator.subagents import SubagentSpec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -206,7 +206,7 @@ class TestFailureReporting:
 class TestExecutionDispatch:
 
     def test_execute_task_dispatches_a2a_kind(self, monkeypatch):
-        import src.core.a2a_client as a2a_mod
+        import src.services.tools_integration.a2a_client as a2a_mod
 
         spec = SubagentSpec(description="remote", kind="a2a", url="http://agent.test")
         monkeypatch.setattr(tools_mod, "resolve_subagent", lambda _t: spec)
@@ -220,7 +220,7 @@ class TestExecutionDispatch:
         assert usage == {} and writes == []
 
     def test_a2a_specs_come_from_config(self, monkeypatch):
-        import src.core.subagents as subagents_mod
+        import src.services.agent_orchestrator.subagents as subagents_mod
 
         monkeypatch.setattr(
             subagents_mod, "get_a2a_agents",
@@ -249,8 +249,8 @@ def test_configured_a2a_agents_appear_in_registry_and_task_schema():
         }),
     }
     code = (
-        "from src.core.subagents import SUBAGENTS, is_parallelizable\n"
-        "from src.core.tools import task\n"
+        "from src.services.agent_orchestrator.subagents import SUBAGENTS, is_parallelizable\n"
+        "from src.services.tools_integration.tools import task\n"
         "enum = task.args_schema.model_json_schema()['properties']['subagent_type']['enum']\n"
         "print('REG', sorted(SUBAGENTS))\n"
         "print('ENUM', sorted(enum))\n"

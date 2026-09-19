@@ -1,9 +1,9 @@
-"""Tests for conversation summarization — verify compression preserves context."""
+"""Tests for session memory compression — verify summarization preserves context."""
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
 
-from src.core.summarization import (
+from src.services.session_memory.compression import (
     compress_messages,
     _extract_role_label,
     _summarize_old_messages,
@@ -52,9 +52,7 @@ class TestCompressMessagesUnderThreshold:
     def test_over_threshold_does_compress(self):
         msgs = [HumanMessage(content=f"msg{i}") for i in range(25)]
         result = compress_messages(msgs, max_history=20)
-        # Should have: 1 summary + min_keep recent
         assert len(result) <= 21
-        # First item should be a summary (HumanMessage with summary content).
         assert isinstance(result[0], HumanMessage)
         assert "Summary" in result[0].content
 
@@ -95,8 +93,6 @@ class TestCompressMessagesBehavior:
             AIMessage(content="Sent successfully."),
         ]
         result = compress_messages(msgs, max_history=8)
-
-        # Should have a summary + recent messages.
         assert len(result) > 1
         summary_content = str(result[0].content)
         assert "Summary" in summary_content
@@ -105,37 +101,24 @@ class TestCompressMessagesBehavior:
     def test_tool_errors_appear_in_summary(self):
         msgs = [
             HumanMessage(content="Do something"),
-            ToolMessage(
-                content="Error: file not found",
-                tool_call_id="1",
-                name="read_file",
-            ),
+            ToolMessage(content="Error: file not found", tool_call_id="1", name="read_file"),
             AIMessage(content="Let me try another approach"),
-            ToolMessage(
-                content="Error: permission denied",
-                tool_call_id="2",
-                name="write_file",
-            ),
+            ToolMessage(content="Error: permission denied", tool_call_id="2", name="write_file"),
             AIMessage(content="I'll handle this differently"),
         ]
-        # Force compression by setting a very low max_history.
         result = compress_messages(msgs, max_history=2)
-
         summary_content = str(result[0].content)
         assert "Error" in summary_content or "error" in summary_content.lower()
 
     def test_min_keep_recent_preserved(self):
         msgs = [AIMessage(content=f"msg{i}") for i in range(30)]
         result = compress_messages(msgs, max_history=10)
-
-        # The last MIN_KEEP_RECENT messages should be intact.
-        recent_count = len(result) - 1  # minus the summary
+        recent_count = len(result) - 1
         assert recent_count >= MIN_KEEP_RECENT
 
     def test_summary_comes_first(self):
         msgs = [HumanMessage(content=f"msg{i}") for i in range(25)]
         result = compress_messages(msgs, max_history=10)
-
         assert isinstance(result[0], HumanMessage)
         assert "Summary" in result[0].content
 
@@ -148,22 +131,19 @@ class TestCompressMessagesToolGroups:
             {"name": "search", "args": {}, "id": call_id}
             for call_id in ["a", "b", "c"]
         ])
-        # Results may arrive in a different order than the assistant's calls.
         group = [calls] + [
             ToolMessage(content=f"result {call_id}", tool_call_id=call_id)
             for call_id in ["c", "a", "b"]
         ]
         msgs = [HumanMessage(content="older context"), *group]
         original = list(msgs)
-
         result = compress_messages(msgs, max_history=max_history)
-
         assert result[1:] == group
         assert all(actual is expected for actual, expected in zip(result[1:], group))
         assert {call["id"] for call in result[1].tool_calls} == {
             msg.tool_call_id for msg in result[2:]
         }
-        assert len(result) > max_history  # protocol validity wins over the limit
+        assert len(result) > max_history
         assert msgs == original
 
     def test_single_result_at_limit_retains_its_call(self):
@@ -175,9 +155,7 @@ class TestCompressMessagesToolGroups:
             ToolMessage(content="result", tool_call_id="single"),
             AIMessage(content="answer"),
         ]
-
         result = compress_messages(msgs, max_history=3)
-
         assert result[1:] == msgs[1:]
 
     def test_oversized_group_without_older_messages_is_unchanged(self):
@@ -189,9 +167,7 @@ class TestCompressMessagesToolGroups:
             ToolMessage(content="result", tool_call_id=call_id)
             for call_id in ["a", "b"]
         ]
-
         result = compress_messages(msgs, max_history=2)
-
         assert result == msgs
         assert all(actual is expected for actual, expected in zip(result, msgs))
 
@@ -208,9 +184,7 @@ class TestCompressMessagesToolGroups:
                   for call_id in reversed(call_ids)],
             ])
         msgs = groups[0] + groups[1]
-
         result = compress_messages(msgs, max_history=3)
-
         assert result[1:] == groups[1]
         assert "Exchanged 3 messages" in result[0].content
         assert "2 tool results" in result[0].content
@@ -224,9 +198,7 @@ class TestCompressMessagesToolGroups:
             ToolMessage(content="first result", tool_call_id="a"),
             ToolMessage(content="last result", tool_call_id="b"),
         ]
-
         result = compress_messages(msgs, max_history=1)
-
         assert len(result) == 1
         assert "Exchanged 3 messages" in result[0].content
         assert "2 tool results" in result[0].content
@@ -240,9 +212,7 @@ class TestCompressMessagesToolGroups:
             ToolMessage(content="old result", tool_call_id="old-call"),
             AIMessage(content="final answer"),
         ]
-
         result = compress_messages(msgs, max_history=2)
-
         assert result[1:] == msgs[-1:]
         assert "1 tool results" in result[0].content
 

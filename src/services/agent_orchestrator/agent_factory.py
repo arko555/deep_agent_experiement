@@ -23,27 +23,28 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 # pyrefly: ignore [missing-import]
-from src.state import AgentState
+from src.services.agent_orchestrator.state import AgentState
 # pyrefly: ignore [missing-import]
-from src.core.config import (
+from src.config import (
     get_max_parallel_tasks,
     get_max_subagent_depth,
     get_subagent_timeout_seconds,
 )
-from src.core.subagents import is_parallelizable
-from src.core.mcp_client import clear_mcp_tools_cache
-from src.core.memory import get_workspace_files, get_system_prompt
-from src.core.guardrails import get_workspace_root
-from src.core.routing import (
+from src.services.agent_orchestrator.subagents import is_parallelizable
+from src.services.tools_integration.mcp_client import clear_mcp_tools_cache as clear_mcp_client_cache
+from src.services.tools_integration.mcp_bridge import clear_mcp_tools_cache as clear_mcp_bridge_cache
+from src.services.agent_orchestrator.memory import get_workspace_files, get_system_prompt
+from src.services.agent_orchestrator.guardrails import get_workspace_root
+from src.services.agent_orchestrator.routing import (
     route_from_orchestrator,
     route_from_critic,
     route_from_plan_checker,
     route_from_reflection,
 )
-from src.core.utils import invoke_with_retry
-from src.core.tools import get_all_tools, _execute_task
-from src.nodes.plan import call_orchestrator
-from src.nodes.review import (
+from src.services.tools_integration.tools import create_tool_registry, _execute_task, get_all_tools
+from src.services.tools_integration.executor import ToolExecutor
+from src.services.agent_orchestrator.plan import call_orchestrator
+from src.services.agent_orchestrator.review import (
     call_agent_node,
     call_responder_node,
     call_critic_node,
@@ -199,8 +200,8 @@ def _get_cached_model():
 # --- Graph Wrapper Nodes ---
 
 def local_orchestrator_node(state: AgentState):
-    current_tools = get_all_tools()
-    return call_orchestrator(state, model=get_model(), tools=list(current_tools.values()))
+    current_tools = list(get_all_tools().values())
+    return call_orchestrator(state, model=get_model(), tools=current_tools)
 
 
 def local_agent_node(state: AgentState):
@@ -217,7 +218,8 @@ def local_tools_node(state: AgentState):
     tool_messages = []
     updates = {}
 
-    current_tools = get_all_tools()
+    registry = create_tool_registry()
+    executor = ToolExecutor(registry)
 
     audit_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -251,12 +253,14 @@ def local_tools_node(state: AgentState):
 
         audit_entry["tool_calls"].append({"name": tool_name, "args": tool_args})
 
-        if tool_name in current_tools:
-            tool_func = current_tools[tool_name]
-            # Shared retry wrapper (exponential backoff); returns an error
-            # string on failure rather than raising, so the graph can continue.
+        tool_func = registry.get_callable(tool_name)
+        # Shared retry wrapper (exponential backoff); returns an error
+        # string on failure rather than raising, so the graph can continue.
+        if tool_func is not None:
             try:
-                result = invoke_with_retry(tool_func, tool_args)
+                result = executor.execute_sync(
+                    tool_name, tool_args, "general-purpose"
+                )
             except Exception as e:
                 result = f"Error executing tool {tool_name}: {str(e)}"
 
@@ -317,7 +321,7 @@ def local_tools_node(state: AgentState):
             task_info["subagent_type"],
             task_info["description"],
             recursion_depth,
-            current_tools,
+            get_all_tools(),
         )
         return (task_info["tool_id"], result, usage, write_ops)
 
@@ -500,4 +504,5 @@ def reset_deep_agent():
     global _compiled_graph
     _compiled_graph = None
     _model_cache.clear()
-    clear_mcp_tools_cache()
+    clear_mcp_client_cache()
+    clear_mcp_bridge_cache()

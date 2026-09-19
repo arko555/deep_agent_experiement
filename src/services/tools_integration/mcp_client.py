@@ -17,8 +17,8 @@ import logging
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from src.core.async_bridge import run_sync
-from src.core.config import get_mcp_servers
+from src.async_bridge import run_sync
+from src.config import get_mcp_servers
 
 logger = logging.getLogger(__name__)
 

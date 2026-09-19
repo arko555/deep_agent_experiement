@@ -28,7 +28,7 @@ def _state() -> dict:
 
 
 def test_critic_recovers_from_transient_failure():
-    from src.nodes.review import call_critic_node
+    from src.services.agent_orchestrator.review import call_critic_node
     model = _FlakyModel("APPROVED — the answer is solid.")
     result = call_critic_node(_state(), model)
     assert model.calls == 2  # retried after the transient error
@@ -36,7 +36,7 @@ def test_critic_recovers_from_transient_failure():
 
 
 def test_plan_checker_recovers_from_transient_failure():
-    from src.nodes.review import call_plan_checker_node
+    from src.services.agent_orchestrator.review import call_plan_checker_node
     state = _state()
     state["current_plan"] = ["step one"]
     model = _FlakyModel("COMPLIANT — follows the plan.")
@@ -46,7 +46,7 @@ def test_plan_checker_recovers_from_transient_failure():
 
 
 def test_reflection_recovers_from_transient_failure():
-    from src.nodes.review import call_reflection_node
+    from src.services.agent_orchestrator.review import call_reflection_node
     model = _FlakyModel("Revised strategy: split the task first.")
     result = call_reflection_node(_state(), model)
     assert model.calls == 2

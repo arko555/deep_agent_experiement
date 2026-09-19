@@ -93,7 +93,7 @@ Notes:
 | `agent.py` | Thin facade — re-exports `get_deep_agent()` |
 | `main.py` | CLI REPL over the cached compiled graph |
 | `app.py` | Streamlit UI — chat, action log, plan, skills, workspace files (the `ui` extra) |
-| `src/state.py` | `AgentState` TypedDict |
+| `src/services/agent_orchestrator/state.py` | `AgentState` TypedDict |
 | `src/core/agent_factory.py` | Graph construction, `tools` node (task batch execution), model selection + caching |
 | `src/core/subagents.py` | `SUBAGENTS` registry + `SubagentSpec`; role prompt builder |
 | `src/core/routing.py` | Conditional edges (explicit-state routing) |

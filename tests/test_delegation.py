@@ -13,7 +13,7 @@ import time
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from src.core import agent_factory
+from src.services.agent_orchestrator import agent_factory
 from tests.fake_models import ScriptedChatModel, ai
 
 
@@ -31,6 +31,7 @@ def _initial_state(user_message: str) -> dict:
         "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
+        "routing_decisions": [],
         "token_usage": {},
         "iteration_count": 0,
         "max_iterations": 25,
@@ -71,7 +72,7 @@ def patched_model(monkeypatch):
 class TestDelegationContract:
 
     def test_delegation_uses_bound_tool_name(self, sandbox, patched_model):
-        from src.core.tools import task
+        from src.services.tools_integration.tools import task
 
         class BoundNameModel(ScriptedChatModel):
             def bind_tools(self, tools, **kwargs):

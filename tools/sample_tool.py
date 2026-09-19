@@ -1,6 +1,9 @@
 from langchain_core.tools import tool
+from src.services.tools_integration.decorator import tool_spec
+
 
 @tool
+@tool_spec(name="get_current_time", description="Returns the current time in the specified timezone.", risk_level="low")
 def get_current_time(timezone: str = "UTC") -> str:
     """Returns the current time in the specified timezone.
 

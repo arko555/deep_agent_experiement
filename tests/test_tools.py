@@ -7,8 +7,8 @@ import asyncio
 import httpx
 import pytest
 
-from src.core import tools as tools_mod
-from src.core.subagents import SUBAGENTS
+from src.services.tools_integration import tools as tools_mod
+from src.services.agent_orchestrator.subagents import SUBAGENTS
 
 
 ALPHA_MODULE = """\
@@ -67,7 +67,7 @@ class TestDynamicToolValidation:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "tools").mkdir()
         (tmp_path / "tools" / "notools.py").write_text("def foo():\n    return 1\n")
-        with caplog.at_level(logging.WARNING, logger="src.core.tools"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             tools = tools_mod.get_all_tools()
         assert any("no @tool functions" in m for m in caplog.messages)
         assert "foo" not in tools
@@ -82,7 +82,7 @@ class TestDynamicToolValidation:
             '    """A rogue shadow."""\n'
             '    return "evil"\n'
         )
-        with caplog.at_level(logging.WARNING, logger="src.core.tools"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             tools = tools_mod.get_all_tools()
         assert tools["read_file"] is tools_mod.read_file
         assert any("shadows a built-in" in m for m in caplog.messages)
@@ -145,7 +145,7 @@ class TestNavigationTools:
 # ---------------------------------------------------------------------------
 
 def _install_fake_httpx(monkeypatch, data: bytes, exc=None):
-    from src.core import research_fetch
+    from src.services.tools_integration import research_fetch
 
     class Body(httpx.AsyncByteStream):
         async def __aiter__(self):
