@@ -1,56 +1,48 @@
 """Routing functions for the deep agent graph.
 
-Routers branch on explicit state fields (``review_verdict``, tool calls,
-plan presence) rather than inspecting message content, so routing can never
-be fooled by a verdict keyword appearing inside a response.
+The graph is a ReAct loop around the dispatcher:
+
+    START → orchestrator → {tools | subagent_fanout | responder}
+                 ↑              │
+                 └──────────────┘   (tools node loops back until the model
+                                       stops asking for tools)
+
+``route_after_orchestrator`` is the single conditional edge out of the
+dispatcher. It checks tool calls first, because a model that wants a tool emits
+one *instead of* the JSON envelope.
 """
 
-from src.config import get_max_iterations
 from src.services.agent_orchestrator.state import AgentState
 
 
+def _has_tool_calls(state: AgentState) -> bool:
+    """True when the dispatcher's last message requests tool execution."""
+    for message in reversed(state.get("messages") or []):
+        if getattr(message, "type", None) == "ai":
+            return bool(getattr(message, "tool_calls", None))
+        break  # only the most recent AI message decides
+    return False
+
+
+def route_after_orchestrator(state: AgentState):
+    """Route out of the dispatcher: tools → fanout → responder, in that order.
+
+    Tool calls win over departments. A model that wants to run a tool does not
+    also return a department envelope, so there is no case where both are set
+    and the ordering matters — but checking tool calls first is what makes an
+    empty ``department_targets`` non-fatal.
+    """
+    if _has_tool_calls(state):
+        return "tools"
+    if state.get("department_targets"):
+        return "subagent_fanout"
+    return "responder"
+
+
 def route_from_orchestrator(state: AgentState):
-    next_msg = state.get("next_message")
-    if not next_msg:
-        return "end"
+    """Backwards-compatible alias for :func:`route_after_orchestrator`.
 
-    if hasattr(next_msg, "tool_calls") and next_msg.tool_calls:
-        return "agent"
-
-    # Budget exhausted: deliver the orchestrator's stop message instead of
-    # burning more reviewer cycles on it.
-    max_iterations = state.get("max_iterations") or get_max_iterations()
-    if state.get("iteration_count", 0) >= max_iterations:
-        return "responder"
-
-    plan = state.get("current_plan", [])
-    if plan:
-        return "plan_checker"
-    return "critic"
-
-
-
-def route_from_critic(state: AgentState):
-    # The critic node sets ``review_verdict`` explicitly.
-    if state.get("review_verdict") == "approved":
-        return "responder"
-
-    # After repeated rejections, route through reflection to break the loop
-    # and generate a revised strategy before going back to orchestrator.
-    iteration_count = state.get("iteration_count", 0)
-    if iteration_count >= 4:
-        return "reflection"
-
-    return "orchestrator"
-
-
-def route_from_reflection(state: AgentState):
-    # Reflection produces strategic guidance; go back to orchestrator to act on it.
-    return "orchestrator"
-
-
-def route_from_plan_checker(state: AgentState):
-    # The plan checker sets ``review_verdict`` explicitly.
-    if state.get("review_verdict") == "compliant":
-        return "critic"
-    return "orchestrator"
+    Kept because ``agent_orchestrator.__init__`` exports this name and external
+    callers may import it. The Phase 3 graph uses the new name.
+    """
+    return route_after_orchestrator(state)

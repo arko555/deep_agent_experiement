@@ -12,6 +12,16 @@ _saver = MemorySaver()
 _latest: dict[str, str] = {}
 
 
+def get_saver() -> MemorySaver:
+    """Return the shared MemorySaver.
+
+    The graph must compile with this same instance, otherwise it writes
+    conversation history to a private saver that ``get_session`` can never
+    read and the orchestrator sees an empty window on every turn.
+    """
+    return _saver
+
+
 def _config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
 

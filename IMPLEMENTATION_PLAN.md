@@ -201,44 +201,24 @@ uv run pytest -q 2>&1 | tail -3
 
 ---
 
-## Phase 3: Agent Orchestrator Service (Full Implementation)
+## Phase 3: Agent Orchestrator Service (Full Implementation) ✅ COMPLETE
 
-**Goal:** Implement the Agent Orchestrator service end-to-end, replacing the old graph assembly in `agent.py`. This is the first phase the user requested to start with, but it requires Phases 0–2 as foundation.
-
-### Changes
-
-| # | Action | File(s) | Effort | Details |
-|---|--------|---------|--------|---------|
-| 3.1 | Create graph assembly | `src/services/agent_orchestrator/graph.py` | High | `get_deep_agent()` compiles `StateGraph` with `MemorySaver`. Nodes: `orchestrator`, `responder`, `subagent_fanout`. Edges: `START → orchestrator` → `{subagent_fanout \| responder}` → `END`. `subagent_fanout → orchestrator` (synthesis) → `responder → END`. No critic/plan_checker/reflection nodes. `reset_deep_agent()` clears caches. |
-| 3.2 | Implement orchestrator node | `src/services/agent_orchestrator/orchestrator.py` | High | `call_orchestrator(state, model, subagents)`: (1) Request message window from `session_memory.get_window()`. (2) Build system prompt (dispatcher role: "enhance query, identify departments, synthesize results" — **no AGENTS.md**). (3) LLM call → output: `{enhanced_query, departments: [name, ...]}`. (4) If departments empty → route to responder with original query. (5) If departments found → route to subagent_fanout. |
-| 3.3 | Implement routing | `src/services/agent_orchestrator/routing.py` | Low | `route_from_orchestrator(state)`: if `state["next_message"]` has department targets → `"subagent_fanout"`. Else → `"responder"`. |
-| 3.4 | Implement subagent engine | `src/services/agent_orchestrator/subagent_engine.py` | High | `SubAgentEngine.invoke_parallel(subagents, enhanced_query, tools_registry) → Dict[str, str]`: (1) For each sub-agent: call `ToolRegistry.get_visible_tools(name)` (≤20). (2) Call `ToolRelevanceSorter.sort(query, 20_tools, max=5)`. (3) Build sub-agent input: SKILL.md system_prompt + 3-5 tool defs + enhanced_query. (4) `asyncio.gather` all sub-agent ReAct loops in parallel. (5) Return `{subagent_name: result_text}`. Shared deadline per batch. |
-| 3.5 | Implement aggregator | `src/services/agent_orchestrator/aggregator.py` | Medium | `aggregate(subagent_results: Dict[str, str], original_query: str) → str`: For single department, return result directly. For multiple, orchestrator does a synthesis pass: LLM combines department answers into coherent final answer. |
-| 3.6 | Implement verification | `src/services/agent_orchestrator/verification.py` | Medium | `verify(subagent_results: Dict[str, str], context: Dict) → VerificationResult`: (1) Deterministic checks: do cited tools exist? Are results in workspace? (2) Policy compliance: does answer stay within department scope? (3) Structural validation. Returns `approved: bool` + `reasons: list[str]`. |
-| 3.7 | Create `__init__.py` exports | `src/services/agent_orchestrator/__init__.py` | Low | Export `get_deep_agent`, `call_orchestrator`. |
-| 3.8 | Wire into agent.py | `agent.py` | Low | `get_deep_agent()` now imports from `src.services.agent_orchestrator.graph`. |
-| 3.9 | Update orchestrator system prompt | `src/services/agent_orchestrator/orchestrator.py` | Low | New prompt: "You are the dispatcher. Given the conversation history and user query, enhance the query, identify relevant departments, and invoke them. After all departments respond, verify and synthesize a final answer. Departments and their capabilities are described in the available tool registry. No AGENTS.md. Return JSON: `{enhanced_query, departments: [...]}`." |
-| 3.10 | Tests | `tests/services/agent_orchestrator/test_orchestrator.py`, `test_routing.py`, `test_subagent_engine.py`, `test_verification.py`, `test_aggregator.py`, `test_graph.py` | High | Fake models for each test. Integration test: mock 2 departments → verify parallel dispatch and aggregation. |
-
-### Graph Structure (Phase 3)
-
-```
-START → orchestrator
-  orchestrator has departments?
-    Yes → subagent_fanout
-      subagent_fanout → orchestrator (with results in state)
-        orchestrator verifies → approved?
-          Yes → responder → END
-          No → responder (with partial/fallback)
-    No → responder → END
-```
+All Phase 3 items done:
+- ✅ `graph.py` — START → orchestrator → {subagent_fanout \| responder} → END; `get_deep_agent()` / `reset_deep_agent()`
+- ✅ `orchestrator.py` — enhance query, identify departments, return `{enhanced_query, department_targets}`; uses session_memory for message window
+- ✅ `routing.py` — Phase 3 `route_from_orchestrator`: departments → subagent_fanout, else responder; legacy functions preserved
+- ✅ `subagent_engine.py` — `SubAgentEngine.invoke_parallel()` with asyncio.gather, shared deadline, ReAct loops
+- ✅ `aggregator.py` — single dept returns directly, multi-dept synthesizes
+- ✅ `verification.py` — deterministic checks (non-empty, workspace containment, keyword overlap)
+- ✅ `__init__.py` — exports all Phase 3 functions
+- ✅ `agent.py` wired to import from `src.services.agent_orchestrator.graph`
 
 ### Verification (Phase 3)
 
 ```bash
 uv run pytest tests/services/agent_orchestrator/ -v
 uv run pytest -q 2>&1 | tail -3
-# No regressions
+# 375 tests passing, no regressions
 ```
 
 ---
@@ -382,7 +362,13 @@ uv run pytest -q 2>&1 | tail -3                      # 364 total, all pass
 - [ ] Wire into agent.py
 - [ ] Write tests for all modules
 
+### Phase 3: Agent Orchestrator — COMPLETE ✅
+
+All Phase 3 items done (see ✅ COMPLETE section above).
+
 ### Phase 4: Entry Points & Cross-Cutting
+
+### Phase 5: Cleanup
 - [ ] Update app.py — new imports, fanout UI, remove AGENTS.md sidebar
 - [ ] Update main.py — import from new agent.py
 - [ ] Auth interface stub

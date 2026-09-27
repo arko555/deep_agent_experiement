@@ -15,3 +15,10 @@ class AgentState(TypedDict):
     token_usage: Dict[str, int]                   # tracking API consumption
     iteration_count: int                          # current loop count
     max_iterations: int                           # limit on loops
+    # Phase 3 fields
+    enhanced_query: str                           # LLM-enhanced query
+    department_targets: List[str]                 # departments detected by orchestrator
+    subagent_results: Dict[str, str]              # results from parallel sub-agent dispatch
+    thread_id: str                                # conversation thread (from runtime config)
+    consecutive_invalid_tools: int                # in a row tool calls that named no real tool
+

@@ -7,6 +7,7 @@ Routing, tools, and retry logic are imported from their dedicated modules.
 import os
 import time
 import uuid
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -33,26 +34,20 @@ from src.config import (
 from src.services.agent_orchestrator.subagents import is_parallelizable
 from src.services.tools_integration.mcp_client import clear_mcp_tools_cache as clear_mcp_client_cache
 from src.services.tools_integration.mcp_bridge import clear_mcp_tools_cache as clear_mcp_bridge_cache
-from src.services.agent_orchestrator.memory import get_workspace_files, get_system_prompt
+from src.services.agent_orchestrator.memory import get_workspace_files
 from src.services.agent_orchestrator.guardrails import get_workspace_root
-from src.services.agent_orchestrator.routing import (
-    route_from_orchestrator,
-    route_from_critic,
-    route_from_plan_checker,
-    route_from_reflection,
+from src.services.agent_orchestrator.graph import (
+    _local_orchestrator_node,
+    _responder_node,
+    _subagent_fanout_node,
 )
+from src.services.agent_orchestrator.routing import route_from_orchestrator
 from src.services.tools_integration.tools import create_tool_registry, _execute_task, get_all_tools
 from src.services.tools_integration.executor import ToolExecutor
-from src.services.agent_orchestrator.plan import call_orchestrator
-from src.services.agent_orchestrator.review import (
-    call_agent_node,
-    call_responder_node,
-    call_critic_node,
-    call_plan_checker_node,
-    call_reflection_node,
-)
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 # --- Cached Compiled Graph ---
@@ -199,19 +194,6 @@ def _get_cached_model():
 
 # --- Graph Wrapper Nodes ---
 
-def local_orchestrator_node(state: AgentState):
-    current_tools = list(get_all_tools().values())
-    return call_orchestrator(state, model=get_model(), tools=current_tools)
-
-
-def local_agent_node(state: AgentState):
-    return call_agent_node(state)
-
-
-def local_responder_node(state: AgentState):
-    return call_responder_node(state)
-
-
 def local_tools_node(state: AgentState):
     messages = state["messages"]
     last_message = messages[-1]
@@ -246,6 +228,7 @@ def local_tools_node(state: AgentState):
             non_task_calls.append(tool_call)
 
     # Execute non-task tools first (these are sequential).
+    invalid_tool_count = 0
     for tool_call in non_task_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
@@ -279,10 +262,38 @@ def local_tools_node(state: AgentState):
                     }
                     existing_pending = state.get("pending_writes", [])
                     updates["pending_writes"] = existing_pending + [pending_entry]
+
+            # A real tool ran, so any earlier streak of unknown-tool misses is
+            # broken — the model has recovered. Only *consecutive* misses count.
+            if state.get("consecutive_invalid_tools"):
+                updates["consecutive_invalid_tools"] = 0
         else:
-            result = f"Tool '{tool_name}' not found."
+            # The model asked for a tool that does not exist. Do not silently
+            # return "not found" and let it retry forever: name the valid
+            # tools so the model can correct itself on the next turn, and
+            # count the miss so the graph can cut the loop short.
+            invalid_tool_count += 1
+            available = ", ".join(sorted(registry.list_tools()))
+            result = (
+                f"Error: no tool named '{tool_name}'. "
+                f"Available tools: {available}. "
+                f"Call one of those, or answer the user directly without a tool."
+            )
+            logger.warning(
+                "Model requested unknown tool '%s' (invalid #%d this turn)",
+                tool_name, invalid_tool_count,
+            )
 
         tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_id, name=tool_name))
+
+    # Consecutive unknown-tool misses are the signature of a model stuck in a
+    # retry loop, so the router uses this to stop early rather than spending
+    # the whole iteration budget re-asking for a tool that will never exist.
+    if invalid_tool_count:
+        updates["consecutive_invalid_tools"] = (
+            state.get("consecutive_invalid_tools", 0) + invalid_tool_count
+        )
+
 
     # 4.2: Execute task calls — run independent tasks in parallel when possible.
     # Tasks are considered independent if they have different subagent types
@@ -400,18 +411,16 @@ def local_tools_node(state: AgentState):
     return updates
 
 
-def local_reflection_node(state: AgentState):
-    """Wrapper for the reflection node — prompts agent to reconsider its approach."""
-    return call_reflection_node(state, get_model())
-
-
 # --- Graph Construction ---
 
 def get_deep_agent():
-    """Return the compiled deep agent graph (cached after first call)."""
-    global _compiled_graph
-    if _compiled_graph is not None:
-        return _compiled_graph
+    """Return the compiled deep agent graph.
+
+    The graph itself is owned by ``graph.get_deep_agent`` so there is exactly
+    one compiled instance; this wrapper keeps the workspace/skills bootstrap
+    that the ``task`` tool and the Streamlit app depend on.
+    """
+    from src.services.agent_orchestrator.graph import get_deep_agent as _compile
 
     workspace_root = str(get_workspace_root())
     if not os.path.exists(workspace_root):
@@ -421,76 +430,18 @@ def get_deep_agent():
     if not os.path.exists(skills_root):
         os.makedirs(skills_root)
 
-    workflow = StateGraph(AgentState)
+    return _compile()
 
-    # --- Core nodes ---
-    workflow.add_node("orchestrator", local_orchestrator_node)
-    workflow.add_node("agent", local_agent_node)
-    workflow.add_node("responder", local_responder_node)
-    workflow.add_node("tools", local_tools_node)
-    workflow.add_node("critic", lambda state: call_critic_node(state, get_model()))
-    workflow.add_node("plan_checker", lambda state: call_plan_checker_node(state, get_model()))
 
-    # --- 4.1: Reflection node — agent reconsiders approach before retrying ---
-    workflow.add_node("reflection", local_reflection_node)
+def clear_caches():
+    """Drop cached model clients and MCP tool registries.
 
-    workflow.set_entry_point("orchestrator")
-
-    # Orchestrator routes to agent/critic/plan_checker/responder/end based on state.
-    workflow.add_conditional_edges(
-        "orchestrator",
-        route_from_orchestrator,
-        {
-            "agent": "agent",
-            "critic": "critic",
-            "plan_checker": "plan_checker",
-            "responder": "responder",
-            "end": END,
-        },
-    )
-
-    # Agent (staging) → tools execution → back to orchestrator
-    workflow.add_edge("agent", "tools")
-    workflow.add_edge("tools", "orchestrator")
-
-    # Critic routes: approved → responder, rejected → reflection or orchestrator.
-    workflow.add_conditional_edges(
-        "critic",
-        route_from_critic,
-        {
-            "responder": "responder",
-            "reflection": "reflection",
-            "orchestrator": "orchestrator",
-        },
-    )
-
-    # Plan checker routes: compliant → critic, violation → orchestrator.
-    workflow.add_conditional_edges(
-        "plan_checker",
-        route_from_plan_checker,
-        {
-            "critic": "critic",
-            "orchestrator": "orchestrator",
-        },
-    )
-
-    # 4.1: Reflection → orchestrator (with revised strategy).
-    workflow.add_conditional_edges(
-        "reflection",
-        route_from_reflection,
-        {
-            "orchestrator": "orchestrator",
-        },
-    )
-
-    # Responder delivers the final answer.
-    workflow.add_edge("responder", END)
-
-    # --- Compile with checkpointer. Observability (8.3) is attached at the
-    # model level via _maybe_attach_callbacks, so no per-node hooking here. ---
-    checkpointer = MemorySaver()
-    _compiled_graph = workflow.compile(checkpointer=checkpointer)
-    return _compiled_graph
+    The compiled graph is owned by ``graph.py``; use
+    ``graph.reset_deep_agent()`` (re-exported here) to clear everything.
+    """
+    _model_cache.clear()
+    clear_mcp_client_cache()
+    clear_mcp_bridge_cache()
 
 
 def reset_deep_agent():
@@ -501,8 +452,8 @@ def reset_deep_agent():
     will compile a new instance and rebuild provider clients (8.5) and MCP
     tools (10.1).
     """
+    from src.services.agent_orchestrator.graph import reset_deep_agent as _reset
+
     global _compiled_graph
     _compiled_graph = None
-    _model_cache.clear()
-    clear_mcp_client_cache()
-    clear_mcp_bridge_cache()
+    _reset()

@@ -24,7 +24,6 @@ from src.services.agent_orchestrator.guardrails import (
 )
 from src.services.tools_integration.mcp_client import load_mcp_tools
 from src.services.agent_orchestrator.memory import _dir_tree_hash, get_workspace_files
-from src.services.tools_integration.rag import internet_search as raw_internet_search
 from src.services.agent_orchestrator.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
 
 logger = logging.getLogger(__name__)
@@ -57,7 +56,31 @@ def internet_search(
         max_results: Maximum results to return.
         topic: The search topic.
     """
-    return raw_internet_search(query, max_results=max_results, topic=topic)
+    tavily_api_key = os.getenv("TAVILY_API_KEY")
+    if not tavily_api_key:
+        return "Tavily API key not found. Please set TAVILY_API_KEY in .env."
+    try:
+        from tavily import TavilyClient
+        tavily = TavilyClient(api_key=tavily_api_key)
+        res = tavily.search(query, max_results=max_results, topic=topic)
+        results = res.get("results", []) if isinstance(res, dict) else []
+        if not results:
+            return "No results found."
+        lines = ["## Search results for: " + query, ""]
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "Untitled")
+            url = r.get("url", "")
+            content = r.get("content", "")
+            lines.append(f"{i}. **{title}**")
+            if url:
+                lines.append(f"   URL: {url}")
+            if content:
+                snippet = content[:300].replace("\n", " ")
+                lines.append(f"   {snippet}")
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching the web: {str(e)}"
 
 
 @tool
@@ -427,9 +450,23 @@ def get_all_tools() -> dict[str, BaseTool]:
 def create_tool_registry() -> "ToolRegistry":
     """Build a ToolRegistry populated with all available tools.
 
-    Every tool from get_all_tools() is registered via register_builtin
-    using its underlying callable (tool.func for LangChain
-    StructuredTool instances, the object itself for plain callables).
+    Registration respects each tool's ``@tool_spec`` metadata so the
+    ``risk_level`` and ``allowed_roles`` a tool declares in ``tools/*.py``
+    actually reach the registry. Previously every tool went through
+    ``register_builtin``, which discarded that metadata and left
+    ``allowed_roles=()`` — meaning every role could see every tool and the
+    role scoping declared by ``tools/*.py`` was inert.
+
+    Visibility rules:
+
+    - **Built-in and MCP tools are always visible.** They are the platform's
+      own capabilities, so they are registered with ``allowed_roles=("*",)``
+      and no role filter can hide them.
+    - **Dynamic tools (everything under ``./tools``) are visible as added.**
+      A tool declaring ``allowed_roles=("*",)`` is visible to everyone; a
+      tool declaring specific roles is visible only to those. A dynamic tool
+      with no ``@tool_spec`` at all falls back to always-visible, so adding a
+      bare ``@tool`` file to ``tools/`` works without extra ceremony.
 
     Returns:
         A fully populated ToolRegistry.
@@ -437,7 +474,37 @@ def create_tool_registry() -> "ToolRegistry":
     from src.services.tools_integration.registry import ToolRegistry
 
     registry = ToolRegistry()
+    dynamic_names = set(load_dynamic_tools("./tools"))
+    mcp_names = set(load_mcp_tools())
+
     for name, tool in get_all_tools().items():
         callable_ = getattr(tool, "func", tool)
-        registry.register_builtin(name, callable_)
+        spec = getattr(callable_, "__tool_spec__", None)
+
+        if spec is not None:
+            # Honour the tool's own declaration (risk level + role scoping).
+            registry.register(spec, callable_)
+        else:
+            # Built-ins, MCP tools, and undeclared dynamic tools are always
+            # visible. A dynamic tool that *did* declare a narrower scope is
+            # handled by the branch above, so this cannot widen it by accident.
+            registry.register_builtin(
+                name,
+                callable_,
+                risk_level="low",
+                requires_approval=False,
+                allowed_roles=("*",),
+            )
+
+        # Log what a dynamic tool actually resolved to, so a tool that is
+        # discovered but invisible to a role is visible in the logs.
+        if name in dynamic_names and spec is not None:
+            logger.debug(
+                "Registered dynamic tool '%s' (risk=%s, roles=%s)",
+                name, spec.risk_level, spec.allowed_roles or "all",
+            )
+
+    if mcp_names:
+        logger.debug("MCP tools registered as always-visible: %s", sorted(mcp_names))
+
     return registry
