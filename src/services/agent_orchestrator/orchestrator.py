@@ -12,19 +12,65 @@ from src.services.session_memory.window import get_window as _get_window
 
 logger = logging.getLogger(__name__)
 
-DISPATCHER_SYSTEM_PROMPT = (
-    "You are the dispatcher. Given the conversation history and user query, "
-    "enhance the query, identify relevant departments, and invoke them. "
-    "After all departments respond, verify and synthesize a final answer. "
-    "Departments and their capabilities are described in the available tool registry. "
-    "Return JSON: {enhanced_query, departments: [...]}.\n\n"
-    "You also have tools available. When the query needs a concrete action — "
-    "reading or writing a file, searching the web, getting the current time, "
-    "text statistics, or delegating to a subagent with the `task` tool — CALL "
-    "the tool instead of describing what you would do. Tool results come back "
-    "to you, and you then answer the user in plain language. Only return the "
-    "JSON envelope when no tool call is needed."
-)
+def _build_dispatcher_prompt() -> str:
+    """Build the dispatcher prompt with the real department roster.
+
+    The prompt used to claim departments were "described in the available
+    tool registry" — they are not, the registry holds tools only — so the
+    model had no way to know a department existed and the fanout branch never
+    fired. The roster now comes from ``skills/`` via ``list_departments()``,
+    which means a new SKILL.md appears here with no code change.
+
+    Departments are reachable two ways and the prompt has to separate them, or
+    one shadows the other: the ``task`` tool delegates to a *single* sub-agent
+    and returns its answer inline, while the JSON envelope fans out to
+    *several* departments in parallel and comes back as context. Without that
+    split, "prefer a tool" made the model call ``task`` for every departmental
+    query and the parallel fanout branch went unused.
+    """
+    from src.services.agent_orchestrator.subagents import list_departments
+
+    departments = list_departments()
+    if departments:
+        roster = "\n".join(
+            f"- **{d['name']}**: {d['description']}" for d in departments
+        )
+        department_block = (
+            "These departments each have their own tools and run independently:\n"
+            f"{roster}\n\n"
+            "To hand work to one or more of them, return JSON: "
+            "{enhanced_query, departments: [...]}, listing only names from the "
+            "list above. Listing two or more runs them in parallel — use that "
+            "when a query has genuinely separate parts (e.g. research a topic "
+            "and draft a post about it). Use an empty list when no department "
+            "is a better fit than answering directly."
+        )
+    else:
+        department_block = (
+            "No departments are currently registered, so always return an empty "
+            "departments list and answer the user yourself."
+        )
+
+    return (
+        "You are the dispatcher. Given the conversation history and user query, "
+        "enhance the query, then either route it to departments or answer it "
+        "yourself. You are the only actor who talks to the user, so department "
+        "output arrives as context for you to synthesize into one final answer.\n\n"
+        f"{department_block}\n\n"
+        "You also have tools. When the query needs one concrete action — reading "
+        "or writing a file, searching the web, getting the current time, text "
+        "statistics — CALL the tool instead of describing what you would do. The "
+        "`task` tool delegates a *single* sub-task to one subagent and returns "
+        "its answer to you; reach for it when one subagent does the whole job. "
+        "Tool results come back to you, and you then answer the user in plain "
+        "language. Emit the JSON envelope instead when no single tool call "
+        "covers the request."
+    )
+
+
+# Built per call rather than at import so a SKILL.md added at runtime is
+# reflected. The module-level name is kept for callers that import it.
+DISPATCHER_SYSTEM_PROMPT = _build_dispatcher_prompt()
 
 
 def _is_budget_exhausted(state: AgentState) -> bool:
@@ -84,7 +130,10 @@ def call_orchestrator(
     resolved_thread = thread_id or state.get("thread_id") or "default"
     messages = _get_window(resolved_thread, max_messages=max_history_messages)
 
-    formatted_messages = [SystemMessage(content=DISPATCHER_SYSTEM_PROMPT)] + list(messages)
+    # Built per call so a department added to skills/ mid-process is listed.
+    formatted_messages = [
+        SystemMessage(content=_build_dispatcher_prompt())
+    ] + list(messages)
 
     # Bind the tool set so the dispatcher can actually call a tool. The tools
     # node reads ``state["messages"][-1]``, so a tool-calling response must also
@@ -101,7 +150,7 @@ def call_orchestrator(
     parsed = _parse_dispatcher_output(content)
     if parsed:
         enhanced_query = parsed.get("enhanced_query", content)
-        departments = parsed.get("departments", [])
+        departments = _validate_departments(parsed.get("departments", []))
 
     logger.info(
         "Orchestrator: enhanced_query=%r, departments=%r",
@@ -136,6 +185,33 @@ def call_orchestrator(
         pass
 
     return updates
+
+
+def _validate_departments(departments: list) -> list[str]:
+    """Keep only department names that resolve to a registered department.
+
+    The model can invent a name. Without this check an unknown department
+    reaches ``subagent_fanout``, where it resolves to nothing and the turn
+    produces a confusing "unknown department" error instead of an answer.
+    Dropping it lets the responder answer directly.
+    """
+    from src.services.agent_orchestrator.subagents import list_departments
+
+    valid = {d["name"] for d in list_departments()}
+    kept: list[str] = []
+    for name in departments or []:
+        if not isinstance(name, str):
+            continue
+        cleaned = name.strip()
+        if cleaned in valid:
+            if cleaned not in kept:
+                kept.append(cleaned)
+        else:
+            logger.warning(
+                "Dispatcher named unknown department %r (known: %s); dropping it.",
+                cleaned, ", ".join(sorted(valid)) or "none",
+            )
+    return kept
 
 
 def _parse_dispatcher_output(content: str) -> dict | None:

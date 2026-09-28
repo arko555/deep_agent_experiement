@@ -1,17 +1,25 @@
-"""Subagent registry and executors for the `task` tool.
+"""Subagent registry and executors for the `task` tool and department fanout.
 
 SUBAGENTS is the single source of truth for subagent types: it drives the
 `task` tool schema (the allowed subagent_type values), `_execute_task`
 dispatch, the parallel-vs-sequential split in the tools node, and role
-prompt construction. Adding a subagent type = adding one SUBAGENTS entry.
+prompt construction.
 
-Research and writer subagents run a minimal tool loop (model + bound tools)
-so they can actually search, read, and write files instead of answering in a
-single completion. The general-purpose subagent reuses the full compiled
-graph and is handled in ``tools._execute_task``.
+**Departments come from ``skills/``.** Each ``skills/<name>/SKILL.md`` yields
+a ``tool_loop`` sub-agent whose system prompt is the markdown body and whose
+``allowed-tools`` frontmatter is the hard tool allowlist. Adding a department
+is adding a directory — no Python change. ``general-purpose`` (full graph) and
+A2A agents are runtime capabilities, not skills, so they stay hardcoded.
+
+Every tool_loop sub-agent runs the same executor, ``run_department``: it
+shortlists its allowlist down to the tools relevant to the current query, then
+runs a real ReAct loop with those tools bound, so it can actually search, read
+and write files instead of answering in a single completion.
 """
 
+import logging
 from dataclasses import dataclass
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -20,6 +28,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from src.config import get_a2a_agents
 from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
 from src.utils import get_message_text, invoke_with_retry
+
+logger = logging.getLogger(__name__)
 
 # A2A subagent types come from configuration, but the `task` tool's type enum
 # is built statically from this registry — so `.env` must be loaded before the
@@ -46,28 +56,54 @@ class SubagentSpec:
     url: str | None = None         # remote agent base URL (a2a only)
 
 
-_BUILTIN_SUBAGENTS: dict[str, SubagentSpec] = {
+def _skill_specs(skills_dir: str | None = None) -> dict[str, SubagentSpec]:
+    """Build a spec per ``skills/*/SKILL.md``.
+
+    This is what makes ``skills/`` data-driven: dropping a new department
+    directory in produces a routable sub-agent with no Python change. The
+    SKILL.md frontmatter supplies the description (surfaced to the model),
+    the ``allowed-tools`` allowlist, and whether the department is
+    parallelizable; the markdown body is the system prompt.
+
+    ``skills_dir`` defaults to the repository's ``skills/`` rather than the
+    process cwd, so a rebuild after a chdir still finds every department.
+    """
+    from src.services.tools_integration.discovery import discover_subagents
+
+    specs: dict[str, SubagentSpec] = {}
+    for entry in discover_subagents(skills_dir):
+        name = entry.get("name") or entry.get("department")
+        if not name:
+            logger.warning("Skipping skill with no name: %s", entry.get("skill_file"))
+            continue
+        # A duplicate name would silently shadow an earlier department, so
+        # keep the first and say so rather than picking a winner quietly.
+        if name in specs:
+            logger.warning(
+                "Duplicate subagent name '%s' in %s; keeping the first definition.",
+                name, entry.get("skill_file"),
+            )
+            continue
+        specs[name] = SubagentSpec(
+            description=entry.get("description")
+            or f"Department sub-agent defined by {entry.get('skill_file')}.",
+            kind="tool_loop",
+            parallelizable=bool(entry.get("parallelizable", True)),
+            skill=entry.get("department") or name,
+            tools=tuple(entry.get("allowed_tools") or ()),
+        )
+    return specs
+
+
+# `general-purpose` is a capability of the runtime, not a skill: it runs the
+# full graph and has no SKILL.md, so it stays hardcoded. Everything else comes
+# from skills/ or from the A2A_AGENTS config.
+_RUNTIME_SUBAGENTS: dict[str, SubagentSpec] = {
     "general-purpose": SubagentSpec(
         description="Full deep agent with all tools; use for complex or context-heavy sub-tasks.",
         kind="graph",
         parallelizable=False,
         aliases=("general",),
-    ),
-    "research": SubagentSpec(
-        description="Web research: searches the internet and writes findings to a workspace file.",
-        kind="tool_loop",
-        parallelizable=True,
-        aliases=("researcher",),
-        skill="research",
-        tools=("internet_search", "fetch_url", "read_file", "write_file",
-               "list_files", "search_files"),
-    ),
-    "writer": SubagentSpec(
-        description="Content writer: reads workspace notes and saves the draft to a file.",
-        kind="tool_loop",
-        parallelizable=True,
-        skill="writer",
-        tools=("read_file", "write_file", "edit_file", "list_files", "search_files"),
     ),
 }
 
@@ -89,7 +125,49 @@ def _a2a_specs() -> dict[str, SubagentSpec]:
     }
 
 
-SUBAGENTS: dict[str, SubagentSpec] = {**_BUILTIN_SUBAGENTS, **_a2a_specs()}
+def build_subagent_registry() -> dict[str, SubagentSpec]:
+    """Assemble the full registry: skills + runtime capabilities + A2A agents.
+
+    Called at import for the module-level ``SUBAGENTS`` (which the ``task``
+    tool's schema is built from) and again by ``refresh_subagents`` after a
+    skills change.
+    """
+    return {**_skill_specs(), **_RUNTIME_SUBAGENTS, **_a2a_specs()}
+
+
+SUBAGENTS: dict[str, SubagentSpec] = build_subagent_registry()
+
+
+def refresh_subagents() -> dict[str, SubagentSpec]:
+    """Rebuild ``SUBAGENTS`` from disk after skills/ changes.
+
+    ``SUBAGENTS`` is a module-level dict that several modules import by
+    value, so this rebinds it in place on the defining module and every
+    importer sees the update. ``reset_deep_agent()`` calls this.
+    """
+    global SUBAGENTS
+    from src.services.tools_integration.discovery import invalidate_discovery_cache
+
+    invalidate_discovery_cache()
+    SUBAGENTS = build_subagent_registry()
+    logger.info(
+        "Sub-agent registry refreshed from skills/: %s", sorted(SUBAGENTS)
+    )
+    return SUBAGENTS
+
+
+def list_departments() -> list[dict[str, str]]:
+    """The routable departments, for the dispatcher's prompt.
+
+    Only ``tool_loop`` specs backed by a SKILL.md are routable departments:
+    ``general-purpose`` is a delegation target, and A2A agents are remote
+    services, so neither is something the dispatcher should route a query to.
+    """
+    return [
+        {"name": name, "description": spec.description}
+        for name, spec in sorted(SUBAGENTS.items())
+        if spec.kind == "tool_loop" and spec.skill
+    ]
 
 
 def resolve_subagent(subagent_type: str) -> SubagentSpec | None:
@@ -178,7 +256,7 @@ def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterati
 
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=description)]
     usage = {"input": 0, "output": 0}
-    write_ops = []
+    write_ops: list[dict[str, Any]] = []
 
     for _ in range(max_iterations):
         response = invoke_with_retry(model_with_tools, messages)
@@ -214,11 +292,154 @@ def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterati
                 name=tool_call["name"],
             ))
 
-    # Budget exhausted — return the last model turn if it has any text.
+    # Budget exhausted. The last model turn is usually another tool call, whose
+    # content is "" — returning that hands the parent an empty string, which
+    # reads as "the subagent found nothing" and leaves it to redo the whole
+    # task. Report the truncation and what was actually done instead, so the
+    # parent can either use the partial work or say the subagent ran out of
+    # budget.
     last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
-    fallback = (
-        get_message_text(last_ai.content)
-        if last_ai is not None
-        else "Error: subagent reached max iterations without a final answer."
+    final_text = get_message_text(last_ai.content) if last_ai is not None else ""
+    if not final_text.strip():
+        called = [
+            c["name"]
+            for m in messages
+            if isinstance(m, AIMessage)
+            for c in (getattr(m, "tool_calls", None) or [])
+        ]
+        detail = f" It called: {', '.join(called)}." if called else ""
+        wrote = ", ".join(op["args"].get("path", "?") for op in write_ops) or "none"
+        final_text = (
+            f"Stopped after {max_iterations} model turns without a final answer."
+            f"{detail} Files written: {wrote}."
+        )
+        logger.warning(
+            "Subagent hit its %d-turn budget with no final answer (%d tool calls)",
+            max_iterations, len(called),
+        )
+    return final_text, usage, write_ops
+
+
+# ---------------------------------------------------------------------------
+# Unified department executor
+# ---------------------------------------------------------------------------
+
+# Tools per sub-agent, per CLAUDE.md: the allowlist is capped at 20 visible and
+# the LLM narrows it to 3-5 for the specific query.
+MAX_VISIBLE_TOOLS = 20
+MAX_SHORTLISTED_TOOLS = 5
+
+
+def select_department_tools(
+    spec: SubagentSpec,
+    query: str,
+    tools_dict: dict | None = None,
+    model=None,
+) -> list:
+    """Resolve a department's tool allowlist into real, bindable tools.
+
+    Three stages, per the documented contract:
+
+    1. ``spec.tools`` (the SKILL.md ``allowed-tools`` frontmatter) is the hard
+       allowlist. Names that do not resolve are dropped with a warning — a
+       stale name in a SKILL.md must not become a tool the model can call but
+       never execute.
+    2. The allowlist is capped at ``MAX_VISIBLE_TOOLS``.
+    3. ``relevance.sort_tools`` narrows to ``MAX_SHORTLISTED_TOOLS`` for *this*
+       query, so a department is handed the tools its current task needs
+       rather than its whole declared set.
+
+    The return value is real ``BaseTool`` objects. ``get_tool_definitions``
+    returns metadata only, so resolving names back to callables here is what
+    makes the sub-agent able to actually *call* what it was offered.
+
+    Falls back to the capped allowlist if relevance sorting fails.
+    """
+    from src.services.tools_integration.relevance import sort_tools
+
+    toolset = tools_dict if tools_dict is not None else _all_tools()
+
+    allowed: list = []
+    for name in spec.tools:
+        tool_obj = toolset.get(name)
+        if tool_obj is None:
+            logger.warning(
+                "Department '%s' allows unknown tool '%s' (skills/%s/SKILL.md); skipping.",
+                getattr(spec, "skill", "?"), name, getattr(spec, "skill", "?"),
+            )
+            continue
+        allowed.append(tool_obj)
+
+    if not allowed:
+        return []
+    if len(allowed) <= MAX_SHORTLISTED_TOOLS:
+        return allowed
+
+    visible = allowed[:MAX_VISIBLE_TOOLS]
+    try:
+        from src.services.agent_orchestrator.agent_factory import get_model
+
+        sorter = model if model is not None else get_model()
+        tool_defs = [
+            {
+                "name": t.name,
+                "description": getattr(t, "description", "") or "",
+            }
+            for t in visible
+        ]
+        chosen = sort_tools(sorter, query, tool_defs, MAX_SHORTLISTED_TOOLS)
+        by_name = {t.name: t for t in visible}
+        shortlist = [by_name[c["name"]] for c in chosen if c.get("name") in by_name]
+    except Exception as e:
+        logger.warning(
+            "Tool shortlisting failed for '%s' (%s); using capped allowlist.",
+            getattr(spec, "skill", "?"), e,
+        )
+        return visible
+
+    if not shortlist:
+        return visible[:MAX_SHORTLISTED_TOOLS]
+    logger.info(
+        "Department '%s': shortlisted %d of %d allowed tools for this query.",
+        getattr(spec, "skill", "?"), len(shortlist), len(visible),
     )
-    return fallback, usage, write_ops
+    return shortlist
+
+
+def _all_tools() -> dict:
+    """Lazily fetch the full tool set (avoids an import cycle at module load)."""
+    from src.services.tools_integration.tools import get_all_tools
+
+    return get_all_tools()
+
+
+def run_department(
+    spec: SubagentSpec,
+    query: str,
+    tools_dict: dict | None = None,
+    max_iterations: int = 10,
+):
+    """Run one department end to end: prompt, tools, ReAct loop.
+
+    This is the single executor behind both entry points — the ``task`` tool
+    (``tools._execute_task``) and department fanout
+    (``subagent_engine.SubAgentEngine``). Both previously had their own
+    implementation and the fanout one could not execute tools at all.
+
+    Args:
+        spec: The department's registered spec (supplies the SKILL.md prompt
+            and the tool allowlist).
+        query: The enhanced query to fulfil.
+        tools_dict: Live tool mapping to resolve the allowlist against.
+        max_iterations: Cap on model turns before giving up.
+
+    Returns:
+        ``(final_text, usage, write_ops)`` — same shape as ``run_tool_loop``.
+    """
+    tools = select_department_tools(spec, query, tools_dict)
+    return run_tool_loop(
+        build_role_prompt(spec),
+        query,
+        tools,
+        max_iterations=max_iterations,
+    )

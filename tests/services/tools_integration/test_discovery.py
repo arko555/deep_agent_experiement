@@ -82,6 +82,75 @@ class TestParseSkillFile:
         result = _parse_skill_file(str(skill_file))
         assert result["allowed-tools"] == ["tool_a", "tool_b"]
 
+    def test_folded_scalar_description_is_joined(self, tmp_path):
+        """`description: >` spans several indented lines; YAML folds them.
+
+        The previous hand-rolled parser stored the literal `">"` as the
+        description and threw away every continuation line, which is why the
+        shipped SKILL.md files produced a one-character description.
+        """
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text(
+            "---\n"
+            "name: research\n"
+            "description: >\n"
+            "  Conducts comprehensive web research on any topic.\n"
+            "  Use when the user asks for research or needs current data.\n"
+            "---\n"
+            "Body.\n",
+        )
+        result = _parse_skill_file(str(skill_file))
+        assert result["description"] == (
+            "Conducts comprehensive web research on any topic. "
+            "Use when the user asks for research or needs current data."
+        )
+        assert ">" not in result["description"]
+
+    def test_block_scalar_description_is_joined(self, tmp_path):
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: w\ndescription: |\n  line one\n  line two\n---\nBody.\n",
+        )
+        result = _parse_skill_file(str(skill_file))
+        assert result["description"] == "line one line two"
+
+    def test_space_separated_allowed_tools_are_split(self, tmp_path):
+        """`allowed-tools: a b c` is three tools, not one name with spaces.
+
+        Both separators appear in the wild; the comma-only split turned the
+        space form into the single bogus tool 'internet_search Read Write'.
+        """
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: research\nallowed-tools: internet_search Read Write\n---\n",
+        )
+        result = _parse_skill_file(str(skill_file))
+        assert result["allowed-tools"] == ["internet_search", "Read", "Write"]
+
+    def test_allowed_tools_accepts_a_yaml_list(self, tmp_path):
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: w\nallowed-tools:\n  - read_file\n  - write_file\n---\n",
+        )
+        result = _parse_skill_file(str(skill_file))
+        assert result["allowed-tools"] == ["read_file", "write_file"]
+
+    def test_parallelizable_flag(self, tmp_path):
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: a\nparallelizable: false\n---\n",
+        )
+        assert _parse_skill_file(str(skill_file))["parallelizable"] is False
+        # Absent means parallelizable: independent departments are the point
+        # of fanout, so an undeclared skill is a fanout candidate.
+        skill_file.write_text("---\nname: a\n---\n")
+        assert _parse_skill_file(str(skill_file))["parallelizable"] is True
+
+    def test_malformed_yaml_returns_none(self, tmp_path):
+        skill_file = tmp_path / "SKILL.md"
+        skill_file.write_text("---\nname: [unclosed\n---\nBody.\n")
+        assert _parse_skill_file(str(skill_file)) is None
+
 
 # ---------------------------------------------------------------------------
 # discover_subagents

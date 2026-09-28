@@ -206,10 +206,14 @@ class TestFailureReporting:
 class TestExecutionDispatch:
 
     def test_execute_task_dispatches_a2a_kind(self, monkeypatch):
+        import src.services.agent_orchestrator.subagents as subagents_mod
         import src.services.tools_integration.a2a_client as a2a_mod
 
         spec = SubagentSpec(description="remote", kind="a2a", url="http://agent.test")
-        monkeypatch.setattr(tools_mod, "resolve_subagent", lambda _t: spec)
+        # Patched on `subagents`, not `tools`: tools imports the dispatch
+        # helpers lazily (they close an import cycle with discovery), so the
+        # module attribute a test sees is not the one the call resolves.
+        monkeypatch.setattr(subagents_mod, "resolve_subagent", lambda _t: spec)
         monkeypatch.setattr(a2a_mod, "call_a2a_agent",
                             lambda url, description: f"remote({url}):{description}")
 
@@ -248,9 +252,13 @@ def test_configured_a2a_agents_appear_in_registry_and_task_schema():
                                   "description": "Remote research agent"}
         }),
     }
+    # `task` is built by get_all_tools() rather than at import — its
+    # subagent_type enum is derived from the live registry — so the schema is
+    # read from the tool set, not from a module-level `task` object.
     code = (
         "from src.services.agent_orchestrator.subagents import SUBAGENTS, is_parallelizable\n"
-        "from src.services.tools_integration.tools import task\n"
+        "from src.services.tools_integration.tools import get_all_tools\n"
+        "task = get_all_tools()['task']\n"
         "enum = task.args_schema.model_json_schema()['properties']['subagent_type']['enum']\n"
         "print('REG', sorted(SUBAGENTS))\n"
         "print('ENUM', sorted(enum))\n"

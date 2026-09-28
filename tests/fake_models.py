@@ -21,11 +21,18 @@ class ScriptedChatModel:
     """A ``.invoke``-able fake that pops canned responses per detected role.
 
     Roles are matched by a substring of the first message's content:
+      - "dispatcher"           → orchestrator
+      - "specialized subagent delegated a task" → tool-loop subagent
       - "generic Deep Agent"   → orchestrator
       - "Critical Reviewer"    → critic
       - "Plan Compliance"      → plan_checker
       - "Reflection Agent"     → reflection
-      - "specialized subagent" → tool-loop subagent (research/writer)
+
+    The sub-agent marker is the opening line of ``subagents.COMPLETION_CONTRACT``,
+    which prefixes every department prompt. It is stable regardless of which
+    ``skills/`` departments exist — matching the old "You are the {dept}
+    specialist" text would silently stop matching once fanout started building
+    prompts from SKILL.md bodies.
 
     Each role maps to a list of canned AIMessages; the next one is returned on
     each call for that role (the last one repeats once exhausted). Every message
@@ -64,9 +71,12 @@ class ScriptedChatModel:
             else:
                 content = getattr(msg, "content", "")
             content = content if isinstance(content, str) else str(content)
-            if "dispatcher" in content.lower():
+            lowered = content.lower()
+            if "specialized subagent delegated a task" in lowered:
+                return "subagent"
+            if "dispatcher" in lowered:
                 return "orchestrator"
-            if "specialist" in content.lower():
+            if "specialist" in lowered:
                 return "subagent"
             # Legacy markers (Phase 9 graph).
             if "generic Deep Agent" in content:

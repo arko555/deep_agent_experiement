@@ -24,9 +24,22 @@ from src.services.agent_orchestrator.guardrails import (
 )
 from src.services.tools_integration.mcp_client import load_mcp_tools
 from src.services.agent_orchestrator.memory import _dir_tree_hash, get_workspace_files
-from src.services.agent_orchestrator.subagents import SUBAGENTS, build_role_prompt, resolve_subagent, run_tool_loop
 
 logger = logging.getLogger(__name__)
+
+
+def _subagent_registry() -> dict:
+    """The live sub-agent registry, imported lazily.
+
+    ``subagents`` builds ``SUBAGENTS`` from ``skills/`` at import time, which
+    reaches ``tools_integration.discovery`` — whose package ``__init__``
+    imports this module. A top-level import would close that cycle and fail
+    whenever this module is imported first. Every use below is at call time,
+    so deferring costs nothing and keeps the registry live.
+    """
+    from src.services.agent_orchestrator.subagents import SUBAGENTS
+
+    return SUBAGENTS
 
 # ---------------------------------------------------------------------------
 # Built-in Tools
@@ -191,13 +204,14 @@ def fetch_url(url: str) -> str:
         return f"Error fetching {url}: {e}"
 
 
-# subagent_type values and the tool description are driven by the SUBAGENTS
-# registry (6.1) — adding a type there updates the schema automatically.
-_SubagentType = Literal[(*SUBAGENTS.keys(),)]  # type: ignore[valid-type]
+# The `task` tool's schema (both the subagent_type enum and the description)
+# is derived from the SUBAGENTS registry. Because departments are now loaded
+# from skills/ at runtime, the tool is built by `_get_task_tool()` on each call
+# rather than frozen at import — otherwise a SKILL.md added after startup would
+# not appear in the enum until the process restarted.
 
 
-def _task_impl(subagent_type: _SubagentType,  # type: ignore[valid-type]
-               description: str) -> str:
+def _task_impl(subagent_type: str, description: str) -> str:
     # The `task` tool is executed by the tools node (local_tools_node), which
     # enforces recursion depth and aggregates child token usage/writes. A
     # direct invoke has no graph state and would skip the depth guard, so it
@@ -207,8 +221,9 @@ def _task_impl(subagent_type: _SubagentType,  # type: ignore[valid-type]
 
 
 def _build_task_docstring() -> str:
+    registry = _subagent_registry()
     types = "\n".join(
-        f"- **{name}**: {spec.description}" for name, spec in SUBAGENTS.items()
+        f"- **{name}**: {spec.description}" for name, spec in registry.items()
     )
     return f"""Delegate a complex sub-task to a specialized or general-purpose subagent.
 
@@ -216,14 +231,23 @@ Available subagent types:
 {types}
 
 Args:
-    subagent_type: The type/role of the subagent (one of: {', '.join(SUBAGENTS)}).
+    subagent_type: The type/role of the subagent (one of: {', '.join(registry)}).
     description: The task description for the subagent. Name a unique output path
         under ./workspace (e.g., workspace/<topic>.md) for each file to produce.
 """
 
 
-_task_impl.__doc__ = _build_task_docstring()
-task = tool("task")(_task_impl)
+def _get_task_tool():
+    """Build the `task` tool with the current subagent_type enum.
+
+    The Literal is rebuilt per call so a newly discovered department shows up
+    in the schema the model is shown.
+    """
+    subagent_type = Literal[(*_subagent_registry().keys(),)]  # type: ignore[valid-type]
+    impl = _task_impl
+    impl.__doc__ = _build_task_docstring()
+    impl.__annotations__ = {"subagent_type": subagent_type, "description": str}
+    return tool("task")(impl)
 
 
 @tool
@@ -267,26 +291,22 @@ def _execute_task(subagent_type: str, description: str, recursion_depth: int,
         is the list of file-write operations the subagent performed (for the
         parent's pending_writes audit trail).
     """
+    from src.services.agent_orchestrator.subagents import resolve_subagent, run_department
+
     spec = resolve_subagent(subagent_type)
     if spec is None:
         return (
             f"Error: Unknown subagent_type '{subagent_type}'. "
-            f"Use one of: {', '.join(SUBAGENTS)}.",
+            f"Use one of: {', '.join(_subagent_registry())}.",
             {},
             [],
         )
 
     if spec.kind == "tool_loop":
-        # Restricted tool loop with the spec's toolset (resolved by name) and
-        # a prompt derived from its SKILL.md + shared completion contract.
-        toolset = tools_dict if tools_dict is not None else get_all_tools()
-        loop_tools = [toolset[name] for name in spec.tools if name in toolset]
-        text, usage, write_ops = run_tool_loop(
-            build_role_prompt(spec),
-            description,
-            loop_tools,
-        )
-        return text, usage, write_ops
+        # The shared department executor: SKILL.md prompt, tool allowlist
+        # shortlisted for this query, then a real ReAct loop. Same code path
+        # the department-fanout branch uses.
+        return run_department(spec, description, tools_dict)
 
     if spec.kind == "a2a":
         # Remote agent over the A2A protocol: send the task description and
@@ -429,7 +449,7 @@ def get_all_tools() -> dict[str, BaseTool]:
         "list_files": list_files,
         "search_files": search_files,
         "fetch_url": fetch_url,
-        "task": task,
+        "task": _get_task_tool(),
         "list_tools": list_tools,
     }
     dynamic_tools = load_dynamic_tools("./tools")

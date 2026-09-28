@@ -56,18 +56,38 @@ def _local_orchestrator_node(state: AgentState, config: RunnableConfig | None = 
 
 
 def _subagent_fanout_node(state: AgentState) -> dict:
-    """Fan out to department sub-agents in parallel."""
+    """Fan out to department sub-agents in parallel.
+
+    Only the department *name* crosses this boundary. The name resolves to a
+    ``SubagentSpec`` in ``subagents.SUBAGENTS``, and the spec's ``skill`` points
+    at a ``SKILL.md`` whose body becomes the sub-agent's system prompt. This
+    node used to synthesize ``f"You are the {dept} specialist..."`` here, which
+    bypassed ``skills/`` entirely and threw away the department prompt.
+
+    Names that no longer resolve (a skill deleted mid-turn, a name the
+    validator let through) are dropped with a warning. If nothing resolves,
+    the empty result lets the responder answer directly instead of the user
+    seeing an "unknown department" error.
+    """
+    from src.services.agent_orchestrator.subagents import SUBAGENTS
+
     departments = state.get("department_targets", [])
     enhanced_query = state.get("enhanced_query", "")
+
+    subagents = []
+    for dept in departments:
+        if dept in SUBAGENTS:
+            subagents.append({"name": dept, "description": enhanced_query})
+        else:
+            logger.warning(
+                "Department %r no longer exists; dropping it from the fanout", dept
+            )
+
+    if not subagents:
+        logger.warning("No requested department resolved; answering directly")
+        return {"subagent_results": {}}
+
     engine = SubAgentEngine()
-    subagents = [
-        {
-            "name": dept,
-            "system_prompt": f"You are the {dept} specialist. Address the query concisely.",
-            "description": enhanced_query,
-        }
-        for dept in departments
-    ]
     results = asyncio.run(engine.invoke_parallel(subagents, enhanced_query))
     return {"subagent_results": results}
 
@@ -230,9 +250,17 @@ def get_deep_agent():
 
 
 def reset_deep_agent():
-    """Invalidate the cached compiled graph, model clients, and MCP tools."""
+    """Invalidate the cached compiled graph, model clients, and MCP tools.
+
+    Also rebuilds the sub-agent registry from ``skills/``. ``SUBAGENTS`` is a
+    module-level dict built at import time, so a SKILL.md added after startup
+    is invisible until this is called — this is the hook that makes the
+    documented "edit skills, then reset" workflow real.
+    """
     global _compiled_graph
     _compiled_graph = None
     from src.services.agent_orchestrator import agent_factory
+    from src.services.agent_orchestrator.subagents import refresh_subagents
 
     agent_factory.clear_caches()
+    refresh_subagents()

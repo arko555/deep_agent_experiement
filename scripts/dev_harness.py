@@ -175,16 +175,20 @@ class ScriptedDispatcher:
 def _is_subagent_prompt(messages) -> bool:
     """True if this is a sub-agent turn rather than a dispatcher turn.
 
-    ``SubAgentEngine`` builds: SystemMessage(system_prompt + tool defs) then
-    HumanMessage(description). The dispatcher gets a SystemMessage beginning
-    with "You are the dispatcher".
+    A department turn is ``SystemMessage(COMPLETION_CONTRACT + SKILL.md body)``
+    followed by ``HumanMessage(enhanced_query)``; the dispatcher gets a
+    SystemMessage beginning with "You are the dispatcher". The marker is the
+    contract's opening line, not the word "specialist" — department prompts now
+    come from ``skills/<name>/SKILL.md`` and say whatever that file says, so
+    matching on a synthesized phrase silently stops matching and the fake
+    model answers a sub-agent turn with a dispatcher's JSON envelope.
     """
     for m in messages:
         if getattr(m, "type", "") == "system":
-            content = str(m.content)
-            if "dispatcher" in content.lower():
+            content = str(m.content).lower()
+            if "you are the dispatcher" in content:
                 return False
-            if "specialist" in content.lower():
+            if "specialized subagent delegated a task" in content:
                 return True
     return False
 
@@ -253,7 +257,7 @@ def tools_dir_only_registry(tools_dir: str = "./tools") -> ToolRegistry:
 # The session driver.
 # ---------------------------------------------------------------------------
 
-def initial_state(user_message: str) -> "AgentState":
+def initial_state(user_message: str) -> AgentState:
     """Build the same state dict main.py sends for a user turn."""
     return {
         "messages": [HumanMessage(content=user_message)] if user_message else [],

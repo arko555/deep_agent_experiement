@@ -1,16 +1,19 @@
-"""Parallel sub-agent dispatch and ReAct loop execution."""
+"""Parallel sub-agent dispatch.
+
+Batching only: it splits the requested departments into batches of
+``MAX_PARALLEL_TASKS``, runs each batch under ``asyncio.gather`` with a shared
+deadline, and merges the results. The per-department work — SKILL.md prompt,
+tool shortlisting, and the ReAct loop — lives in
+``subagents.run_department``, shared with the ``task`` tool so both entry
+points behave identically.
+"""
 
 import asyncio
-import json
 import logging
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from src.config import get_max_parallel_tasks, get_subagent_timeout_seconds
 from src.services.tools_integration.registry import ToolRegistry
-from src.services.tools_integration.relevance import sort_tools
-from src.utils import get_message_text, invoke_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -123,43 +126,45 @@ class SubAgentEngine:
         tool_defs: list[dict[str, Any]],
         enhanced_query: str,
     ) -> str:
-        """Run a single sub-agent ReAct loop with tool relevance sorting.
+        """Run one department through the shared executor.
 
-        ``invoke_with_retry`` is a blocking sync call, so it is offloaded to
-        a worker thread — otherwise it blocks the event loop and
+        This used to be a second, divergent implementation: a single model
+        call with tool descriptions pasted into the prompt as JSON text, so
+        the "ReAct loop" could never produce a tool call and any tool output
+        it appeared to have was hallucinated. It now delegates to
+        ``subagents.run_department`` — the same executor the ``task`` tool
+        uses — which loads the department's SKILL.md, shortlists its tool
+        allowlist for this query, and runs a real ReAct loop with those tools
+        bound.
+
+        ``system_prompt`` and ``tool_defs`` are accepted and ignored so
+        existing callers keep working; the department's registered spec is the
+        source of truth now.
+
+        ``run_department`` is blocking (sync LLM + tool calls), so it is
+        offloaded to a worker thread — otherwise it blocks the event loop and
         ``asyncio.gather`` degenerates into serial execution.
         """
-        model = self._get_model()
-        if not tool_defs:
-            sorted_tools: list[dict[str, Any]] = []
-        else:
-            sorted_tools = await asyncio.to_thread(
-                sort_tools, model, enhanced_query, tool_defs, 5
+        from src.services.agent_orchestrator.subagents import (
+            run_department,
+            SUBAGENTS,
+        )
+
+        spec = SUBAGENTS.get(name)
+        if spec is None:
+            return (
+                f"Error: unknown department '{name}'. "
+                f"Available: {', '.join(sorted(SUBAGENTS)) or 'none'}."
             )
 
-        tool_section = (
-            f"\nAvailable tools: {json.dumps(sorted_tools, indent=2)}"
-            if sorted_tools
-            else ""
-        )
-        full_prompt = (
-            f"{system_prompt}{tool_section}\n\nQuery: {description}\n\n"
-            f"Enhanced query: {enhanced_query}\n\nRespond comprehensively."
-        )
-
-        # Step 4: single-call sub-agent turn (no history, per the sub-agent
-        # context contract: enhanced query + system prompt + tool defs only).
-        response = await asyncio.to_thread(
-            invoke_with_retry,
-            model,
-            [SystemMessage(content=full_prompt), HumanMessage(content=description)],
-        )
-        return get_message_text(getattr(response, "content", response))
-
-    def _get_model(self):
-        """Lazy import to avoid circular dependencies."""
-        from src.services.agent_orchestrator.agent_factory import get_model
-        return get_model()
+        try:
+            text, _usage, _writes = await asyncio.to_thread(
+                run_department, spec, enhanced_query or description
+            )
+            return str(text)
+        except Exception as e:
+            logger.error("Department '%s' failed: %s", name, e)
+            return f"Error: {e}"
 
 
 async def invoke_parallel(

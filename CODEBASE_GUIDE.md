@@ -98,18 +98,31 @@ to `[]`, which prevents the loop from re-dispatching forever.
 
 ### Step 2 — conditional edge
 
-`routing.py::route_from_orchestrator` is one line: departments present →
-`subagent_fanout`, otherwise → `responder`.
+`routing.py::route_after_orchestrator` checks tool calls first, then
+departments: tool call → `tools`, departments present → `subagent_fanout`,
+otherwise → `responder`. Tool calls win because a model that wants a tool emits
+one *instead of* the JSON envelope.
+
+Departments reach this edge only after `_validate_departments` drops names that
+resolve to no registered department. The model can invent a name, and without
+that check an invented department reaches the executor and surfaces as a
+confusing "unknown department" error instead of an answer.
 
 ### Step 3a — fanout node (departments found)
 
-`graph.py::\_subagent_fanout_node` builds one thin spec per department name and
-calls `SubAgentEngine().invoke_parallel(...)`.
+`graph.py::\_subagent_fanout_node` passes **department names only** to
+`SubAgentEngine().invoke_parallel(...)`. It deliberately does not build a
+prompt: the name resolves to a `SubagentSpec`, and the spec's `skill` points at
+a `SKILL.md` whose body becomes the sub-agent's system prompt. The node used to
+synthesize `f"You are the {dept} specialist..."`, which bypassed `skills/`
+entirely and discarded the department prompt. A name that no longer resolves is
+dropped with a warning; if nothing resolves, the node returns empty results and
+the responder answers directly rather than showing the user an error.
 
-Note what is *not* here: no conversation history, no system prompt from
-`SKILL.md`, no tools passed in. The engine fills tools from the registry. This
-is the sub-agent context contract — a sub-agent sees the enhanced query, a
-one-line role prompt, and its tool list, nothing else. That is the point of the
+Note what is *not* here: no conversation history, no tools passed in. This is the
+sub-agent context contract — a sub-agent sees the enhanced query, the
+`COMPLETION_CONTRACT` + `SKILL.md` prompt, and whatever tools
+`select_department_tools` shortlisted, nothing else. That is the point of the
 architecture: parallel branches cannot see or corrupt each other's context.
 
 ### Step 3b — responder node (no departments)
@@ -165,13 +178,24 @@ have its departments thrown away by the `iteration_count > 0` rule.
 │   └── writer/SKILL.md
 ├── tools/
 │   └── sample_tool.py
-├── tests/                     ← 370 tests
+├── tests/                     ← 392 tests
 └── workspace/                 ← agent file output (git-tracked sample notes)
 ```
 
 Only two directories are data-driven at runtime: `skills/` and `tools/`. Add a
 skill or a tool file and the system picks it up. Everything else is imported
 normally.
+
+For a new `skills/<name>/SKILL.md` to be routable, the frontmatter needs `name`
+and a `description`; `allowed-tools` and `parallelizable` are optional. The
+description is what the dispatcher matches a query against, so it is the part
+worth writing well. Names are deduplicated (first in sorted directory order
+wins, with a warning) and a duplicate does not shadow the earlier department.
+
+Discovery defaults are anchored to the repo root rather than the process cwd, so
+a `chdir` — a test's `tmp_path`, an app started elsewhere — cannot silently
+reduce the registry to nothing. `reset_deep_agent()` calls `refresh_subagents()`
+so the "edit a skill, then reset" workflow is real.
 
 ---
 
@@ -238,9 +262,16 @@ The single owner of the compiled graph. Everything that needs a graph calls
 `get_deep_agent()` here.
 
 ```
-START → orchestrator → (conditional) → subagent_fanout → responder → END
-                                  ↘                  → responder ↗
+START → orchestrator → (conditional) → tools ─────────→ orchestrator   (ReAct loop)
+                             ↘            → subagent_fanout → responder → END
+                             ↘            → responder ↗
 ```
+
+The `tools → orchestrator` edge is conditional: it goes back for another turn
+unless the iteration budget is spent or `consecutive_invalid_tools` has hit
+`MAX_INVALID_TOOL_RETRIES` (3). A model that has been told "no tool named X"
+and asks again is not going to recover on its own, so after a few misses the
+responder answers from what is available.
 
 Nodes are module-level functions, not closures:
 
@@ -332,8 +363,18 @@ specs, which would leave every sub-agent with no tools and no error.
 `_run_subagent_loop` is where a subtle performance bug lived.
 `invoke_with_retry` is a **blocking** sync call. Calling it directly inside
 `async def` blocks the event loop, and `asyncio.gather` quietly degenerates into
-serial execution — four sub-agents took 1.22s instead of 0.31s. Both the tool
-sort and the model call now go through `asyncio.to_thread`.
+serial execution — four sub-agents took 1.22s instead of 0.31s. The executor
+now runs via `asyncio.to_thread`.
+
+The engine is **batching only**. It used to be a second, divergent sub-agent
+implementation — a single model call with the tool descriptions pasted into the
+prompt as JSON text, so the "ReAct loop" could never produce a tool call and any
+tool output it appeared to have was hallucinated. It now delegates to
+`subagents.run_department`, the same executor the `task` tool uses. The
+`system_prompt` and `tool_defs` parameters are still accepted and ignored so
+callers keep working; the registered spec is the source of truth. It also used
+to embed the enhanced query in the system prompt *and* pass it as the
+`HumanMessage`, so every sub-agent saw the query twice.
 
 The loop body is a **single** model call, not a ReAct loop. The sub-agent gets
 the enhanced query, a role prompt, and the top-5 relevant tool definitions, and
@@ -439,10 +480,38 @@ starting point if the planner is ever brought back. Read it as reference.
 | `graph` | the full compiled graph, fresh thread | `graph.get_deep_agent()` |
 | `a2a` | HTTP call to a remote agent | `a2a_client.call_a2a_agent` |
 
-Built-ins: `general-purpose` (graph, not parallelizable, alias `general`),
-`research` (tool loop, parallelizable, alias `researcher`, six tools),
-`writer` (tool loop, parallelizable, five tools). A2A entries are appended from
-the `A2A_AGENTS` env var.
+`SUBAGENTS` is assembled by `build_subagent_registry()` from three sources:
+
+1. **`skills/*/SKILL.md`** via `discovery.discover_subagents` — each becomes a
+   `tool_loop` spec whose `skill` names the SKILL.md (the prompt source) and
+   whose `tools` come from the `allowed-tools` frontmatter. This is what makes
+   `skills/` genuinely data-driven; adding a department is adding a directory.
+2. **`_RUNTIME_SUBAGENTS`** — `general-purpose` (graph, not parallelizable, alias
+   `general`). Hardcoded: it is a capability of the runtime, not a skill, and has
+   no `SKILL.md`.
+3. **`_a2a_specs()`** — remote agents from the `A2A_AGENTS` env var.
+
+`refresh_subagents()` rebuilds it; `reset_deep_agent()` calls it.
+
+`list_departments()` is the subset that is *routable* — `tool_loop` specs backed
+by a SKILL.md. `general-purpose` is a delegation target and A2A agents are
+remote services, so neither belongs in the dispatcher's roster.
+
+**Tool selection** (`select_department_tools`) is three stages, matching the
+documented contract: the SKILL.md `allowed-tools` allowlist is the hard limit,
+capped at 20 visible, then `relevance.sort_tools` narrows to 3-5 for the
+current query. Names that do not resolve are dropped with a warning — a stale
+name in a SKILL.md must not become a tool the model can call but never execute.
+The result is **real `BaseTool` objects**, not the metadata dicts
+`get_tool_definitions` returns; resolving names back to callables is what makes
+the shortlist bindable at all. A failing sorter falls back to the capped
+allowlist.
+
+**Budget exhaustion is reported, not swallowed.** When `run_tool_loop` runs out
+of turns, the last model message is usually another tool call whose content is
+`""`. Returning that hands the parent an empty string, which reads as "the
+subagent found nothing" and leaves it to redo the whole task. The loop instead
+reports the truncation, the tools it called, and the files it wrote.
 
 `SUBAGENTS` is the single source of truth. It drives the `task` tool's
 `subagent_type` enum, the dispatch in `tools._execute_task`, the
@@ -924,7 +993,7 @@ second call if you add a module that must see `.env` at import time.
 
 ## 11. Tests
 
-370 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
+392 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
 
 Layout mirrors `src/`:
 

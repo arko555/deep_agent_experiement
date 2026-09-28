@@ -3,10 +3,30 @@
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 logger = logging.getLogger(__name__)
+
+# Repository root, derived from this file's location rather than the process
+# cwd. Default scan targets are anchored here so that a chdir — a test's
+# tmp_path, or an embedding app that starts elsewhere — cannot silently make
+# discovery return nothing. Relative to ``discovery.py`` this is
+# src/services/tools_integration → src/services → src → <root>.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def default_skills_dir() -> str:
+    """The shipped ``skills/`` directory, independent of the process cwd."""
+    return str(REPO_ROOT / "skills")
+
+
+def default_tools_dir() -> str:
+    """The shipped ``tools/`` directory, independent of the process cwd."""
+    return str(REPO_ROOT / "tools")
 
 # ---------------------------------------------------------------------------
 # Caching
@@ -14,6 +34,19 @@ logger = logging.getLogger(__name__)
 
 _skills_cache: list[dict[str, Any]] | None = None
 _skills_cache_key: str = ""
+
+
+def invalidate_discovery_cache() -> None:
+    """Drop the cached sub-agent scan.
+
+    The cache key is a tree hash of mtime+size, so it self-invalidates when a
+    file changes. This exists for the case where a file is replaced with the
+    same size and mtime granularity hides the edit — and so ``reset_deep_agent``
+    has an explicit hook to call.
+    """
+    global _skills_cache, _skills_cache_key
+    _skills_cache = None
+    _skills_cache_key = ""
 
 
 def _dir_tree_hash(directory: str) -> str:
@@ -43,7 +76,14 @@ def _directory_tree_key(paths: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_skill_file(filepath: str) -> dict[str, Any] | None:
-    """Parse a SKILL.md YAML frontmatter into a sub-agent definition."""
+    """Parse a SKILL.md YAML frontmatter into a sub-agent definition.
+
+    Frontmatter is parsed with ``yaml.safe_load`` so YAML features actually
+    used by these files work: folded scalars (``description: >`` spanning
+    several indented lines) and block scalars (``|``). A line-by-line parser
+    silently stored the literal ``">"`` as the description and dropped every
+    continuation line.
+    """
     try:
         with open(filepath, "r") as f:
             content = f.read()
@@ -64,41 +104,58 @@ def _parse_skill_file(filepath: str) -> dict[str, Any] | None:
     yaml_text = parts[1]
     body = parts[2].strip()
 
+    try:
+        loaded = yaml.safe_load(yaml_text) or {}
+    except yaml.YAMLError as e:
+        logger.warning("Invalid YAML frontmatter in %s: %s", filepath, e)
+        return None
+    if not isinstance(loaded, dict):
+        logger.warning("Frontmatter in %s is not a mapping; ignoring", filepath)
+        return None
+
     metadata: dict[str, Any] = {
-        "name": "",
-        "description": "",
-        "department": "",
-        "allowed-tools": [],
-        "protocol": "react",
+        "name": str(loaded.get("name") or "").strip(),
+        "description": " ".join(str(loaded.get("description") or "").split()),
+        "department": str(loaded.get("department") or "").strip(),
+        "allowed-tools": _parse_tool_list(loaded.get("allowed-tools")),
+        "parallelizable": bool(loaded.get("parallelizable", True)),
+        "protocol": str(loaded.get("protocol") or "react").strip(),
     }
-    for line in yaml_text.splitlines():
-        if not line or ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        key = key.strip()
-        value = value.strip()
-        if key in ("name", "description", "department"):
-            metadata[key] = value
-        elif key == "allowed-tools":
-            metadata[key] = [t.strip() for t in value.split(",") if t.strip()]
-        elif key == "protocol":
-            metadata[key] = value
 
     metadata["body"] = body
     metadata["skill_file"] = filepath
     return metadata
 
 
-def discover_subagents(skills_dir: str = "./skills") -> list[dict[str, Any]]:
+def _parse_tool_list(value: Any) -> list[str]:
+    """Normalize an ``allowed-tools`` value to a list of tool names.
+
+    Accepts a YAML list, or a string in either the comma-separated
+    (``a, b, c``) or space-separated (``a b c``) form — both appear in the
+    wild, and the previous comma-only split turned a space-separated list
+    into a single bogus tool name.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [t for t in re.split(r"[,\s]+", str(value).strip()) if t]
+
+
+def discover_subagents(skills_dir: str | None = None) -> list[dict[str, Any]]:
     """Scan ``skills/*/SKILL.md`` for sub-agent definitions.
 
     Returns a list of dicts with ``name``, ``department``,
     ``system_prompt``, ``allowed_tools``, and ``skill_file``.
 
+    ``skills_dir`` defaults to the repository's ``skills/`` (see
+    :func:`default_skills_dir`), not the process cwd.
+
     Results are cached keyed by the directory tree hash of
     ``skills_dir``; calls re-scan only when the directory
     contents change (mtime+size).
     """
+    skills_dir = skills_dir or default_skills_dir()
     global _skills_cache, _skills_cache_key
 
     key = _directory_tree_key([skills_dir]) if os.path.exists(skills_dir) else ""
@@ -133,9 +190,11 @@ def discover_subagents(skills_dir: str = "./skills") -> list[dict[str, Any]]:
 
         subagents.append({
             "name": metadata.get("name", skill_dir.name),
+            "description": metadata.get("description", ""),
             "department": metadata.get("department") or skill_dir.name,
             "system_prompt": system_prompt,
             "allowed_tools": metadata.get("allowed-tools", []),
+            "parallelizable": metadata.get("parallelizable", True),
             "skill_file": str(skill_file),
             "protocol": metadata.get("protocol", "react"),
         })
@@ -150,15 +209,19 @@ def discover_subagents(skills_dir: str = "./skills") -> list[dict[str, Any]]:
 # Tool discovery from tools/*.py @tool_spec tags
 # ---------------------------------------------------------------------------
 
-def discover_tools(tools_dir: str = "./tools") -> list[dict[str, Any]]:
+def discover_tools(tools_dir: str | None = None) -> list[dict[str, Any]]:
     """Scan ``tools/*.py`` for `@tool_spec` metadata tags.
 
     Each module's functions are inspected for a ``__tool_spec__``
     attribute set by the :func:`tool_spec` decorator.
 
+    ``tools_dir`` defaults to the repository's ``tools/`` (see
+    :func:`default_tools_dir`), not the process cwd.
+
     Returns a list of dicts with ``name``, ``description``,
     ``risk_level``, ``requires_approval``, and ``allowed_roles``.
     """
+    tools_dir = tools_dir or default_tools_dir()
     tools: list[dict[str, Any]] = []
     tools_path = Path(tools_dir)
     if not tools_path.exists():
