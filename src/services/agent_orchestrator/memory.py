@@ -1,21 +1,12 @@
 import os
 from typing import Optional
 
-# `get_workspace_files` and `get_workspace_root` moved to guardrails, but three
-# modules still import them from here. They stay in `__all__` until those
-# importers are repointed, so the move is not a silent breaking change.
-from src.services.tools_integration.guardrails import (
-    get_workspace_files,
-    get_workspace_root,
-    validate_read_path,
-)
+from src.services.tools_integration.guardrails import validate_read_path
 
 __all__ = [
     "get_skill_info",
     "get_skill_body",
     "get_memory_content",
-    "get_workspace_files",
-    "get_workspace_root",
 ]
 
 

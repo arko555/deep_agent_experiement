@@ -13,7 +13,8 @@ from src.services.tools_integration.guardrails import (
     validate_and_normalize_path,
     validate_read_path,
 )
-from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body, get_workspace_files
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
+from src.services.tools_integration.guardrails import get_workspace_files
 from src.services.tools_integration.tools import edit_file, list_files, read_file, search_files, write_file
 
 

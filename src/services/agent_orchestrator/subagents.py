@@ -102,13 +102,12 @@ def _skill_specs(skills_dir: str | None = None) -> dict[str, SubagentSpec]:
     return specs
 
 
-# There is no hardcoded runtime subagent. A `general-purpose` spec used to live
-# here, running the whole compiled graph as a "sub-agent" — which made the
-# orchestrator its own sub-agent, so a delegated description would be routed
-# again from the top and the hierarchy stopped being one-way. The catch-all is
-# now `skills/general/SKILL.md`: a real department with a real prompt and a real
-# tool allowlist, chosen by the router rather than by a self-referential spec.
-# Its `kind` is `tool_loop` like every other skill.
+# There is no hardcoded runtime subagent. A `general-purpose` spec running the
+# whole compiled graph as a "sub-agent" would make the orchestrator its own
+# sub-agent — a delegated description gets routed again from the top and the
+# hierarchy stops being one-way. The catch-all is `skills/general/SKILL.md`: a
+# real department with a real prompt and a real tool allowlist, chosen by the
+# router rather than by a self-referential spec.
 
 
 def _a2a_specs() -> dict[str, SubagentSpec]:

@@ -7,7 +7,8 @@ from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
 from src.services.tools_integration.guardrails import clear_workspace, get_workspace_root, validate_read_path
-from src.services.agent_orchestrator.memory import get_workspace_files, get_memory_content, get_skill_info
+from src.services.tools_integration.guardrails import get_workspace_files
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_info
 
 # --- Logging Configuration ---
 logging.basicConfig(
