@@ -6,7 +6,8 @@ description: >
   gathering, competitive analysis, or needs current data from the web.
 license: MIT
 compatibility: Requires internet access and Tavily API key
-allowed-tools: internet_search Read Write
+allowed-tools: internet_search, fetch_url, read_file, write_file, list_files
+parallelizable: true
 ---
 
 # Web Research Skill

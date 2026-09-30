@@ -12,7 +12,8 @@ from typing import ClassVar
 
 import pytest
 
-from src.core import agent_factory, mcp_client, tools as tools_mod
+from src.services.agent_orchestrator import agent_factory
+from src.services.tools_integration import mcp_client, tools as tools_mod
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +193,7 @@ class TestRegistryVisibility:
 
         monkeypatch.setattr(mcp_client, "MultiServerMCPClient", _ctor)
 
-        with caplog.at_level(logging.WARNING, logger="src.core.tools"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             all_tools = tools_mod.get_all_tools()
         assert all_tools["read_file"] is tools_mod.read_file
         assert any("shadows a built-in" in m for m in caplog.messages)
@@ -208,7 +209,7 @@ class TestRegistryVisibility:
 
         monkeypatch.setattr(mcp_client, "MultiServerMCPClient", _ctor)
 
-        with caplog.at_level(logging.WARNING, logger="src.core.mcp_client"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.mcp_client"):
             loaded = mcp_client.load_mcp_tools()
         assert loaded["svc_dup"].invoke({"x": 1}) == "first"
         assert any("Duplicate MCP tool name" in m for m in caplog.messages)
@@ -222,7 +223,7 @@ class TestConfigValidation:
 
     def test_invalid_json_is_ignored(self, monkeypatch, caplog):
         monkeypatch.setenv("MCP_SERVERS", "{not json")
-        with caplog.at_level(logging.WARNING, logger="src.core.config"):
+        with caplog.at_level(logging.WARNING, logger="src.config"):
             assert mcp_client.load_mcp_tools() == {}
         assert any("not valid JSON" in m for m in caplog.messages)
 
@@ -231,9 +232,9 @@ class TestConfigValidation:
             "good-name": {"transport": "http", "url": "http://x/mcp"},
             "bad name": {"transport": "http", "url": "http://y/mcp"},
         })
-        from src.core.config import get_mcp_servers
+        from src.config import get_mcp_servers
 
-        with caplog.at_level(logging.WARNING, logger="src.core.config"):
+        with caplog.at_level(logging.WARNING, logger="src.config"):
             servers = get_mcp_servers()
         assert list(servers) == ["good-name"]
         assert any("is invalid" in m for m in caplog.messages)

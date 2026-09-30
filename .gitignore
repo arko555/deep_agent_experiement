@@ -10,3 +10,9 @@ wheels/
 .venv
 .streamlit
 .env
+
+# Runtime logs
+deep_agent.log
+
+# macOS
+.DS_Store

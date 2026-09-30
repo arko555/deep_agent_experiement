@@ -5,7 +5,7 @@ import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import HumanMessage
 
-from src.core import agent_factory
+from src.services.agent_orchestrator import agent_factory
 
 
 @pytest.fixture

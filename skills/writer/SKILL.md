@@ -5,6 +5,8 @@ description: >
   Use when the user needs a blog post, a report, a technical guide, 
   or any form of structured writing.
 license: MIT
+allowed-tools: read_file, write_file, edit_file, list_files, search_files
+parallelizable: true
 ---
 
 # Creative Writer Skill

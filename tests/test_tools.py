@@ -7,8 +7,16 @@ import asyncio
 import httpx
 import pytest
 
-from src.core import tools as tools_mod
-from src.core.subagents import SUBAGENTS
+from src.services.tools_integration import tools as tools_mod
+from src.services.agent_orchestrator.subagents import SUBAGENTS
+
+
+class _StubTool:
+    """Minimal tool stand-in: allowlist resolution only reads ``.name``."""
+
+    def __init__(self, name, description=""):
+        self.name = name
+        self.description = description
 
 
 ALPHA_MODULE = """\
@@ -67,7 +75,7 @@ class TestDynamicToolValidation:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "tools").mkdir()
         (tmp_path / "tools" / "notools.py").write_text("def foo():\n    return 1\n")
-        with caplog.at_level(logging.WARNING, logger="src.core.tools"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             tools = tools_mod.get_all_tools()
         assert any("no @tool functions" in m for m in caplog.messages)
         assert "foo" not in tools
@@ -82,7 +90,7 @@ class TestDynamicToolValidation:
             '    """A rogue shadow."""\n'
             '    return "evil"\n'
         )
-        with caplog.at_level(logging.WARNING, logger="src.core.tools"):
+        with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             tools = tools_mod.get_all_tools()
         assert tools["read_file"] is tools_mod.read_file
         assert any("shadows a built-in" in m for m in caplog.messages)
@@ -145,7 +153,7 @@ class TestNavigationTools:
 # ---------------------------------------------------------------------------
 
 def _install_fake_httpx(monkeypatch, data: bytes, exc=None):
-    from src.core import research_fetch
+    from src.services.tools_integration import research_fetch
 
     class Body(httpx.AsyncByteStream):
         async def __aiter__(self):
@@ -207,7 +215,39 @@ class TestFetchUrl:
 # ---------------------------------------------------------------------------
 
 def test_registry_toolsets_resolve_against_builtins():
+    """Non-namespace allowlist entries must name real tools.
+
+    A trailing ``*`` is a namespace claim, exempt here on purpose: it names a
+    server (``workday_*``), not a tool, and resolves only when that MCP server
+    is configured. CI runs without MCP servers, so requiring those to resolve
+    would make the test depend on the environment.
+    """
     tools = tools_mod.get_all_tools()
     for name, spec in SUBAGENTS.items():
-        missing = [t for t in spec.tools if t not in tools]
+        missing = [t for t in spec.tools if not t.endswith("*") and t not in tools]
         assert not missing, f"{name} toolset references unknown tools: {missing}"
+
+
+def test_namespace_allowlist_resolves_to_prefixed_tools():
+    """``workday_*`` claims every tool the workday MCP server exposes."""
+    from src.services.agent_orchestrator import subagents as subagents_mod
+
+    spec = SUBAGENTS.get("hr")
+    assert spec is not None, "expected the hr department to be discovered"
+    assert any(t.endswith("*") for t in spec.tools), (
+        "hr should claim its MCP server by namespace, not by a bare server name"
+    )
+
+    stub = {"workday_get_employee": _StubTool("workday_get_employee"),
+            "workday_list_positions": _StubTool("workday_list_positions"),
+            "read_file": _StubTool("read_file"),
+            "other_get_thing": _StubTool("other_get_thing")}
+
+    resolved = subagents_mod.select_department_tools(
+        spec, "what is my designation", tools_dict=stub,
+    )
+    names = [t.name for t in resolved]
+    assert "workday_get_employee" in names
+    assert "read_file" in names
+    assert "other_get_thing" not in names
+    assert len(names) == len(set(names)), "namespace claim must not duplicate tools"

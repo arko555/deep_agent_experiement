@@ -8,8 +8,8 @@ from datetime import datetime
 from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
-from src.core.guardrails import clear_workspace, get_workspace_root, validate_read_path
-from src.core.memory import get_workspace_files, get_memory_content, get_skill_info
+from src.services.tools_integration.guardrails import clear_workspace, get_workspace_root, validate_read_path
+from src.services.agent_orchestrator.memory import get_workspace_files, get_memory_content, get_skill_info
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -124,8 +124,6 @@ if "last_action" not in st.session_state:
     st.session_state.last_action = "None"
 if "current_node" not in st.session_state:
     st.session_state.current_node = "Idle"
-if "iteration_count" not in st.session_state:
-    st.session_state.iteration_count = 0
 # One checkpoint thread per browser session; the checkpointer holds the
 # conversation history so each turn only sends the new user message.
 if "thread_id" not in st.session_state:
@@ -158,11 +156,11 @@ with st.sidebar:
 
     st.divider()
 
-    # Governance Dashboard
+    # Governance Dashboard. Iteration counting moved into the sub-agent ReAct
+    # loops with the rest of the iteration budget, so there is no parent-level
+    # counter to show here — the departments that ran are shown further down.
     st.subheader("🛡️ Governance")
-    col1, col2 = st.columns(2)
-    col1.metric("Iterations", st.session_state.iteration_count)
-    col2.metric("Tokens", f"{st.session_state.token_usage.get('total', 0):,}")
+    st.metric("Tokens", f"{st.session_state.token_usage.get('total', 0):,}")
 
     st.divider()
 
@@ -282,11 +280,9 @@ if prompt := st.chat_input("What would you like me to do?"):
         try:
             st.write("🚀 Initializing agent execution...")
             # Only the new user message goes to the graph — the checkpointer
-            # holds conversation history under this session's thread. The
-            # iteration budget resets each turn so multi-turn chats don't
-            # exhaust it.
+            # holds conversation history under this session's thread.
             for event in st.session_state.agent.stream(
-                {"messages": [HumanMessage(content=prompt)], "iteration_count": 0},
+                {"messages": [HumanMessage(content=prompt)]},
                 config={"configurable": {"thread_id": st.session_state.thread_id}},
                 stream_mode="updates"
             ):
@@ -346,10 +342,6 @@ if prompt := st.chat_input("What would you like me to do?"):
                     # --- Handle Token Usage ---
                     if "token_usage" in data:
                         st.session_state.token_usage.update(data["token_usage"])
-
-                    # --- Handle Iteration Count ---
-                    if "iteration_count" in data:
-                        st.session_state.iteration_count = data["iteration_count"]
 
         except Exception as e:
             import traceback

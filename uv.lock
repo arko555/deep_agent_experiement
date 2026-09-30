@@ -455,6 +455,7 @@ dependencies = [
     { name = "langgraph" },
     { name = "mcp" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "tavily-python" },
 ]
 
@@ -483,6 +484,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "streamlit", marker = "extra == 'ui'", specifier = ">=1.55.0" },
     { name = "tavily-python", specifier = ">=0.7.23" },
