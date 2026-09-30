@@ -41,12 +41,3 @@ def route_after_orchestrator(state: AgentState):
     if state.get("department_targets"):
         return "subagent_fanout"
     return "responder"
-
-
-def route_from_orchestrator(state: AgentState):
-    """Backwards-compatible alias for :func:`route_after_orchestrator`.
-
-    Kept because ``agent_orchestrator.__init__`` exports this name and external
-    callers may import it.
-    """
-    return route_after_orchestrator(state)

@@ -206,11 +206,3 @@ class SubAgentEngine:
         except Exception as e:
             logger.error("Department '%s' failed: %s", name, e)
             return SubagentRun(text=f"Error: {e}")
-
-
-async def invoke_parallel(
-    subagents: list[dict[str, Any]],
-    enhanced_query: str,
-) -> dict[str, SubagentRun]:
-    """Module-level convenience function for parallel sub-agent dispatch."""
-    return await SubAgentEngine().invoke_parallel(subagents, enhanced_query)

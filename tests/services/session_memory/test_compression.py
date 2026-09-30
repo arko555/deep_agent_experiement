@@ -1,35 +1,14 @@
 """Tests for session memory compression — verify summarization preserves context."""
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.services.session_memory.compression import (
     compress_messages,
-    _extract_role_label,
     _summarize_old_messages,
     DEFAULT_MAX_MESSAGES,
     MIN_KEEP_RECENT,
 )
-
-
-# ---------------------------------------------------------------------------
-# Role label extraction
-# ---------------------------------------------------------------------------
-
-class TestExtractRoleLabel:
-
-    def test_human_message(self):
-        assert _extract_role_label(HumanMessage(content="hi")) == "User"
-
-    def test_ai_message(self):
-        assert _extract_role_label(AIMessage(content="answer")) == "Agent"
-
-    def test_tool_message(self):
-        msg = ToolMessage(content="result", tool_call_id="1", name="search")
-        assert _extract_role_label(msg) == "Tool(search)"
-
-    def test_system_message(self):
-        assert _extract_role_label(SystemMessage(content="prompt")) == "System"
 
 
 # ---------------------------------------------------------------------------

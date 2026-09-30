@@ -24,18 +24,6 @@ DEFAULT_MAX_MESSAGES = 20
 MIN_KEEP_RECENT = 8
 
 
-def _extract_role_label(msg: BaseMessage) -> str:
-    if isinstance(msg, HumanMessage):
-        return "User"
-    if isinstance(msg, AIMessage):
-        return "Agent"
-    if isinstance(msg, ToolMessage):
-        return f"Tool({msg.name})"
-    if isinstance(msg, SystemMessage):
-        return "System"
-    return type(msg).__name__
-
-
 def compress_messages(
     messages: Sequence[BaseMessage],
     max_history: int = DEFAULT_MAX_MESSAGES,

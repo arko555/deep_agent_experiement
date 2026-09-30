@@ -8,7 +8,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 _saver = MemorySaver()
 # In-memory index of the latest checkpoint ID per thread, used by get_session
-# and get_turn_token_usage to avoid relying on list() ordering.
+# to avoid relying on list() ordering.
 _latest: dict[str, str] = {}
 
 
@@ -68,23 +68,3 @@ def append_message(thread_id: str, message: BaseMessage) -> None:
     }
     _saver.put(config, checkpoint, metadata, new_versions)
     _latest[thread_id] = checkpoint_id
-
-
-def get_turn_token_usage(thread_id: str):
-    """Get token usage for the latest turn in a thread."""
-    checkpoint_id = _latest.get(thread_id)
-    if checkpoint_id is None:
-        results = list(_saver.list(_config(thread_id)))
-        if not results:
-            return {}
-        checkpoint_id = results[0].checkpoint.get("id")
-
-    config = _config(thread_id)
-    results = list(_saver.list(config))
-    for r in results:
-        if r.checkpoint.get("id") == checkpoint_id:
-            metadata = r.metadata
-            if isinstance(metadata, dict):
-                return metadata.get("token_usage", {})
-            return {}
-    return {}

@@ -1,7 +1,6 @@
 import os
 from typing import Optional
 
-from src.services.tools_integration.discovery import _dir_tree_hash
 # `get_workspace_files` and `get_workspace_root` moved to guardrails, but three
 # modules still import them from here. They stay in `__all__` until those
 # importers are repointed, so the move is not a silent breaking change.
@@ -14,20 +13,10 @@ from src.services.tools_integration.guardrails import (
 __all__ = [
     "get_skill_info",
     "get_skill_body",
-    "get_skills_summary",
     "get_memory_content",
     "get_workspace_files",
     "get_workspace_root",
 ]
-
-
-# The skills summary is memoized on a hash of `skills/`, so a SKILL.md added
-# mid-session is picked up without a restart. `_dir_tree_hash` is the one copy
-# of that digest, in `tools_integration.discovery`; this module used to carry a
-# second, subtly different version that did not sort `files`, so the same
-# directory could hash two ways and the cache could miss an invalidation.
-_skills_cache: Optional[str] = None
-_skills_cache_hash: str = ""
 
 
 def get_skill_info(skill_path: str) -> Optional[dict]:
@@ -70,32 +59,6 @@ def get_skill_body(skill_name: str) -> str:
         if len(parts) >= 3:
             content = "---".join(parts[2:])
     return content.strip()
-
-
-def get_skills_summary() -> str:
-    """Return a markdown summary of available skills (cached via mtime hash)."""
-    global _skills_cache, _skills_cache_hash
-
-    current_hash = _dir_tree_hash("./skills")
-    if _skills_cache is not None and current_hash == _skills_cache_hash:
-        return _skills_cache
-
-    summary = []
-    skills_dir = "./skills"
-    if os.path.exists(skills_dir):
-        for skill_name in os.listdir(skills_dir):
-            skill_path = os.path.join(skills_dir, skill_name)
-            if os.path.isdir(skill_path):
-                info = get_skill_info(skill_path)
-                if info:
-                    summary.append(
-                        f"- **{info.get('name', skill_name)}**: {info.get('description', '').strip()}"
-                    )
-    result = "\n".join(summary) if summary else "No specialized skills available."
-
-    _skills_cache = result
-    _skills_cache_hash = current_hash
-    return result
 
 
 # ---------------------------------------------------------------------------

@@ -5,18 +5,6 @@ from enum import StrEnum
 from typing import Any, Optional
 
 
-@dataclass
-class SubAgent:
-    """A department sub-agent identified by skills/<dept>/SKILL.md."""
-
-    name: str
-    description: str
-    department: str
-    system_prompt: str
-    tool_registry: list = field(default_factory=list)
-    protocol: str = "react"
-
-
 class ToolKind(StrEnum):
     """How a tool is reached, which decides its payload contract.
 

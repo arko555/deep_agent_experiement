@@ -322,9 +322,9 @@ def test_ui_helpers_share_policy_without_starting_streamlit(tmp_path, monkeypatc
 
 
 def test_graph_initialization_uses_custom_workspace(tmp_path, monkeypatch):
-    from src.services.agent_orchestrator import agent_factory
+    from src.services.agent_orchestrator import agent_factory, graph
     monkeypatch.setenv("WORKSPACE_ROOT", "custom")
-    monkeypatch.setattr(agent_factory, "_compiled_graph", None)
+    monkeypatch.setattr(graph, "_compiled_graph", None)
     agent_factory.get_deep_agent()
     assert (tmp_path / "custom").is_dir()
     assert not (tmp_path / "workspace").exists()

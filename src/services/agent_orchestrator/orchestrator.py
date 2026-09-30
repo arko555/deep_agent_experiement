@@ -72,11 +72,6 @@ def _build_dispatcher_prompt() -> str:
     )
 
 
-# Built per call rather than at import so a SKILL.md added at runtime is
-# reflected. The module-level name is kept for callers that import it.
-DISPATCHER_SYSTEM_PROMPT = _build_dispatcher_prompt()
-
-
 def call_orchestrator(
     state: AgentState,
     model,

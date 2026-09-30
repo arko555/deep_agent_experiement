@@ -40,9 +40,8 @@ logger = logging.getLogger(__name__)
 
 
 # --- Cached Compiled Graph ---
-# Compile once, reuse across all invocations (including recursive subagents).
-# Safe because node lambdas call get_model() at runtime, not compile time.
-_compiled_graph = None
+# The compiled graph is owned by graph.py (_compiled_graph there); this module
+# holds model clients and reset hooks only.
 
 
 # --- Observability Hooks (4.4, made real in 8.3) ---
@@ -109,11 +108,6 @@ class DeepAgentTracer(BaseCallbackHandler):
 
 
 _tracer = DeepAgentTracer() if os.getenv("OBSERVABILITY") == "1" else None
-
-
-def get_tracer() -> DeepAgentTracer | None:
-    """Return the global tracer instance, or None if observability is disabled."""
-    return _tracer
 
 
 def _maybe_attach_callbacks(model):
@@ -254,7 +248,5 @@ def reset_deep_agent():
     from src.services.agent_orchestrator.graph import reset_deep_agent as _reset
     from src.services.agent_orchestrator import subagents
 
-    global _compiled_graph
-    _compiled_graph = None
     subagents._TOOL_REGISTRY = None
     _reset()
