@@ -74,7 +74,7 @@ class ScriptedChatModel:
             lowered = content.lower()
             if "specialized subagent delegated a task" in lowered:
                 return "subagent"
-            if "dispatcher" in lowered:
+            if "you are the router" in lowered or "you are the dispatcher" in lowered:
                 return "orchestrator"
             if "specialist" in lowered:
                 return "subagent"

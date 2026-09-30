@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.services.agent_orchestrator.guardrails import (
+from src.services.tools_integration.guardrails import (
     clear_workspace,
     get_workspace_root,
     validate_and_normalize_path,

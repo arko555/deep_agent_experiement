@@ -21,19 +21,36 @@ class TestAgentStateDefaults:
             "workspace_files",
             "next_message",
             "review_verdict",
-            "recursion_depth",
             "pending_writes",
             "audit_log",
             "routing_decisions",
             "token_usage",
-            "iteration_count",
-            "max_iterations",
         ]
         # Just verify the TypedDict definition lists these keys.
         from typing import get_type_hints
         hints = get_type_hints(AgentState)
         for key in expected_keys:
             assert key in hints, f"Key '{key}' missing from AgentState TypedDict"
+
+    def test_state_carries_no_iteration_budget(self):
+        """The parent state has no iteration counter.
+
+        The graph is acyclic, so the orchestrator runs once per turn and has
+        nothing to count. ``iteration_count``/``max_iterations`` were removed
+        with the top-level ReAct dispatcher loop; iteration counting belongs
+        to a sub-agent's tool loop, which is bounded by its own turn budget
+        rather than by parent state.
+
+        They were also a live bug: as checkpointed keys they carried across
+        turns on a reused thread, so turn 2 of any conversation saw a
+        non-zero count and refused to route. Removing the keys from the schema
+        means an old checkpoint cannot reintroduce the behavior.
+        """
+        from typing import get_type_hints
+        hints = get_type_hints(AgentState)
+
+        assert "iteration_count" not in hints
+        assert "max_iterations" not in hints
 
 
 # ---------------------------------------------------------------------------
@@ -48,13 +65,10 @@ def _build_state(**overrides):
         "workspace_files": [],
         "next_message": None,
         "review_verdict": None,
-        "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
         "routing_decisions": [],
         "token_usage": {"input": 0, "output": 0, "total": 0},
-        "iteration_count": 0,
-        "max_iterations": 10,
     }
     state.update(overrides)
     return state
@@ -81,9 +95,3 @@ class TestStateTransitions:
         assert updated["input"] == 300
         assert updated["output"] == 150
         assert updated["total"] == 450
-
-    def test_iteration_count_increments(self):
-        """Orchestrator should increment iteration_count each turn."""
-        state = _build_state(iteration_count=0)
-        new_count = state.get("iteration_count", 0) + 1
-        assert new_count == 1

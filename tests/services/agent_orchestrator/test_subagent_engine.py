@@ -3,15 +3,14 @@
 import asyncio
 import pytest
 
-from src.services.agent_orchestrator.subagent_engine import SubAgentEngine
-from src.services.tools_integration.registry import ToolRegistry
+from src.services.agent_orchestrator.subagent_engine import SubAgentEngine, SubagentRun
 
 
 class TestableSubAgentEngine(SubAgentEngine):
     """SubAgentEngine with overrideable _run_subagent_loop for testing."""
 
-    def __init__(self, results=None, registry=None):
-        super().__init__(registry=registry)
+    def __init__(self, results=None):
+        super().__init__()
         self._results = results or {}
         self._fail = False
 
@@ -25,7 +24,12 @@ class TestableSubAgentEngine(SubAgentEngine):
     async def _run_subagent_loop(self, name, *args, **kwargs):
         if self._fail:
             raise RuntimeError(f"subagent {name} crashed")
-        return self._results.get(name, f"result-for-{name}")
+        return SubagentRun(text=self._results.get(name, f"result-for-{name}"))
+
+
+def _texts(runs):
+    """{name: SubagentRun} → {name: text}, for comparing final answers."""
+    return {name: run.text for name, run in runs.items()}
 
 
 class TestSubAgentEngine:
@@ -35,19 +39,19 @@ class TestSubAgentEngine:
             results={"research": "research result", "writer": "writer result"},
         )
         subagents = [
-            {"name": "research", "description": "do research", "system_prompt": "sys", "tool_registry": []},
-            {"name": "writer", "description": "write report", "system_prompt": "sys", "tool_registry": []},
+            {"name": "research", "description": "do research", "system_prompt": "sys"},
+            {"name": "writer", "description": "write report", "system_prompt": "sys"},
         ]
         result = asyncio.run(engine.invoke_parallel(subagents, "find info"))
-        assert result == {"research": "research result", "writer": "writer result"}
+        assert _texts(result) == {"research": "research result", "writer": "writer result"}
 
     def test_invoke_parallel_single_agent(self):
         engine = TestableSubAgentEngine(results={"research": "single result"})
         subagents = [
-            {"name": "research", "description": "do research", "system_prompt": "sys", "tool_registry": []},
+            {"name": "research", "description": "do research", "system_prompt": "sys"},
         ]
         result = asyncio.run(engine.invoke_parallel(subagents, "find info"))
-        assert result == {"research": "single result"}
+        assert _texts(result) == {"research": "single result"}
 
     def test_invoke_parallel_empty_list(self):
         engine = TestableSubAgentEngine()
@@ -58,22 +62,13 @@ class TestSubAgentEngine:
         engine = TestableSubAgentEngine()
         engine.set_fail()
         subagents = [
-            {"name": "research", "description": "do research", "system_prompt": "sys", "tool_registry": []},
-            {"name": "writer", "description": "write report", "system_prompt": "sys", "tool_registry": []},
+            {"name": "research", "description": "do research", "system_prompt": "sys"},
+            {"name": "writer", "description": "write report", "system_prompt": "sys"},
         ]
         result = asyncio.run(engine.invoke_parallel(subagents, "find info"))
         assert set(result.keys()) == {"research", "writer"}
-        assert "Error" in result["research"]
-        assert "Error" in result["writer"]
-
-    def test_default_registry(self):
-        engine = TestableSubAgentEngine()
-        assert engine.registry is not None
-
-    def test_explicit_registry(self):
-        reg = ToolRegistry()
-        engine = TestableSubAgentEngine(registry=reg)
-        assert engine.registry is reg
+        assert "Error" in result["research"].text
+        assert "Error" in result["writer"].text
 
 
 class TestSubAgentEngineLoop:
@@ -84,10 +79,9 @@ class TestSubAgentEngineLoop:
             name="research",
             system_prompt="You are research.",
             description="find papers",
-            tool_defs=[],
             enhanced_query="find papers",
         ))
-        assert "subagent answer" in result
+        assert "subagent answer" in result.text
 
     def test_run_subagent_loop_returns_answer(self):
         engine = TestableSubAgentEngine(results={"research": "answer"})
@@ -95,10 +89,9 @@ class TestSubAgentEngineLoop:
             name="research",
             system_prompt="You are research.",
             description="find papers",
-            tool_defs=[{"name": "search", "description": "search", "args_schema": {}}],
             enhanced_query="find papers",
         ))
-        assert "answer" in result
+        assert "answer" in result.text
 
 
 class TestSubAgentEngineBatching:
@@ -107,7 +100,7 @@ class TestSubAgentEngineBatching:
     def test_beyond_max_parallel_are_not_dropped(self):
         engine = TestableSubAgentEngine()
         subagents = [
-            {"name": f"dept{i}", "description": "q", "system_prompt": "sys", "tool_registry": []}
+            {"name": f"dept{i}", "description": "q", "system_prompt": "sys"}
             for i in range(7)
         ]
         result = asyncio.run(engine.invoke_parallel(subagents, "find info"))
@@ -120,29 +113,60 @@ class TestSubAgentEngineBatching:
         class SlowEngine(SubAgentEngine):
             async def _run_subagent_loop(self, **kwargs):
                 await asyncio.sleep(10)
-                return "never"
+                return SubagentRun(text="never")
 
         engine = SlowEngine()
         result = asyncio.run(engine.invoke_parallel(
-            [{"name": "slow", "description": "q", "system_prompt": "s", "tool_registry": []}],
+            [{"name": "slow", "description": "q", "system_prompt": "s"}],
             "q",
         ))
-        assert "timed out" in result["slow"]
+        assert "timed out" in result["slow"].text
 
-    def test_registry_supplies_tools_when_spec_has_none(self):
-        reg = ToolRegistry()
-        reg.register_builtin("search", lambda q: q, risk_level="low")
-        engine = SubAgentEngine(registry=reg)
-        defs = engine._tool_defs_for("research", reg)
-        assert [d["name"] for d in defs] == ["search"]
 
-    def test_default_registry_is_populated(self):
-        """The no-arg registry must carry real tools.
+class TestEngineDoesNotSelectTools:
+    """Tool choice belongs to the SKILL.md allowlist, not to the engine.
 
-        A bare ``ToolRegistry()`` has zero specs, so sub-agents dispatched by
-        the graph — which constructs ``SubAgentEngine()`` with no argument —
-        would silently receive no tools at all.
+    The engine used to hold a ``ToolRegistry`` and call
+    ``get_visible_tools(name)``. That result was never bound to anything, so it
+    was a second filter that could only disagree with the real one.
+    """
+
+    def test_engine_has_no_registry(self):
+        engine = SubAgentEngine()
+        assert not hasattr(engine, "registry")
+        assert not hasattr(engine, "_registry")
+
+    def test_engine_passes_no_tool_defs_to_the_department(self):
+        """The loop forwards the query and nothing tool-shaped.
+
+        A ``tool_defs`` argument here would reintroduce a second source of
+        tools alongside ``select_department_tools``.
         """
-        defs = SubAgentEngine()._tool_defs_for("research", SubAgentEngine().registry)
-        assert defs, "default registry resolved no tools for a sub-agent"
-        assert all("name" in d and "description" in d for d in defs)
+        seen = {}
+
+        class SpyEngine(SubAgentEngine):
+            async def _run_subagent_loop(self, name, *args, **kwargs):
+                seen[name] = kwargs
+                return SubagentRun(text="ok")
+
+        asyncio.run(SpyEngine().invoke_parallel(
+            [{"name": "research", "description": "q"}], "find info"
+        ))
+        assert set(seen["research"]) == {"system_prompt", "description", "enhanced_query"}
+
+    def test_department_tools_come_from_the_allowlist(self):
+        """What the engine delegates to resolves real tools from SKILL.md."""
+        from src.services.agent_orchestrator.subagents import (
+            SUBAGENTS,
+            list_departments,
+            select_department_tools,
+        )
+        from src.services.tools_integration.tools import get_all_tools
+
+        toolset = get_all_tools()
+        for dept in list_departments():
+            spec = SUBAGENTS[dept["name"]]
+            resolved = select_department_tools(spec, "test query", tools_dict=toolset)
+            assert resolved, f"{dept['name']} resolved no tools"
+            for t in resolved:
+                assert t.name in toolset

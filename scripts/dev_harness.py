@@ -38,12 +38,18 @@ sys.path.insert(0, str(ROOT))
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage  # noqa: E402
 
 from src.services.agent_orchestrator import agent_factory, graph  # noqa: E402
+from src.services.agent_orchestrator.subagents import (  # noqa: E402
+    SUBAGENTS,
+    list_departments,
+    select_department_tools,
+)
 from src.services.session_memory.checkpoint import get_session  # noqa: E402
 from src.services.session_memory.window import get_window  # noqa: E402
 from src.services.tools_integration.discovery import discover_tools  # noqa: E402
 from src.services.tools_integration.registry import ToolRegistry  # noqa: E402
 from src.services.tools_integration.tools import (  # noqa: E402
     create_tool_registry,
+    get_all_tools,
     load_dynamic_tools,
 )
 
@@ -96,76 +102,111 @@ TOOL_HINTS = {
 
 
 class ScriptedDispatcher:
-    """Fake chat model that plays the dispatcher without an API key.
+    """Fake chat model covering both layers of the hierarchy, no API key.
 
-    Behaviour:
-      - On the first call for a turn, if the *user's* message matches a tool
-        hint, emit a tool call for that tool. Otherwise emit a JSON envelope.
-      - On the second call (after tool results return), summarise the result
-        in plain language.
+    The orchestrator is a pure router: it binds no tools and answers only with
+    the ``{"enhanced_query", "departments"}`` control envelope. A sub-agent
+    binds the tools ``select_department_tools`` shortlisted for it and runs the
+    ReAct loop itself — call a tool, read the ToolMessage, then answer.
+
+    An earlier version of this fake gave the *orchestrator* the tool call,
+    which is the one capability Option B removed. It could not fail, because
+    the router has no tools to call and silently fell through to a department
+    with an empty enhanced query.
     """
 
-    def __init__(self, tool_names: list[str]):
+    def __init__(self, tool_names: list[str], bound: list[str] | None = None):
         self._tool_names = tool_names
-        self._turn_state: dict[str, object] = {}
+        self._bound = list(bound or [])
         self.seen_prompts: list[list[BaseMessage]] = []
+        # (department, tool, result) for every tool a sub-agent executed, so the
+        # harness can assert the ReAct loop really ran.
+        self.subagent_tool_calls: list[tuple[str, str, str]] = []
         LOG.info("ScriptedDispatcher initialised with %d registry tools", len(tool_names))
 
     def bind_tools(self, tools, **kwargs):
         bound = [getattr(t, "name", str(t)) for t in tools]
-        LOG.info("bind_tools: dispatcher received %d tools: %s", len(bound), bound)
-        return self
+        LOG.info("bind_tools: sub-agent received %d tools: %s", len(bound), bound)
+        clone = ScriptedDispatcher(self._tool_names, bound=bound)
+        clone.seen_prompts = self.seen_prompts
+        clone.subagent_tool_calls = self.subagent_tool_calls
+        return clone
 
     def invoke(self, messages, **kwargs):
         self.seen_prompts.append(list(messages))
 
-        # Sub-agents share get_model() with the dispatcher. A sub-agent prompt
-        # is a SystemMessage plus a HumanMessage carrying the *enhanced* query
-        # ("[enhanced] ..."), so route it to plain prose rather than letting a
-        # dispatcher's JSON envelope become a sub-agent's answer.
         if _is_subagent_prompt(messages):
-            query = _last_user_text(messages)
-            LOG.info("Sub-agent answering (not the dispatcher): %r", query[:60])
-            return AIMessage(
-                content=f"Research findings for: {query.replace('[enhanced] ', '').strip()}"
-            )
+            return self._subagent_turn(messages)
 
-        # Only tool results from *this* turn count. The message window spans
-        # turns, so a naive `any(type == "tool")` sees turn 1's ToolMessage on
-        # turn 2 and wrongly believes it already called a tool.
-        already_called_tools = _tools_since_last_human(messages)
+        # The router binds no tools, so this turn can only be the envelope.
         user_text = _last_user_text(messages)
+        dept = self._route_to(user_text)
+        LOG.info("Router returning JSON envelope for %r -> %s", user_text, dept)
+        return AIMessage(content=json.dumps({
+            "enhanced_query": f"[enhanced] {user_text}",
+            "departments": [dept],
+        }))
 
-        if already_called_tools:
+    def _route_to(self, user_text: str) -> str:
+        """Pick a department the way the real router would.
+
+        A query needing a ``./tools`` tool goes to ``general``, the only
+        department whose allowlist lists them; anything else goes to
+        ``research``. Routing a tool-needing query to a department that cannot
+        call the tool would make the ReAct loop unreachable.
+        """
+        if self._suggest_tool(user_text, self._tool_names):
+            return "general"
+        return "research"
+
+    def _subagent_turn(self, messages) -> AIMessage:
+        """One turn of a sub-agent's ReAct loop.
+
+        Calls a hinted tool on the first turn if the department was actually
+        offered one, then summarises the ToolMessage it gets back.
+        """
+        query = _last_user_text(messages)
+        clean = query.replace("[enhanced] ", "").strip()
+
+        if _tools_since_last_human(messages):
             result = _last_tool_result(messages)
-            LOG.info("Dispatcher saw tool result; answering the user")
-            return AIMessage(content=f"Here is what I found — {result}")
+            tool = _last_tool_name(messages)
+            self.subagent_tool_calls.append((tool, query, result))
+            LOG.info("Sub-agent read result of '%s'; answering", tool)
+            return AIMessage(content=f"Research findings for: {clean} — {result}")
 
-        tool_name = self._suggest_tool(user_text)
+        tool_name = self._suggest_tool(query, self._bound)
         if tool_name:
-            LOG.info("Dispatcher chose tool '%s' for query %r", tool_name, user_text)
+            LOG.info(
+                "Sub-agent chose tool '%s' for %r (offered: %s)",
+                tool_name, clean, self._bound,
+            )
             return AIMessage(
                 content="",
                 tool_calls=[{
                     "name": tool_name,
-                    "args": _args_for(tool_name, user_text),
+                    "args": _args_for(tool_name, query),
                     "id": f"call_{tool_name}",
                     "type": "tool_call",
                 }],
             )
 
-        LOG.info("Dispatcher returning JSON envelope for %r", user_text)
-        return AIMessage(content=json.dumps({
-            "enhanced_query": f"[enhanced] {user_text}",
-            "departments": ["research"],
-        }))
+        LOG.info("Sub-agent answering without tools: %r", clean)
+        return AIMessage(content=f"Research findings for: {clean}")
 
-    def _suggest_tool(self, user_text: str) -> str | None:
-        """Suggest a tool from the registry based on what the query needs."""
+    def _suggest_tool(self, user_text: str, offered: list[str]) -> str | None:
+        """Pick a tool the department was actually offered, if the query hints one.
+
+        Only ``offered`` counts. A hint matched against the whole registry
+        would have the sub-agent call a tool its SKILL.md allowlist excluded,
+        which the model could not do against a real LLM.
+        """
         lowered = user_text.lower()
         for name, hints in TOOL_HINTS.items():
-            if name not in self._tool_names:
-                LOG.debug("Tool '%s' hinted at but absent from registry; skipping", name)
+            if name not in offered:
+                LOG.debug(
+                    "Tool '%s' hinted at but not offered to this department; skipping", name
+                )
                 continue
             if any(h in lowered for h in hints):
                 return name
@@ -186,7 +227,7 @@ def _is_subagent_prompt(messages) -> bool:
     for m in messages:
         if getattr(m, "type", "") == "system":
             content = str(m.content).lower()
-            if "you are the dispatcher" in content:
+            if "you are the router" in content or "you are the dispatcher" in content:
                 return False
             if "specialized subagent delegated a task" in content:
                 return True
@@ -221,6 +262,13 @@ def _last_tool_result(messages) -> str:
         if getattr(m, "type", "") == "tool":
             return str(m.content).replace("\n", " ")[:120]
     return "(no tool result)"
+
+
+def _last_tool_name(messages) -> str:
+    for m in reversed(messages):
+        if getattr(m, "type", "") == "tool":
+            return getattr(m, "name", "") or ""
+    return ""
 
 
 def _args_for(tool_name: str, user_text: str) -> dict:
@@ -261,8 +309,6 @@ def initial_state(user_message: str) -> AgentState:
     """Build the same state dict main.py sends for a user turn."""
     return {
         "messages": [HumanMessage(content=user_message)] if user_message else [],
-        "iteration_count": 0,
-        "max_iterations": 25,
         "enhanced_query": "",
         "department_targets": [],
         "subagent_results": {},
@@ -303,22 +349,46 @@ def main() -> int:
         print(f"    - {t['name']}: risk={t['risk_level']} roles={t['allowed_roles']} "
               f"src={Path(t['source_file']).name}")
 
-    # -- 2. Registry visibility -------------------------------------------
-    step("2. Tool registry — visibility scoped to ./tools")
+    # -- 2. Department tool allowlists -------------------------------------
+    step("2. Tool registry and per-department allowlists")
     full_registry = create_tool_registry()
     scoped = tools_dir_only_registry("./tools")
     print(f"  create_tool_registry() (built-ins + dynamic) -> {len(full_registry._specs)} tools")
     print(f"    {sorted(full_registry._specs)}")
     print(f"  tools/ scoped registry                          -> {len(scoped._specs)} tools")
     print(f"    {sorted(scoped._specs)}")
-    for role in ("general-purpose", "research", "writing"):
-        visible = [s.name for s in scoped.get_visible_tools(role)]
-        print(f"  role {role!r:18} sees -> {visible}")
+    # A department's tools come from its SKILL.md `allowed-tools` allowlist,
+    # not from a role lookup: `subagents.select_department_tools` resolves the
+    # names (including `server*` namespace claims) against the live tool set.
+    toolset = get_all_tools()
+    for dept in list_departments():
+        spec = SUBAGENTS[dept["name"]]
+        resolved = select_department_tools(spec, "test query", tools_dict=toolset)
+        print(f"  dept {dept['name']!r:18} allows {list(spec.tools)}")
+        print(f"  {'':25}resolves to {[t.name for t in resolved]}")
 
     # -- 3. Multi-turn session --------------------------------------------
     step("3. Multi-turn session — memory, enhanced query, departments")
     thread_id = "dev-harness-thread"
     tool_names = sorted(scoped._specs)
+
+    # `select_department_tools` shortlists with a live LLM call
+    # (`relevance.sort_tools`) whenever a department allows more than 5 tools.
+    # `general` allows 9, so the shortlist decides whether `text_stats` reaches
+    # the sub-agent at all — and that is a live API call whose ranking is not
+    # this harness's to assert on. Stub it to keyword-match the same hints the
+    # fake sub-agent uses, so the run is deterministic and offline. The
+    # shortlist's *wiring* is still exercised: allowlist -> cap -> shortlist ->
+    # real BaseTool objects bound.
+    def _deterministic_sort(_model, query, tool_defs, max_tools=5):
+        lowered = str(query).lower()
+        hinted = [t for t in tool_defs if any(h in lowered for h in TOOL_HINTS.get(t["name"], ()))]
+        chosen = hinted or list(tool_defs)
+        return [{"name": t["name"], "reason": "harness keyword match"} for t in chosen[:max_tools]]
+
+    import src.services.tools_integration.relevance as relevance_mod
+    relevance_mod.sort_tools = _deterministic_sort  # type: ignore[assignment]
+
     dispatcher = ScriptedDispatcher(tool_names)
     agent_factory.get_model = lambda: dispatcher  # type: ignore[assignment]
     graph.reset_deep_agent()
@@ -331,7 +401,6 @@ def main() -> int:
     print(f"\n  ANSWER 1: {answer1}")
     print(f"  enhanced_query     : {r1.get('enhanced_query')!r}")
     print(f"  department_targets : {r1.get('department_targets')!r}")
-    print(f"  iteration_count    : {r1.get('iteration_count')}")
 
     # session_memory must now hold turn 1.
     hist1 = get_session(thread_id)
@@ -372,14 +441,23 @@ def main() -> int:
         f"{len(full_registry._specs)} vs {len(scoped._specs)}",
     ))
     checks.append((
-        "turn 1 dispatched a real tool call",
-        any(getattr(m, "type", "") == "tool" for m in r1.get("messages", [])),
-        "a ToolMessage is present in turn 1",
+        "a sub-agent dispatched a real tool call",
+        bool(dispatcher.subagent_tool_calls),
+        f"calls={[(t, q[:20]) for t, q, _ in dispatcher.subagent_tool_calls]}",
     ))
     checks.append((
         "tool result is summarised to the user",
-        bool(answer1) and "found" in answer1,
+        bool(answer1) and any(
+            result[:40] in answer1 for _, _, result in dispatcher.subagent_tool_calls
+        ),
         f"answer1={answer1!r}",
+    ))
+    checks.append((
+        "orchestrator bound no tools (pure router)",
+        not any(
+            getattr(m, "type", "") == "tool" for m in r1.get("messages", [])
+        ),
+        "the router's own message state holds no ToolMessage",
     ))
     checks.append((
         "session_memory recorded turn 1",

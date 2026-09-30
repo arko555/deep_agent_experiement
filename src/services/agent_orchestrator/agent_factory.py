@@ -1,14 +1,17 @@
 """Deep agent graph factory.
 
 Constructs and caches the LangGraph state graph for the deep agent workflow.
-Routing, tools, and retry logic are imported from their dedicated modules.
+
+This module used to own the top-level ``tools`` node, where the orchestrator
+called tools itself and delegated to sub-agents via the ``task`` tool. Both are
+gone: the orchestrator is a pure router, tool calls happen inside a
+sub-agent's ReAct loop, and the graph itself is assembled in
+``graph.get_deep_agent``. What remains here is model selection, the
+observability tracer, and the cache-reset hooks.
 """
 
 import os
-import time
-import uuid
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -19,31 +22,10 @@ from langchain_openai import ChatOpenAI
 from langchain_openrouter import ChatOpenRouter
 from langchain_ollama import ChatOllama
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage, AIMessage, HumanMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 
-# pyrefly: ignore [missing-import]
-from src.services.agent_orchestrator.state import AgentState
-# pyrefly: ignore [missing-import]
-from src.config import (
-    get_max_parallel_tasks,
-    get_max_subagent_depth,
-    get_subagent_timeout_seconds,
-)
-from src.services.agent_orchestrator.subagents import is_parallelizable
 from src.services.tools_integration.mcp_client import clear_mcp_tools_cache as clear_mcp_client_cache
 from src.services.tools_integration.mcp_bridge import clear_mcp_tools_cache as clear_mcp_bridge_cache
-from src.services.agent_orchestrator.memory import get_workspace_files
-from src.services.agent_orchestrator.guardrails import get_workspace_root
-from src.services.agent_orchestrator.graph import (
-    _local_orchestrator_node,
-    _responder_node,
-    _subagent_fanout_node,
-)
-from src.services.agent_orchestrator.routing import route_from_orchestrator
-from src.services.tools_integration.tools import create_tool_registry, _execute_task, get_all_tools
-from src.services.tools_integration.executor import ToolExecutor
+from src.services.tools_integration.guardrails import get_workspace_root
 
 load_dotenv()
 
@@ -192,225 +174,6 @@ def _get_cached_model():
         return _model_cache[key]
 
 
-# --- Graph Wrapper Nodes ---
-
-def local_tools_node(state: AgentState):
-    messages = state["messages"]
-    last_message = messages[-1]
-    tool_messages = []
-    updates = {}
-
-    registry = create_tool_registry()
-    executor = ToolExecutor(registry)
-
-    audit_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "action": "tool_call",
-        "details": "",
-        "tool_calls": [],
-    }
-
-    # Depth tracks nesting *level*, not delegation count: the parent keeps
-    # its own depth unchanged; each child is invoked with depth + 1.
-    recursion_depth = state.get("recursion_depth", 0)
-    child_usage = {"input": 0, "output": 0}
-    child_writes: list[dict] = []
-
-    # Collect task calls to check for parallel execution opportunity (4.2).
-    task_calls = []
-    non_task_calls = []
-
-    for tool_call in last_message.tool_calls:
-        tool_name = tool_call["name"]
-        if tool_name == "task":
-            task_calls.append(tool_call)
-        else:
-            non_task_calls.append(tool_call)
-
-    # Execute non-task tools first (these are sequential).
-    invalid_tool_count = 0
-    for tool_call in non_task_calls:
-        tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        tool_id = tool_call["id"]
-
-        audit_entry["tool_calls"].append({"name": tool_name, "args": tool_args})
-
-        tool_func = registry.get_callable(tool_name)
-        # Shared retry wrapper (exponential backoff); returns an error
-        # string on failure rather than raising, so the graph can continue.
-        if tool_func is not None:
-            try:
-                result = executor.execute_sync(
-                    tool_name, tool_args, "general-purpose"
-                )
-            except Exception as e:
-                result = f"Error executing tool {tool_name}: {str(e)}"
-
-            if result is not None:
-                if tool_name == "write_todos":
-                    updates["current_plan"] = tool_args.get("todos", [])
-
-                # Track write operations in pending_writes for audit/logging.
-                # Writes execute immediately; pending_writes is informational only.
-                if tool_name in ["write_file", "edit_file"]:
-                    pending_entry = {
-                        "tool": tool_name,
-                        "tool_id": tool_id,
-                        "args": tool_args,
-                        "status": "executed",
-                    }
-                    existing_pending = state.get("pending_writes", [])
-                    updates["pending_writes"] = existing_pending + [pending_entry]
-
-            # A real tool ran, so any earlier streak of unknown-tool misses is
-            # broken — the model has recovered. Only *consecutive* misses count.
-            if state.get("consecutive_invalid_tools"):
-                updates["consecutive_invalid_tools"] = 0
-        else:
-            # The model asked for a tool that does not exist. Do not silently
-            # return "not found" and let it retry forever: name the valid
-            # tools so the model can correct itself on the next turn, and
-            # count the miss so the graph can cut the loop short.
-            invalid_tool_count += 1
-            available = ", ".join(sorted(registry.list_tools()))
-            result = (
-                f"Error: no tool named '{tool_name}'. "
-                f"Available tools: {available}. "
-                f"Call one of those, or answer the user directly without a tool."
-            )
-            logger.warning(
-                "Model requested unknown tool '%s' (invalid #%d this turn)",
-                tool_name, invalid_tool_count,
-            )
-
-        tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_id, name=tool_name))
-
-    # Consecutive unknown-tool misses are the signature of a model stuck in a
-    # retry loop, so the router uses this to stop early rather than spending
-    # the whole iteration budget re-asking for a tool that will never exist.
-    if invalid_tool_count:
-        updates["consecutive_invalid_tools"] = (
-            state.get("consecutive_invalid_tools", 0) + invalid_tool_count
-        )
-
-
-    # 4.2: Execute task calls — run independent tasks in parallel when possible.
-    # Tasks are considered independent if they have different subagent types
-    # (research vs writer) or are general-purpose tasks with distinct descriptions.
-    tasks_to_parallelize = []
-    for tc in task_calls:
-        tool_args = tc["args"]
-        audit_entry["tool_calls"].append({"name": "task", "args": tool_args})
-
-        if recursion_depth >= get_max_subagent_depth():
-            result = (
-                f"Error: Maximum subagent depth ({get_max_subagent_depth()}) reached. "
-                f"Cannot delegate further subagents. "
-                f"Handle this task directly or consolidate remaining work."
-            )
-            tool_messages.append(ToolMessage(content=result, tool_call_id=tc["id"], name="task"))
-        else:
-            subagent_type = tool_args.get("subagent_type", "general-purpose")
-            description = tool_args.get("description", "")
-            tasks_to_parallelize.append({
-                "subagent_type": subagent_type,
-                "description": description,
-                "tool_id": tc["id"],
-            })
-
-    # Group tasks by the registry's parallelizable flag (6.1): those types run
-    # concurrently; everything else (general-purpose, unknown types) runs
-    # sequentially.
-    independent_tasks = [t for t in tasks_to_parallelize
-                        if is_parallelizable(t["subagent_type"])]
-    sequential_tasks = [t for t in tasks_to_parallelize
-                       if not is_parallelizable(t["subagent_type"])]
-
-    def _run_task(task_info):
-        result, usage, write_ops = _execute_task(
-            task_info["subagent_type"],
-            task_info["description"],
-            recursion_depth,
-            get_all_tools(),
-        )
-        return (task_info["tool_id"], result, usage, write_ops)
-
-    # One shared wall-clock deadline for the whole batch (6.6): each future
-    # only gets the remaining time, so a hung batch costs one timeout, not
-    # N x timeout.
-    batch_deadline = time.monotonic() + get_subagent_timeout_seconds()
-
-    def _resolve_task(future, task_info):
-        """Collect one task result with the shared batch deadline. A failed or
-        hung task yields an error string instead of dropping its siblings'
-        results."""
-        try:
-            return future.result(timeout=max(0.0, batch_deadline - time.monotonic()))
-        except Exception as e:
-            return (task_info["tool_id"], f"Error executing subagent task: {e}", {}, [])
-
-    def _record_task_result(tool_id, result, usage, write_ops):
-        tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_id, name="task"))
-        child_usage["input"] += usage.get("input", 0)
-        child_usage["output"] += usage.get("output", 0)
-        child_writes.extend(write_ops)
-
-    # Independent tasks: bounded parallel pool, results collected in
-    # submission order so ToolMessage ordering is deterministic.
-    if independent_tasks:
-        executor = ThreadPoolExecutor(
-            max_workers=min(get_max_parallel_tasks(), len(independent_tasks))
-        )
-        try:
-            futures = [executor.submit(_run_task, t) for t in independent_tasks]
-            for task_info, future in zip(independent_tasks, futures):
-                _record_task_result(*_resolve_task(future, task_info))
-        finally:
-            # wait=False: a hung worker must not block the parent past the timeout.
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    # Sequential tasks: one at a time (shared state), same timeout guard.
-    for task_info in sequential_tasks:
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(_run_task, task_info)
-            _record_task_result(*_resolve_task(future, task_info))
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-    # Fold subagent token spend into the parent's budget so top-level
-    # tracking reflects the whole delegation tree, not just this level.
-    if child_usage["input"] or child_usage["output"]:
-        current = state.get("token_usage", {}) or {}
-        total_in = current.get("input", 0) + child_usage["input"]
-        total_out = current.get("output", 0) + child_usage["output"]
-        updates["token_usage"] = {
-            "input": total_in,
-            "output": total_out,
-            "total": total_in + total_out,
-        }
-
-    # Subagent file writes join the parent's audit trail (previously only
-    # top-level write_file/edit_file calls were tracked).
-    if child_writes:
-        existing_pending = state.get("pending_writes", [])
-        updates["pending_writes"] = existing_pending + [
-            {
-                "tool": op.get("tool", "write_file"),
-                "tool_id": op.get("tool_id"),
-                "args": op.get("args", {}),
-                "status": op.get("status", "executed"),
-            }
-            for op in child_writes
-        ]
-
-    updates["messages"] = tool_messages
-    updates["workspace_files"] = get_workspace_files()
-    updates["audit_log"] = [audit_entry]
-    return updates
-
-
 # --- Graph Construction ---
 
 def get_deep_agent():
@@ -449,11 +212,14 @@ def reset_deep_agent():
 
     Call this when tools, skills, system prompts, or model configuration
     change and you need a fresh graph. The next call to ``get_deep_agent()``
-    will compile a new instance and rebuild provider clients (8.5) and MCP
-    tools (10.1).
+    will compile a new instance and rebuild provider clients (8.5), MCP
+    tools (10.1), and the tool registry the sub-agent tool loop dispatches
+    through — a stale registry would keep offering tools that no longer exist.
     """
     from src.services.agent_orchestrator.graph import reset_deep_agent as _reset
+    from src.services.agent_orchestrator import subagents
 
     global _compiled_graph
     _compiled_graph = None
+    subagents._TOOL_REGISTRY = None
     _reset()

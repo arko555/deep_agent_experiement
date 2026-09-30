@@ -1,15 +1,14 @@
-"""Subagent registry and executors for the `task` tool and department fanout.
+"""Subagent registry and the department executor.
 
-SUBAGENTS is the single source of truth for subagent types: it drives the
-`task` tool schema (the allowed subagent_type values), `_execute_task`
-dispatch, the parallel-vs-sequential split in the tools node, and role
-prompt construction.
+SUBAGENTS is the single source of truth for departments: it drives the
+router's roster (``list_departments``), the parallel-vs-sequential split in
+``subagent_engine``, and each sub-agent's prompt construction.
 
 **Departments come from ``skills/``.** Each ``skills/<name>/SKILL.md`` yields
 a ``tool_loop`` sub-agent whose system prompt is the markdown body and whose
 ``allowed-tools`` frontmatter is the hard tool allowlist. Adding a department
-is adding a directory — no Python change. ``general-purpose`` (full graph) and
-A2A agents are runtime capabilities, not skills, so they stay hardcoded.
+is adding a directory — no Python change. ``skills/general`` is the catch-all
+department, and configured A2A agents are remote services, not skills.
 
 Every tool_loop sub-agent runs the same executor, ``run_department``: it
 shortlists its allowlist down to the tools relevant to the current query, then
@@ -19,23 +18,31 @@ and write files instead of answering in a single completion.
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.config import get_a2a_agents
+from src.config import get_a2a_agents, get_max_iterations
 from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
 from src.utils import get_message_text, invoke_with_retry
 
+if TYPE_CHECKING:
+    from src.services.tools_integration.registry import ToolRegistry
+
 logger = logging.getLogger(__name__)
 
-# A2A subagent types come from configuration, but the `task` tool's type enum
-# is built statically from this registry — so `.env` must be loaded before the
-# registry is assembled. Import order is tools -> subagents, which runs before
-# the load_dotenv() in agent_factory, hence the explicit call here. Consequence:
-# changing the configured A2A agents requires a process restart.
+# Built on first use, not at import: it reads the toolset from disk and the
+# network, which must not happen merely by importing this module.
+_TOOL_REGISTRY: "ToolRegistry | None" = None
+
+# A2A subagent types come from configuration, but the department roster the
+# router sees is built statically from this registry at import — so `.env` must
+# be loaded before the registry is assembled. Import order is tools ->
+# subagents, which runs before the load_dotenv() in agent_factory, hence the
+# explicit call here. Consequence: changing the configured A2A agents requires
+# a process restart.
 load_dotenv()
 
 
@@ -47,7 +54,7 @@ load_dotenv()
 class SubagentSpec:
     """One subagent type, as registered in SUBAGENTS."""
 
-    description: str   # surfaced in the `task` tool schema
+    description: str   # the only signal the router has for choosing this one
     kind: str          # "tool_loop" (restricted tools), "graph" (full graph), or "a2a" (remote agent)
     parallelizable: bool = False  # may run concurrently with sibling tasks
     aliases: tuple = ()            # accepted alternate names for subagent_type
@@ -95,17 +102,13 @@ def _skill_specs(skills_dir: str | None = None) -> dict[str, SubagentSpec]:
     return specs
 
 
-# `general-purpose` is a capability of the runtime, not a skill: it runs the
-# full graph and has no SKILL.md, so it stays hardcoded. Everything else comes
-# from skills/ or from the A2A_AGENTS config.
-_RUNTIME_SUBAGENTS: dict[str, SubagentSpec] = {
-    "general-purpose": SubagentSpec(
-        description="Full deep agent with all tools; use for complex or context-heavy sub-tasks.",
-        kind="graph",
-        parallelizable=False,
-        aliases=("general",),
-    ),
-}
+# There is no hardcoded runtime subagent. A `general-purpose` spec used to live
+# here, running the whole compiled graph as a "sub-agent" — which made the
+# orchestrator its own sub-agent, so a delegated description would be routed
+# again from the top and the hierarchy stopped being one-way. The catch-all is
+# now `skills/general/SKILL.md`: a real department with a real prompt and a real
+# tool allowlist, chosen by the router rather than by a self-referential spec.
+# Its `kind` is `tool_loop` like every other skill.
 
 
 def _a2a_specs() -> dict[str, SubagentSpec]:
@@ -126,13 +129,13 @@ def _a2a_specs() -> dict[str, SubagentSpec]:
 
 
 def build_subagent_registry() -> dict[str, SubagentSpec]:
-    """Assemble the full registry: skills + runtime capabilities + A2A agents.
+    """Assemble the full registry: skills from disk + configured A2A agents.
 
-    Called at import for the module-level ``SUBAGENTS`` (which the ``task``
-    tool's schema is built from) and again by ``refresh_subagents`` after a
-    skills change.
+    Called at import for the module-level ``SUBAGENTS`` (which the router's
+    roster and every department lookup resolve against) and again by
+    ``refresh_subagents`` after a skills change.
     """
-    return {**_skill_specs(), **_RUNTIME_SUBAGENTS, **_a2a_specs()}
+    return {**_skill_specs(), **_a2a_specs()}
 
 
 SUBAGENTS: dict[str, SubagentSpec] = build_subagent_registry()
@@ -159,14 +162,20 @@ def refresh_subagents() -> dict[str, SubagentSpec]:
 def list_departments() -> list[dict[str, str]]:
     """The routable departments, for the dispatcher's prompt.
 
-    Only ``tool_loop`` specs backed by a SKILL.md are routable departments:
-    ``general-purpose`` is a delegation target, and A2A agents are remote
-    services, so neither is something the dispatcher should route a query to.
+    Both kinds of sub-agent are routable. A ``tool_loop`` spec is backed by a
+    SKILL.md; an ``a2a`` spec is a remote agent reached by URL. A remote agent
+    is a sub-agent that happens to live behind a network hop, so the router
+    treats it exactly like a local department — which is what it has to do
+    now that the ``task`` tool, previously the only thing that dispatched an
+    ``a2a`` spec, is gone.
+
+    A ``tool_loop`` spec with no skill is still excluded: it has no prompt to
+    run a tool loop with, so routing to it would produce an empty turn.
     """
     return [
         {"name": name, "description": spec.description}
         for name, spec in sorted(SUBAGENTS.items())
-        if spec.kind == "tool_loop" and spec.skill
+        if (spec.kind == "tool_loop" and spec.skill) or spec.kind == "a2a"
     ]
 
 
@@ -232,6 +241,56 @@ def _extract_usage(response):
     )
 
 
+def _registry_for(tool_map: dict) -> "ToolRegistry":
+    """The registry a sub-agent's tool calls dispatch through.
+
+    Prefers the process-wide registry from ``create_tool_registry``, which
+    already holds the full tool set with its declared kinds and schemas. Tools
+    it does not know — a test double, a tool registered after it was built —
+    are added to it, so a bound tool is never silently uncallable.
+
+    The registry is built once and cached: it loads dynamic and MCP tools from
+    disk and the network, which must not happen per sub-agent per turn.
+    """
+    from src.services.tools_integration.registry import ToolRegistry
+
+    global _TOOL_REGISTRY
+    if _TOOL_REGISTRY is None:
+        try:
+            from src.services.tools_integration.tools import create_tool_registry
+
+            _TOOL_REGISTRY = create_tool_registry()
+        except Exception as e:
+            # A registry is a convenience here, not a precondition: the loop
+            # still runs, with the bound tools as the only authority.
+            logger.warning("Could not build the tool registry (%s); using bound tools only.", e)
+            _TOOL_REGISTRY = ToolRegistry()
+
+    for name, tool in tool_map.items():
+        if _TOOL_REGISTRY.get_tool(name) is None:
+            _TOOL_REGISTRY.register_builtin(name, tool, allowed_roles=("*",))
+    return _TOOL_REGISTRY
+
+
+class _ToolDispatcher:
+    """Adapts ``ToolRegistry.dispatch`` to the ``invoke_with_retry`` contract.
+
+    ``invoke_with_retry`` calls ``.invoke(payload)`` and reads its second
+    positional as ``max_retries``, so it needs an object rather than a bare
+    callable. Binding the tool name here keeps the retry on the transport —
+    where a transient network failure actually is — and leaves validation
+    errors to re-raise immediately, which is what lets the sub-agent see
+    them and correct the payload.
+    """
+
+    def __init__(self, registry: "ToolRegistry", tool_name: str):
+        self._registry = registry
+        self._tool_name = tool_name
+
+    def invoke(self, payload: dict) -> Any:
+        return self._registry.dispatch(self._tool_name, payload)
+
+
 def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterations: int = 10):
     """Run a minimal ReAct-style loop: model with bound tools until it answers
     without tool calls (or the iteration budget is exhausted).
@@ -253,6 +312,13 @@ def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterati
     model = get_model()
     model_with_tools = model.bind_tools(tools) if tools else model
     tool_map = {t.name: t for t in tools}
+
+    # The one execution surface. Every call goes through the registry so the
+    # payload is checked against the tool's declared schema and the transport
+    # is chosen from the tool's declared kind. A tool the registry has never
+    # seen still runs — the bound `tool_map` is the authority on what a
+    # sub-agent may call, and the registry is populated independently.
+    registry = _registry_for(tool_map)
 
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=description)]
     usage = {"input": 0, "output": 0}
@@ -283,7 +349,9 @@ def run_tool_loop(system_prompt: str, description: str, tools: list, max_iterati
                 result = f"Tool '{tool_call['name']}' not found."
             else:
                 try:
-                    result = invoke_with_retry(tool, tool_call["args"])
+                    result = invoke_with_retry(
+                        _ToolDispatcher(registry, tool_call["name"]), tool_call["args"]
+                    )
                 except Exception as e:
                     result = f"Error executing tool {tool_call['name']}: {e}"
             messages.append(ToolMessage(
@@ -341,9 +409,10 @@ def select_department_tools(
     Three stages, per the documented contract:
 
     1. ``spec.tools`` (the SKILL.md ``allowed-tools`` frontmatter) is the hard
-       allowlist. Names that do not resolve are dropped with a warning — a
-       stale name in a SKILL.md must not become a tool the model can call but
-       never execute.
+       allowlist. A name may be exact or a ``prefix*`` namespace claim, which
+       is how a department claims an MCP server's tools. Names that do not
+       resolve are dropped with a warning — a stale name in a SKILL.md must
+       not become a tool the model can call but never execute.
     2. The allowlist is capped at ``MAX_VISIBLE_TOOLS``.
     3. ``relevance.sort_tools`` narrows to ``MAX_SHORTLISTED_TOOLS`` for *this*
        query, so a department is handed the tools its current task needs
@@ -353,14 +422,34 @@ def select_department_tools(
     returns metadata only, so resolving names back to callables here is what
     makes the sub-agent able to actually *call* what it was offered.
 
+    Stage 3 delegates to ``ToolRegistry.select_for_query``, which owns the
+    relevance shortlist; this function owns the allowlist, namespace matching,
+    and the visibility cap — the two halves of one rule, split where the
+    knowledge sits.
+
     Falls back to the capped allowlist if relevance sorting fails.
     """
-    from src.services.tools_integration.relevance import sort_tools
-
     toolset = tools_dict if tools_dict is not None else _all_tools()
 
     allowed: list = []
     for name in spec.tools:
+        if name.endswith("*"):
+            # A trailing '*' claims a whole namespace. MCP tools arrive
+            # server-prefixed (``<server>_<tool>``), so a department cannot
+            # name them one by one in static frontmatter and would otherwise
+            # be unable to claim its own server at all. Prefix matches still
+            # pass through the visibility cap and the relevance shortlist
+            # below, so a large namespace stays bounded.
+            prefix = name[:-1]
+            matched = [t for tname, t in toolset.items() if tname.startswith(prefix)]
+            if not matched:
+                logger.warning(
+                    "Department '%s' allows namespace '%s' (skills/%s/SKILL.md); "
+                    "no tools matched.",
+                    getattr(spec, "skill", "?"), name, getattr(spec, "skill", "?"),
+                )
+            allowed.extend(matched)
+            continue
         tool_obj = toolset.get(name)
         if tool_obj is None:
             logger.warning(
@@ -370,35 +459,36 @@ def select_department_tools(
             continue
         allowed.append(tool_obj)
 
+    # A namespace claim and an explicit name can resolve to the same tool;
+    # keep the first occurrence so the bound list has no duplicates.
+    deduped: list = []
+    seen: set[str] = set()
+    for tool_obj in allowed:
+        if tool_obj.name in seen:
+            continue
+        seen.add(tool_obj.name)
+        deduped.append(tool_obj)
+    allowed = deduped
+
     if not allowed:
         return []
     if len(allowed) <= MAX_SHORTLISTED_TOOLS:
         return allowed
 
+    # The visibility cap and the relevance shortlist are the registry's job, so
+    # the rule lives in one place: this function decides which names a
+    # department *declares*, the registry decides which of those it *sees*.
     visible = allowed[:MAX_VISIBLE_TOOLS]
-    try:
-        from src.services.agent_orchestrator.agent_factory import get_model
+    from src.services.tools_integration.registry import ToolRegistry
 
-        sorter = model if model is not None else get_model()
-        tool_defs = [
-            {
-                "name": t.name,
-                "description": getattr(t, "description", "") or "",
-            }
-            for t in visible
-        ]
-        chosen = sort_tools(sorter, query, tool_defs, MAX_SHORTLISTED_TOOLS)
-        by_name = {t.name: t for t in visible}
-        shortlist = [by_name[c["name"]] for c in chosen if c.get("name") in by_name]
-    except Exception as e:
-        logger.warning(
-            "Tool shortlisting failed for '%s' (%s); using capped allowlist.",
-            getattr(spec, "skill", "?"), e,
-        )
-        return visible
+    registry = ToolRegistry()
+    for tool_obj in visible:
+        registry.register_builtin(tool_obj.name, tool_obj, allowed_roles=("*",))
 
-    if not shortlist:
-        return visible[:MAX_SHORTLISTED_TOOLS]
+    shortlist = registry.select_for_query(
+        [t.name for t in visible], query, max_tools=MAX_SHORTLISTED_TOOLS, model=model
+    )
+
     logger.info(
         "Department '%s': shortlisted %d of %d allowed tools for this query.",
         getattr(spec, "skill", "?"), len(shortlist), len(visible),
@@ -407,7 +497,15 @@ def select_department_tools(
 
 
 def _all_tools() -> dict:
-    """Lazily fetch the full tool set (avoids an import cycle at module load)."""
+    """The full tool set a department's allowlist resolves against.
+
+    This is ``tools_integration.get_all_tools()`` — every built-in, dynamic
+    file, and MCP tool. It previously also carried the ``task`` delegation
+    tool; that lived in ``agent_orchestrator.task_tool`` because it reached up
+    into this registry, and both it and the sub-agent-to-sub-agent delegation
+    it served have been removed. A department's allowlist resolves against the
+    tool layer alone, so the dependency arrow points one way.
+    """
     from src.services.tools_integration.tools import get_all_tools
 
     return get_all_tools()
@@ -417,25 +515,31 @@ def run_department(
     spec: SubagentSpec,
     query: str,
     tools_dict: dict | None = None,
-    max_iterations: int = 10,
+    max_iterations: int | None = None,
 ):
     """Run one department end to end: prompt, tools, ReAct loop.
 
-    This is the single executor behind both entry points — the ``task`` tool
-    (``tools._execute_task``) and department fanout
-    (``subagent_engine.SubAgentEngine``). Both previously had their own
-    implementation and the fanout one could not execute tools at all.
+    The single executor behind department fanout
+    (``subagent_engine.SubAgentEngine``). The fanout used to have a second,
+    weaker implementation that could not execute tools at all; this is the one
+    both paths go through.
 
     Args:
         spec: The department's registered spec (supplies the SKILL.md prompt
             and the tool allowlist).
         query: The enhanced query to fulfil.
         tools_dict: Live tool mapping to resolve the allowlist against.
-        max_iterations: Cap on model turns before giving up.
+        max_iterations: Cap on model turns before giving up. ``None`` takes
+            ``AGENT_MAX_ITERATIONS``. This is the only iteration budget in
+            the system: the ReAct loop below is the only thing that
+            iterates, so this is where that setting belongs. The orchestrator
+            has no budget because it is a single-shot router.
 
     Returns:
         ``(final_text, usage, write_ops)`` — same shape as ``run_tool_loop``.
     """
+    if max_iterations is None:
+        max_iterations = get_max_iterations()
     tools = select_department_tools(spec, query, tools_dict)
     return run_tool_loop(
         build_role_prompt(spec),

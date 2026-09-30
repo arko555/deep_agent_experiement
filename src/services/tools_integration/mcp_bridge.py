@@ -2,13 +2,13 @@
 
 import json
 import logging
-from typing import Any
 
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from src.async_bridge import run_sync
 from src.config import get_mcp_servers
+from src.services.tools_integration.mcp_client import MCPTool
+from src.services.tools_integration.mcp_client import _to_sync_tool as _client_wrap
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +42,15 @@ async def _load_async(servers: dict) -> dict[str, BaseTool]:
     return loaded
 
 
-def _to_sync_tool(mcp_tool: BaseTool) -> StructuredTool:
-    """Wrap an async MCP tool so it supports synchronous ``.invoke()``."""
+def _to_sync_tool(mcp_tool: BaseTool) -> MCPTool:
+    """Wrap an async MCP tool so it supports synchronous ``.invoke()``.
 
-    def _run(**kwargs):
-        return run_sync(mcp_tool.ainvoke(kwargs))
-
-    return StructuredTool(
-        name=mcp_tool.name,
-        description=mcp_tool.description,
-        args_schema=mcp_tool.args_schema or {"type": "object", "properties": {}},
-        func=_run,
-    )
+    Delegates to ``mcp_client._to_sync_tool`` so the payload contract lives in
+    one place. These two loaders are near-duplicates that should be merged, but
+    until then both must validate identically — ``tools_integration/__init__``
+    re-exports this module, so a caller can reach this one directly.
+    """
+    return _client_wrap(mcp_tool)
 
 
 async def load_mcp_tools_async() -> dict[str, BaseTool]:

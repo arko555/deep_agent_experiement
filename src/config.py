@@ -43,17 +43,28 @@ def _env_json(name: str, default: dict) -> dict:
 
 
 def get_max_iterations() -> int:
-    """Per-turn orchestrator iteration budget (shared by parent and subagents)."""
+    """Per-sub-agent ReAct turn budget (``AGENT_MAX_ITERATIONS``).
+
+    This is the budget for one department's tool loop — the layer that
+    actually iterates. The orchestrator is not covered by it and never was in
+    the current architecture: the graph is acyclic, so the router runs once
+    per turn and has nothing to count. It used to be described as a
+    "parent and subagents" budget, which was true of the old top-level ReAct
+    dispatcher loop and stopped being true when that loop was removed.
+    """
     return _env_int("AGENT_MAX_ITERATIONS", 25)
 
 
 def get_max_subagent_depth() -> int:
-    """Maximum subagent nesting level for `task` delegation.
+    """Maximum subagent nesting level.
 
-    Semantics: a parent at depth D spawns children at D+1, and delegation is
-    rejected when the parent's depth >= this limit. So the deepest subagent
-    sits at depth == limit and cannot delegate further — a top-level agent
-    (depth 0) can nest `limit` levels of subagents deep.
+    Removed from use with the ``task`` delegation path, which was the only
+    thing that nested sub-agents. There is no nesting left to bound: a
+    sub-agent's tool loop is capped by its own iteration budget
+    (``get_max_iterations``), and the router never calls a sub-agent from
+    inside a sub-agent. Kept because ``AGENT_MAX_SUBAGENT_DEPTH`` is a
+    documented environment variable, so a deployment setting it should not
+    break, and so re-introducing nesting has a knob waiting for it.
     """
     return _env_int("AGENT_MAX_SUBAGENT_DEPTH", 3)
 

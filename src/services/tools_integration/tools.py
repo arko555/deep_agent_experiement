@@ -2,44 +2,38 @@
 
 This module holds all LangChain tool definitions and the dynamic tool loader.
 Import from here rather than duplicating inline in agent_factory.
+
+This is the bottom of the dependency stack: nothing here imports
+``agent_orchestrator``. The ``task`` tool used to live here, which forced
+three lazy upward imports and made the one-way hierarchy unenforceable. It was
+moved up to ``agent_orchestrator.task_tool`` and has since been removed along
+with the sub-agent-to-sub-agent delegation it served.
 """
 
 import os
 import logging
 import importlib.util
 import inspect
-import uuid
-from typing import List, Literal
+from typing import Any, Literal
 
 import httpx
-from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool, tool
 
 from src.async_bridge import run_sync
 from src.services.tools_integration.research_fetch import fetch_public_url
-from src.services.agent_orchestrator.guardrails import (
+from src.services.tools_integration.guardrails import (
+    get_workspace_files,
     get_workspace_root,
     validate_and_normalize_path,
     validate_read_path,
 )
 from src.services.tools_integration.mcp_client import load_mcp_tools
-from src.services.agent_orchestrator.memory import _dir_tree_hash, get_workspace_files
+from src.services.tools_integration.discovery import _dir_tree_hash
+from src.services.tools_integration.registry import ToolRegistry
+from src.types import ToolKind
 
 logger = logging.getLogger(__name__)
 
-
-def _subagent_registry() -> dict:
-    """The live sub-agent registry, imported lazily.
-
-    ``subagents`` builds ``SUBAGENTS`` from ``skills/`` at import time, which
-    reaches ``tools_integration.discovery`` — whose package ``__init__``
-    imports this module. A top-level import would close that cycle and fail
-    whenever this module is imported first. Every use below is at call time,
-    so deferring costs nothing and keeps the registry live.
-    """
-    from src.services.agent_orchestrator.subagents import SUBAGENTS
-
-    return SUBAGENTS
 
 # ---------------------------------------------------------------------------
 # Built-in Tools
@@ -47,7 +41,7 @@ def _subagent_registry() -> dict:
 
 
 @tool
-def write_todos(todos: List[str]) -> str:
+def write_todos(todos: list[str]) -> str:
     """Update or set the list of planned tasks/todos. Use this to keep track of your progress.
 
     Args:
@@ -93,7 +87,7 @@ def internet_search(
             lines.append("")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error searching the web: {str(e)}"
+        return f"Error searching the web: {e!s}"
 
 
 @tool
@@ -103,12 +97,12 @@ def read_file(path: str) -> str:
         clean_path = validate_read_path(path)
         if not os.path.exists(clean_path):
             return f"Error: File {clean_path} does not exist."
-        with open(clean_path, "r") as f:
+        with open(clean_path) as f:
             return f.read()
     except ValueError as e:
         return str(e)
     except Exception as e:
-        return f"Error reading file {path}: {str(e)}"
+        return f"Error reading file {path}: {e!s}"
 
 
 @tool
@@ -121,7 +115,7 @@ def write_file(path: str, content: str) -> str:
             f.write(content)
         return f"Successfully wrote to {clean_path}"
     except Exception as e:
-        return f"Error writing to file {path}: {str(e)}"
+        return f"Error writing to file {path}: {e!s}"
 
 
 @tool
@@ -131,7 +125,7 @@ def edit_file(path: str, search_text: str, replace_text: str) -> str:
         clean_path = validate_and_normalize_path(path, must_be_in_workspace=True)
         if not os.path.exists(clean_path):
             return f"Error: File {clean_path} does not exist."
-        with open(clean_path, "r") as f:
+        with open(clean_path) as f:
             content = f.read()
         if search_text not in content:
             return f"Error: '{search_text}' not found in {clean_path}"
@@ -140,7 +134,7 @@ def edit_file(path: str, search_text: str, replace_text: str) -> str:
             f.write(new_content)
         return f"Successfully updated {clean_path}"
     except Exception as e:
-        return f"Error editing file {path}: {str(e)}"
+        return f"Error editing file {path}: {e!s}"
 
 
 @tool
@@ -167,7 +161,7 @@ def search_files(pattern: str, max_matches: int = 30) -> str:
     for rel_path in files:
         try:
             full_path = validate_read_path(str(root / rel_path))
-            with open(full_path, "r", errors="ignore") as f:
+            with open(full_path, errors="ignore") as f:
                 for line_no, line in enumerate(f, 1):
                     if pattern in line:
                         matches.append(f"{rel_path}:{line_no}: {line.rstrip()}")
@@ -181,6 +175,22 @@ def search_files(pattern: str, max_matches: int = 30) -> str:
         return f"No matches for '{pattern}' in workspace."
     note = "" if len(matches) < max_matches else f"\n(truncated at {max_matches} matches)"
     return "\n".join(matches) + note
+
+
+@tool
+def list_tools() -> str:
+    """List all available tools and their descriptions. Use this to discover new capabilities.
+
+    Reports the tool layer's own view. ``task`` is deliberately absent: it
+    belongs to the sub-agent layer, and a sub-agent is offered tools by its
+    allowlist, not by asking this.
+    """
+    tools_dict = get_all_tools()
+    summary = []
+    for name, tool_obj in tools_dict.items():
+        description = getattr(tool_obj, "description", "No description provided.")
+        summary.append(f"- **{name}**: {description}")
+    return "\n".join(summary)
 
 
 FETCH_URL_TIMEOUT_SECONDS = 15
@@ -202,165 +212,6 @@ def fetch_url(url: str) -> str:
         return f"Error fetching {url}: total fetch deadline exceeded"
     except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as e:
         return f"Error fetching {url}: {e}"
-
-
-# The `task` tool's schema (both the subagent_type enum and the description)
-# is derived from the SUBAGENTS registry. Because departments are now loaded
-# from skills/ at runtime, the tool is built by `_get_task_tool()` on each call
-# rather than frozen at import — otherwise a SKILL.md added after startup would
-# not appear in the enum until the process restarted.
-
-
-def _task_impl(subagent_type: str, description: str) -> str:
-    # The `task` tool is executed by the tools node (local_tools_node), which
-    # enforces recursion depth and aggregates child token usage/writes. A
-    # direct invoke has no graph state and would skip the depth guard, so it
-    # is refused outright (6.4) rather than executed at depth 0.
-    return ("Error: the task tool must be executed by the tools node so subagent "
-            "recursion depth can be enforced; it cannot be invoked directly.")
-
-
-def _build_task_docstring() -> str:
-    registry = _subagent_registry()
-    types = "\n".join(
-        f"- **{name}**: {spec.description}" for name, spec in registry.items()
-    )
-    return f"""Delegate a complex sub-task to a specialized or general-purpose subagent.
-
-Available subagent types:
-{types}
-
-Args:
-    subagent_type: The type/role of the subagent (one of: {', '.join(registry)}).
-    description: The task description for the subagent. Name a unique output path
-        under ./workspace (e.g., workspace/<topic>.md) for each file to produce.
-"""
-
-
-def _get_task_tool():
-    """Build the `task` tool with the current subagent_type enum.
-
-    The Literal is rebuilt per call so a newly discovered department shows up
-    in the schema the model is shown.
-    """
-    subagent_type = Literal[(*_subagent_registry().keys(),)]  # type: ignore[valid-type]
-    impl = _task_impl
-    impl.__doc__ = _build_task_docstring()
-    impl.__annotations__ = {"subagent_type": subagent_type, "description": str}
-    return tool("task")(impl)
-
-
-@tool
-def list_tools() -> str:
-    """List all available tools and their descriptions. Use this to discover new capabilities."""
-    tools_dict = get_all_tools()
-    summary = []
-    for name, tool_obj in tools_dict.items():
-        description = getattr(tool_obj, "description", "No description provided.")
-        summary.append(f"- **{name}**: {description}")
-    return "\n".join(summary)
-
-
-# ---------------------------------------------------------------------------
-# Subagent Executor
-# ---------------------------------------------------------------------------
-
-def _execute_task(subagent_type: str, description: str, recursion_depth: int,
-                  tools_dict: dict | None = None):
-    """
-    Execute a subagent task.
-
-    Called from local_tools_node (not as a LangChain tool invoke) so that
-    the caller has access to the graph state for depth tracking and can
-    aggregate the child's token usage back into the parent.
-
-    Dispatch is driven by the SUBAGENTS registry (6.1): kind="tool_loop"
-    types run a restricted tool loop with their SKILL.md-derived prompt;
-    kind="graph" types run the full cached compiled graph.
-
-    Args:
-        subagent_type: Type/alias as issued in the task tool call.
-        description: The task description for the subagent.
-        recursion_depth: Parent's nesting level; the child runs at +1.
-        tools_dict: Tools visible to the parent this turn, used to resolve
-            the spec's restricted tool names. Falls back to get_all_tools().
-
-    Returns:
-        (result_text, child_token_usage, child_write_ops) where
-        child_token_usage is {"input": n, "output": n} and child_write_ops
-        is the list of file-write operations the subagent performed (for the
-        parent's pending_writes audit trail).
-    """
-    from src.services.agent_orchestrator.subagents import resolve_subagent, run_department
-
-    spec = resolve_subagent(subagent_type)
-    if spec is None:
-        return (
-            f"Error: Unknown subagent_type '{subagent_type}'. "
-            f"Use one of: {', '.join(_subagent_registry())}.",
-            {},
-            [],
-        )
-
-    if spec.kind == "tool_loop":
-        # The shared department executor: SKILL.md prompt, tool allowlist
-        # shortlisted for this query, then a real ReAct loop. Same code path
-        # the department-fanout branch uses.
-        return run_department(spec, description, tools_dict)
-
-    if spec.kind == "a2a":
-        # Remote agent over the A2A protocol: send the task description and
-        # return its answer. A remote agent reports no token usage, and its
-        # file writes are not visible here, so both come back empty. Failures
-        # raise, and the caller turns them into a task error message.
-        # Imported lazily to keep the a2a SDK off the import path until used.
-        from src.services.tools_integration.a2a_client import call_a2a_agent
-
-        if not spec.url:
-            return (
-                f"Error: A2A subagent '{subagent_type}' has no url configured.",
-                {},
-                [],
-            )
-        return call_a2a_agent(spec.url, description), {}, []
-
-    # kind == "graph": general-purpose subagent — use the cached compiled graph
-    from src.services.agent_orchestrator.agent_factory import get_deep_agent
-    from src.config import get_max_iterations
-    from src.utils import get_message_text
-
-    sub_agent = get_deep_agent()
-    # Fresh checkpoint thread per subagent invocation: the checkpointer
-    # requires a thread_id, and reusing the parent's thread would merge
-    # child state into the parent's checkpoint (and vice versa).
-    res = sub_agent.invoke(
-        {
-            "messages": [HumanMessage(content=description)],
-            "current_plan": [],
-            "workspace_files": [],
-            "recursion_depth": recursion_depth + 1,
-            "audit_log": [],
-            "token_usage": {},
-            "iteration_count": 0,
-            "max_iterations": get_max_iterations(),
-        },
-        config={"configurable": {"thread_id": f"subagent-{uuid.uuid4()}"}}
-    )
-    # Extract the last non-empty AI message (the responder's final
-    # answer) rather than messages[-1], which could be a ToolMessage.
-    final = next(
-        (m for m in reversed(res.get("messages", []))
-         if isinstance(m, AIMessage) and get_message_text(m.content)),
-        None,
-    )
-    text = (
-        get_message_text(final.content)
-        if final is not None
-        else "Error: subagent produced no final answer."
-    )
-    # The child's full graph already tracked its own writes; surface them
-    # to the parent's audit trail.
-    return text, res.get("token_usage", {}) or {}, res.get("pending_writes", []) or []
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +290,13 @@ def load_dynamic_tools(tools_dir: str) -> dict[str, BaseTool]:
 # ---------------------------------------------------------------------------
 
 def get_all_tools() -> dict[str, BaseTool]:
-    """Returns a dictionary of all available tools (built-in + dynamic)."""
+    """Return every tool this service owns: built-in, dynamic file, and MCP.
+
+    This is the complete tool set: a department's ``allowed-tools`` allowlist
+    in ``subagents.select_department_tools`` resolves against exactly this, and
+    the orchestrator binds none of it. Tool calls happen only inside a
+    sub-agent's ReAct loop.
+    """
     built_in_tools = {
         "write_todos": write_todos,
         "internet_search": internet_search,
@@ -449,7 +306,6 @@ def get_all_tools() -> dict[str, BaseTool]:
         "list_files": list_files,
         "search_files": search_files,
         "fetch_url": fetch_url,
-        "task": _get_task_tool(),
         "list_tools": list_tools,
     }
     dynamic_tools = load_dynamic_tools("./tools")
@@ -467,7 +323,19 @@ def get_all_tools() -> dict[str, BaseTool]:
     return {**dynamic_tools, **mcp_tools, **built_in_tools}
 
 
-def create_tool_registry() -> "ToolRegistry":
+def _kind_of_tool(tool: Any) -> ToolKind:
+    """Read a tool's transport off the tool object, defaulting to local.
+
+    MCP tools are constructed with ``kind="mcp"`` at load time; everything
+    else is a local call unless it says otherwise.
+    """
+    try:
+        return ToolKind(getattr(tool, "kind", ToolKind.LOCAL))
+    except ValueError:
+        return ToolKind.LOCAL
+
+
+def create_tool_registry() -> ToolRegistry:
     """Build a ToolRegistry populated with all available tools.
 
     Registration respects each tool's ``@tool_spec`` metadata so the
@@ -488,18 +356,22 @@ def create_tool_registry() -> "ToolRegistry":
       with no ``@tool_spec`` at all falls back to always-visible, so adding a
       bare ``@tool`` file to ``tools/`` works without extra ceremony.
 
+    The ``BaseTool`` object is registered, not the bare function behind it:
+    dispatch needs the object's ``args_schema`` to validate a payload and its
+    ``kind`` to choose a transport, and neither survives ``tool.func``.
+
     Returns:
         A fully populated ToolRegistry.
     """
-    from src.services.tools_integration.registry import ToolRegistry
-
     registry = ToolRegistry()
     dynamic_names = set(load_dynamic_tools("./tools"))
     mcp_names = set(load_mcp_tools())
 
     for name, tool in get_all_tools().items():
-        callable_ = getattr(tool, "func", tool)
-        spec = getattr(callable_, "__tool_spec__", None)
+        # Register the tool object itself; `tool_spec` metadata hangs off the
+        # underlying function.
+        callable_ = tool
+        spec = getattr(getattr(tool, "func", tool), "__tool_spec__", None)
 
         if spec is not None:
             # Honour the tool's own declaration (risk level + role scoping).
@@ -514,6 +386,7 @@ def create_tool_registry() -> "ToolRegistry":
                 risk_level="low",
                 requires_approval=False,
                 allowed_roles=("*",),
+                kind=_kind_of_tool(tool),
             )
 
         # Log what a dynamic tool actually resolved to, so a tool that is
@@ -526,5 +399,18 @@ def create_tool_registry() -> "ToolRegistry":
 
     if mcp_names:
         logger.debug("MCP tools registered as always-visible: %s", sorted(mcp_names))
+
+    # Configured A2A agents, so dispatch can reach one by name. They are
+    # registered as their own kind rather than as tools with a callable: A2A
+    # has no introspection, so there is no schema to bind and the payload is
+    # serialized into the message at dispatch time.
+    from src.config import get_a2a_agents
+
+    for agent_name, agent_config in get_a2a_agents().items():
+        registry.register_a2a(
+            agent_name,
+            agent_config["url"],
+            description=agent_config.get("description", ""),
+        )
 
     return registry

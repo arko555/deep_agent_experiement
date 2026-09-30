@@ -4,6 +4,8 @@ import functools
 from dataclasses import dataclass
 from typing import Optional
 
+from src.types import ToolKind
+
 
 @dataclass(frozen=True)
 class ToolSpecMetadata:
@@ -14,6 +16,9 @@ class ToolSpecMetadata:
     risk_level: str = "low"  # "low" | "medium" | "high"
     requires_approval: bool = False
     allowed_roles: tuple = ()  # e.g., ("hr", "payroll") or () for all
+    # Which transport reaches this tool, and therefore what a correct payload
+    # is. Defaults to a local call, so existing @tool_spec uses are unaffected.
+    kind: ToolKind = ToolKind.LOCAL
 
 
 def tool_spec(
@@ -22,6 +27,7 @@ def tool_spec(
     risk_level: str = "low",
     requires_approval: bool = False,
     allowed_roles: Optional[tuple] = None,
+    kind: ToolKind = ToolKind.LOCAL,
 ):
     """Decorator that attaches ToolSpec metadata to a tool function.
 
@@ -40,6 +46,7 @@ def tool_spec(
             risk_level=risk_level,
             requires_approval=requires_approval,
             allowed_roles=allowed_roles,
+            kind=kind,
         )
         func.__tool_spec__ = meta  # type: ignore[attr-defined]
         return func

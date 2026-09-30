@@ -8,6 +8,38 @@ from src.utils import invoke_with_retry
 
 logger = logging.getLogger(__name__)
 
+# The sorter sees every visible tool's parameter spec, so 20 tools' worth of
+# schemas is the prompt. Schemas are truncated per tool so one verbose spec
+# cannot crowd out the rest of the roster: relevance turns on the name, the
+# description, and the parameter names, so a long spec's tail is the droppable
+# part.
+MAX_SCHEMA_CHARS = 400
+
+
+def _render_schema(schema: Any) -> Any:
+    """Render a tool's ``args_schema`` as a compact, LLM-readable JSON Schema.
+
+    ``args_schema`` is usually a Pydantic model, which ``json.dumps`` cannot
+    serialize. Converting it back to a JSON Schema gives the sorter the shape
+    the tool was actually declared with, so a parameter spec can inform the
+    relevance call rather than a name and a prose description standing alone.
+    """
+    if isinstance(schema, dict):
+        rendered = schema
+    elif isinstance(schema, type) and hasattr(schema, "model_json_schema"):
+        try:
+            rendered = schema.model_json_schema()
+        except Exception as e:  # a malformed model must not break selection
+            logger.debug("Could not render args_schema: %s", e)
+            return None
+    else:
+        return None
+
+    text = json.dumps(rendered)
+    if len(text) > MAX_SCHEMA_CHARS:
+        return text[:MAX_SCHEMA_CHARS] + "... (truncated)"
+    return rendered
+
 
 def sort_tools(
     model,
@@ -27,20 +59,34 @@ def sort_tools(
             method (e.g. a ChatAnthropic/ChatOpenAI instance or a
             test double).
         enhanced_query: The context-enriched query to score against.
-        tool_defs: Tool schema dicts from
-            ``ToolRegistry.get_tool_definitions()``.
+        tool_defs: Tool definition dicts, each optionally carrying an
+            ``args_schema`` (a Pydantic model or a JSON Schema dict).
         max_tools: Maximum tools to return (default 5).
 
     Returns:
         Up to *max_tools* tool definition dicts, ordered most
         relevant first.  Returns all tools if there are fewer than
-        *max_tools*.
+        *max_tools*. The returned dicts are the originals from
+        *tool_defs*, so a Pydantic ``args_schema`` is passed back
+        unrendered.
     """
     if not tool_defs:
         return []
 
+    # Schemas go into the prompt under "parameters", not by overwriting
+    # "args_schema" — the caller gets the original entries back, model and all.
     tools_json = json.dumps(
-        [{k: v for k, v in d.items() if k != "args_schema"} for d in tool_defs],
+        [
+            {
+                **{k: v for k, v in d.items() if k != "args_schema"},
+                **(
+                    {"parameters": _render_schema(d["args_schema"])}
+                    if d.get("args_schema") is not None
+                    else {}
+                ),
+            }
+            for d in tool_defs
+        ],
         indent=2,
     )
 
@@ -48,6 +94,8 @@ def sort_tools(
         "You are a tool relevance filter. Given the user's query below, "
         "return a JSON list of the names of the most relevant tools "
         f"(at most {max_tools}), ordered by relevance. "
+        "Each tool has a description and, when it accepts arguments, the "
+        "parameters it takes — use both to judge which can serve the query. "
         "Return ONLY a JSON array of tool name strings."
     )
 

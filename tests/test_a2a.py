@@ -26,7 +26,7 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 
-from src.services.tools_integration import a2a_client, tools as tools_mod
+from src.services.tools_integration import a2a_client
 from src.services.agent_orchestrator.subagents import SubagentSpec
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -205,23 +205,56 @@ class TestFailureReporting:
 
 class TestExecutionDispatch:
 
-    def test_execute_task_dispatches_a2a_kind(self, monkeypatch):
-        import src.services.agent_orchestrator.subagents as subagents_mod
+    def test_engine_dispatches_a2a_kind_to_the_remote_agent(self, monkeypatch):
+        """An ``a2a`` spec calls the remote agent rather than a local loop.
+
+        It has no SKILL.md, so a tool loop would run with no prompt and no
+        tools — a silent empty turn. The engine picks the executor by kind.
+        """
+        from src.services.agent_orchestrator.subagent_engine import SubAgentEngine
+        from src.services.agent_orchestrator.subagents import (
+            SUBAGENTS, SubagentSpec,
+        )
         import src.services.tools_integration.a2a_client as a2a_mod
 
         spec = SubagentSpec(description="remote", kind="a2a", url="http://agent.test")
-        # Patched on `subagents`, not `tools`: tools imports the dispatch
-        # helpers lazily (they close an import cycle with discovery), so the
-        # module attribute a test sees is not the one the call resolves.
-        monkeypatch.setattr(subagents_mod, "resolve_subagent", lambda _t: spec)
+        monkeypatch.setitem(SUBAGENTS, "remote_x", spec)
         monkeypatch.setattr(a2a_mod, "call_a2a_agent",
                             lambda url, description: f"remote({url}):{description}")
+        # If the local executor were reached, this would raise — the a2a spec
+        # has no `skill`, so there is no prompt to build.
+        monkeypatch.setattr(
+            "src.services.agent_orchestrator.subagents.run_department",
+            _boom,
+        )
 
-        text, usage, writes = tools_mod._execute_task("remote_x", "task desc", 0)
+        run = asyncio.run(SubAgentEngine()._run_subagent_loop(
+            name="remote_x", system_prompt="", description="task desc",
+            enhanced_query="task desc",
+        ))
 
-        assert text == "remote(http://agent.test):task desc"
-        # A remote agent reports no token usage and no local writes.
-        assert usage == {} and writes == []
+        assert run.text == "remote(http://agent.test):task desc"
+        # A remote agent reports no local token usage and writes no local files.
+        assert run.usage == {"input": 0, "output": 0}
+        assert run.writes == []
+
+    def test_tool_loop_kind_still_runs_locally(self, monkeypatch):
+        from src.services.agent_orchestrator.subagent_engine import SubAgentEngine
+        import src.services.tools_integration.a2a_client as a2a_mod
+
+        monkeypatch.setattr(
+            a2a_mod, "call_a2a_agent", _boom,
+        )
+        monkeypatch.setattr(
+            "src.services.agent_orchestrator.subagents.run_department",
+            lambda spec, query: ("local answer", {"input": 2, "output": 1}, []),
+        )
+
+        run = asyncio.run(SubAgentEngine()._run_subagent_loop(
+            name="research", system_prompt="", description="q", enhanced_query="q",
+        ))
+        assert run.text == "local answer"
+        assert run.usage == {"input": 2, "output": 1}
 
     def test_a2a_specs_come_from_config(self, monkeypatch):
         import src.services.agent_orchestrator.subagents as subagents_mod
@@ -239,12 +272,20 @@ class TestExecutionDispatch:
         assert spec.parallelizable is True
 
 
+def _boom(*args, **kwargs):
+    raise AssertionError("the wrong executor was reached")
+
+
 # ---------------------------------------------------------------------------
 # 10: import-time registry wiring (the reason subagents.py loads .env itself)
 # ---------------------------------------------------------------------------
 
-def test_configured_a2a_agents_appear_in_registry_and_task_schema():
-    """Run in a fresh interpreter: the registry is built at import time."""
+def test_configured_a2a_agents_reach_the_router_roster():
+    """Run in a fresh interpreter: the registry is built at import time.
+
+    The roster is what the router names departments from, so an A2A agent
+    missing here is an agent nothing can dispatch to.
+    """
     env = {
         **_base_env(),
         "A2A_AGENTS": json.dumps({
@@ -252,18 +293,14 @@ def test_configured_a2a_agents_appear_in_registry_and_task_schema():
                                   "description": "Remote research agent"}
         }),
     }
-    # `task` is built by get_all_tools() rather than at import — its
-    # subagent_type enum is derived from the live registry — so the schema is
-    # read from the tool set, not from a module-level `task` object.
     code = (
-        "from src.services.agent_orchestrator.subagents import SUBAGENTS, is_parallelizable\n"
-        "from src.services.tools_integration.tools import get_all_tools\n"
-        "task = get_all_tools()['task']\n"
-        "enum = task.args_schema.model_json_schema()['properties']['subagent_type']['enum']\n"
+        "from src.services.agent_orchestrator.subagents import "
+        "SUBAGENTS, is_parallelizable, list_departments\n"
+        "roster = {d['name']: d['description'] for d in list_departments()}\n"
         "print('REG', sorted(SUBAGENTS))\n"
-        "print('ENUM', sorted(enum))\n"
+        "print('ROSTER', sorted(roster))\n"
         "print('PAR', is_parallelizable('remote_researcher'))\n"
-        "print('DOC', 'Remote research agent' in task.description)\n"
+        "print('DOC', roster.get('remote_researcher'))\n"
     )
     out = subprocess.run(
         [sys.executable, "-c", code], env=env, cwd=REPO_ROOT,
@@ -272,7 +309,9 @@ def test_configured_a2a_agents_appear_in_registry_and_task_schema():
     assert out.returncode == 0, out.stderr
     assert "remote_researcher" in out.stdout
     assert "PAR True" in out.stdout
-    assert "DOC True" in out.stdout
+    # Routable, and its description reaches the dispatcher's prompt.
+    assert "ROSTER" in out.stdout and "remote_researcher" in out.stdout.split("ROSTER")[1]
+    assert "DOC Remote research agent" in out.stdout
 
 
 def _base_env():

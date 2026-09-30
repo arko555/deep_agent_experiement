@@ -5,6 +5,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.agent_orchestrator.graph import get_deep_agent, reset_deep_agent
+from src.services.agent_orchestrator.subagent_engine import SubagentRun
+from tests.fake_models import ScriptedChatModel
 
 
 def _initial_state(user_message: str) -> dict:
@@ -14,13 +16,10 @@ def _initial_state(user_message: str) -> dict:
         "workspace_files": [],
         "next_message": None,
         "review_verdict": None,
-        "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
         "routing_decisions": [],
         "token_usage": {},
-        "iteration_count": 0,
-        "max_iterations": 25,
         "thread_id": "test-thread",
         "enhanced_query": "",
         "department_targets": [],
@@ -134,7 +133,9 @@ class TestConversationMemory:
                 pass
 
             async def invoke_parallel(self, subs, query, *a, **k):
-                return {s["name"]: f"FIRST-TURN-{s['name']}" for s in subs}
+                # Echo the query so a stale result from turn one is
+                # distinguishable from a fresh one for turn two.
+                return {s["name"]: SubagentRun(text=f"RESULT-FOR({query})") for s in subs}
 
         monkeypatch.setattr(
             "src.services.agent_orchestrator.agent_factory.get_model",
@@ -154,14 +155,29 @@ class TestConversationMemory:
         answer = next(
             m.content for m in reversed(result["messages"]) if isinstance(m, AIMessage)
         )
-        assert "FIRST-TURN" not in answer
+        assert "RESULT-FOR(turn one)" not in answer
+        assert "RESULT-FOR(turn two)" in answer
 
     def test_dispatcher_json_never_reaches_the_user(self, monkeypatch):
+        """The router's control envelope is never shown to the user.
+
+        ``{"enhanced_query": ..., "departments": ...}`` is a routing decision,
+        not an answer. An empty department list is not a dead end — it falls
+        through to ``general``, and what the user sees is that sub-agent's
+        reply.
+        """
+        fake = ScriptedChatModel(
+            scripts={
+                "orchestrator": [AIMessage(
+                    content='{"enhanced_query": "tell me about X", "departments": []}'
+                )],
+                "subagent": [AIMessage(content="Here is a real answer.")],
+            },
+            default=AIMessage(content="done"),
+        )
         monkeypatch.setattr(
             "src.services.agent_orchestrator.agent_factory.get_model",
-            lambda: FakeModel([
-                AIMessage(content='{"enhanced_query": "tell me about X", "departments": []}')
-            ]),
+            lambda: fake,
         )
         reset_deep_agent()
         result = get_deep_agent().invoke(
@@ -172,3 +188,4 @@ class TestConversationMemory:
         )
         assert not answer.strip().startswith("{")
         assert "departments" not in answer
+        assert "Here is a real answer." in answer

@@ -1,10 +1,14 @@
 """Tests for subagent tool-loop behavior and the parent's audit aggregation."""
 
+import asyncio
 from unittest.mock import patch
 
-from langchain_core.messages import AIMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 
+from src.services.agent_orchestrator.graph import _subagent_fanout_node
+from src.services.agent_orchestrator.subagent_engine import SubagentRun
 from src.services.agent_orchestrator.subagents import run_tool_loop
 
 
@@ -93,34 +97,52 @@ class TestRunToolLoop:
         assert usage == {"input": 14, "output": 6}
 
 
-class TestToolsNodeSubagentAudit:
-    """local_tools_node must fold subagent write ops into pending_writes."""
+class TestFanoutFoldsSubagentAudit:
+    """The fanout node must fold sub-agent write ops and spend into the state.
 
-    def test_child_write_ops_merged_into_pending_writes(self):
-        from src.services.agent_orchestrator import agent_factory
+    This used to be the top-level tools node's job. The tools node is gone —
+    the orchestrator no longer binds tools — so the audit trail is now built
+    from the ``SubagentRun`` each department returns.
+    """
 
-        def fake_execute(subagent_type, description, depth, tools_dict=None):
-            return (
-                "done",
-                {"input": 5, "output": 2},
-                [{"tool": "write_file", "tool_id": None,
-                  "args": {"path": "workspace/child.md"}, "status": "executed"}],
-            )
-
+    def _state(self, **overrides):
         state = {
-            "messages": [AIMessage(
-                content="",
-                tool_calls=[{"name": "task",
-                             "args": {"subagent_type": "writer", "description": "d"},
-                             "id": "t1"}],
-            )],
-            "recursion_depth": 0,
+            "messages": [HumanMessage(content="go")],
+            "subagent_results": {},
             "pending_writes": [],
-            "token_usage": {},
+            "audit_log": [],
+            "token_usage": {"input": 0, "output": 0, "total": 0},
         }
+        state.update(overrides)
+        return state
 
-        with patch.object(agent_factory, "_execute_task", side_effect=fake_execute):
-            result = agent_factory.local_tools_node(state)
+    @staticmethod
+    def _engine(runs):
+        class StubEngine:
+            def __init__(self, *a, **k):
+                pass
+
+            async def invoke_parallel(self, subs, query, *a, **k):
+                return {s["name"]: runs[s["name"]] for s in subs}
+
+        return StubEngine
+
+    def _run(self, state, runs, monkeypatch):
+        monkeypatch.setattr(
+            "src.services.agent_orchestrator.graph.SubAgentEngine", self._engine(runs)
+        )
+        return _subagent_fanout_node(state)
+
+    def test_child_write_ops_merged_into_pending_writes(self, monkeypatch):
+        run = SubagentRun(
+            text="done",
+            usage={"input": 5, "output": 2},
+            writes=[{"tool": "write_file", "tool_id": None,
+                     "args": {"path": "workspace/child.md"}, "status": "executed"}],
+        )
+        result = self._run(
+            self._state(department_targets=["writer"]), {"writer": run}, monkeypatch
+        )
 
         # Child write surfaced in the parent's audit trail.
         pending = result["pending_writes"]
@@ -129,103 +151,67 @@ class TestToolsNodeSubagentAudit:
         assert pending[0]["args"]["path"] == "workspace/child.md"
         # Child token spend folded into the parent budget.
         assert result["token_usage"]["total"] == 7
-        # The task's ToolMessage is present for the orchestrator to consume.
-        assert result["messages"][0].tool_call_id == "t1"
+        assert result["subagent_results"] == {"writer": "done"}
+        # And there is an audit entry, so the Streamlit trail isn't empty.
+        assert result["audit_log"]
 
-    def test_failed_task_yields_error_not_crash(self):
-        """One failing task must not drop its siblings' results."""
-        from src.services.agent_orchestrator import agent_factory
-
-        def fake_execute(subagent_type, description, depth, tools_dict=None):
-            # Deterministic per-task outcome (tasks run in a thread pool,
-            # so call order is not guaranteed).
-            if "query 1" in description:
-                raise RuntimeError("subagent blew up")
-            return ("first done", {"input": 1, "output": 1}, [])
-
-        task_calls = [
-            {"name": "task",
-             "args": {"subagent_type": "research", "description": f"query {i}"},
-             "id": f"t{i}"}
-            for i in range(2)
-        ]
-        state = {
-            "messages": [AIMessage(content="", tool_calls=task_calls)],
-            "recursion_depth": 0,
-            "pending_writes": [],
-            "token_usage": {},
+    def test_child_usage_is_summed_across_departments(self, monkeypatch):
+        runs = {
+            "research": SubagentRun(text="r", usage={"input": 3, "output": 1}),
+            "writer": SubagentRun(text="w", usage={"input": 4, "output": 2}),
         }
+        result = self._run(
+            self._state(department_targets=["research", "writer"]), runs, monkeypatch
+        )
+        assert result["token_usage"] == {"input": 7, "output": 3, "total": 10}
+        assert result["subagent_results"] == {"research": "r", "writer": "w"}
 
-        with patch.object(agent_factory, "_execute_task", side_effect=fake_execute):
-            result = agent_factory.local_tools_node(state)
-
-        contents = [m.content for m in result["messages"]]
-        assert "first done" in contents[0]
-        assert "Error executing subagent task" in contents[1]
-        # Sibling's usage still counted.
-        assert result["token_usage"]["total"] == 2
-
-    def test_depth_rejection_uses_configured_limit(self):
-        """6.3: the depth limit comes from config, not a magic number."""
-        from src.services.agent_orchestrator import agent_factory
-
-        state = {
-            "messages": [AIMessage(
-                content="",
-                tool_calls=[{"name": "task",
-                             "args": {"subagent_type": "research", "description": "d"},
-                             "id": "t1"}],
-            )],
-            "recursion_depth": 2,
-            "pending_writes": [],
-            "token_usage": {},
-        }
-
-        def _no_execute(*args, **kwargs):
-            raise AssertionError("task must be rejected at the depth limit")
-
-        with patch.object(agent_factory, "get_max_subagent_depth", return_value=2), \
-                patch.object(agent_factory, "_execute_task", side_effect=_no_execute):
-            result = agent_factory.local_tools_node(state)
-
-        assert "Maximum subagent depth (2) reached" in result["messages"][0].content
+    def test_departments_that_wrote_nothing_leave_state_untouched(self, monkeypatch):
+        """A read-only department must not create empty audit entries."""
+        run = SubagentRun(text="read only", usage={"input": 0, "output": 0})
+        result = self._run(
+            self._state(department_targets=["research"]), {"research": run}, monkeypatch
+        )
+        assert "pending_writes" not in result
+        assert "audit_log" not in result
+        assert "token_usage" not in result
 
 
-class TestRegistryDrivesTaskTool:
-    """6.1/6.4: the SUBAGENTS registry drives the task tool schema and the
-    direct-invoke bypass is closed."""
+class TestNoDelegationPath:
+    """The `task` tool and sub-agent-to-sub-agent delegation are gone.
 
-    def test_task_tool_schema_lists_exactly_the_registry_types(self):
+    The orchestrator is a pure router, so it never binds `task`; and no
+    SKILL.md lists `task` in `allowed-tools`, so no sub-agent is ever offered
+    it either. There is exactly one route from the router to a department:
+    the fanout node.
+    """
+
+    def test_the_task_tool_module_is_gone(self):
+        import importlib
+
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("src.services.agent_orchestrator.task_tool")
+
+    def test_no_skill_declares_the_task_tool(self):
         from src.services.agent_orchestrator.subagents import SUBAGENTS
+
+        for name, spec in SUBAGENTS.items():
+            assert "task" not in spec.tools, f"{name} still allows the task tool"
+
+    def test_no_department_tool_is_named_task(self):
+        """Not even as a fallback: the tool layer has no such tool."""
         from src.services.tools_integration.tools import get_all_tools
 
-        task_tool = get_all_tools()["task"]
-        schema = task_tool.args_schema.model_json_schema()
-        assert set(schema["properties"]["subagent_type"]["enum"]) == set(SUBAGENTS)
-
-    def test_task_tool_description_names_every_registry_type(self):
-        from src.services.agent_orchestrator.subagents import SUBAGENTS
-        from src.services.tools_integration.tools import get_all_tools
-
-        task_tool = get_all_tools()["task"]
-        for name in SUBAGENTS:
-            assert name in task_tool.description
-
-    def test_direct_task_invoke_is_refused(self):
-        from src.services.tools_integration.tools import get_all_tools
-
-        result = get_all_tools()["task"].invoke(
-            {"subagent_type": "research", "description": "x"})
-        assert "must be executed by the tools node" in result
+        assert "task" not in get_all_tools()
 
 
 class TestRegistryDrivesDispatch:
-    """6.1: _execute_task dispatch is driven by the SUBAGENTS registry."""
+    """6.1: department dispatch is driven by the SUBAGENTS registry."""
 
     def test_tool_loop_dispatch_uses_registry_spec(self):
         import src.services.agent_orchestrator.subagents as subagents_mod
-        import src.services.tools_integration.tools as tools_mod
         from src.services.agent_orchestrator.subagents import SUBAGENTS
+        from src.services.tools_integration.tools import get_all_tools
 
         calls = {}
 
@@ -236,16 +222,18 @@ class TestRegistryDrivesDispatch:
                               subagents_mod.select_department_tools(spec, query, tools_dict)]
             return "done", {"input": 1, "output": 1}, []
 
-        # Production passes the parent's visible tools (all built-ins here).
-        toolset = tools_mod.get_all_tools()
-        with patch.object(subagents_mod, "run_department", side_effect=fake_run):
-            text, usage, write_ops = tools_mod._execute_task(
-                "research", "find x", 0, toolset)
+        # Production resolves against the live tool layer.
+        toolset = get_all_tools()
+        with patch.object(subagents_mod, "run_tool_loop",
+                          side_effect=lambda prompt, desc, tools, max_iterations=10:
+                              fake_run(SUBAGENTS["research"], desc, toolset)):
+            from src.services.agent_orchestrator.subagents import run_department
+
+            text, usage, write_ops = run_department(SUBAGENTS["research"], "find x")
 
         assert text == "done"
         assert usage == {"input": 1, "output": 1}
         assert write_ops == []
-        assert calls["spec"] is SUBAGENTS["research"]
         assert calls["query"] == "find x"
         # The department's tools are resolved from its SKILL.md allowlist
         # against the live tool set, so every name must be a real tool.
@@ -254,14 +242,15 @@ class TestRegistryDrivesDispatch:
             assert name in toolset
         assert set(calls["tools"]) <= set(SUBAGENTS["research"].tools)
 
-    def test_unknown_type_lists_registry_types(self):
-        import src.services.tools_integration.tools as tools_mod
+    def test_unknown_department_lists_registry_types(self):
+        from src.services.agent_orchestrator.subagent_engine import SubAgentEngine
         from src.services.agent_orchestrator.subagents import SUBAGENTS
 
-        error, usage, ops = tools_mod._execute_task("nope", "d", 0)
-        assert usage == {} and ops == []
+        result = asyncio.run(SubAgentEngine()._run_subagent_loop(
+            name="nope", system_prompt="", description="d", enhanced_query="d",
+        ))
         for name in SUBAGENTS:
-            assert name in error
+            assert name in result.text
 
 
 class TestRegistryDrivesParallelGrouping:
@@ -338,15 +327,21 @@ class TestSkillsAreTheRegistry:
         _write_skill(tmp_path, "serial", parallel=False)
         assert _skill_specs(str(tmp_path))["serial"].parallelizable is False
 
-    def test_runtime_and_skill_specs_are_both_present(self, tmp_path):
-        from src.services.agent_orchestrator.subagents import (
-            _RUNTIME_SUBAGENTS, build_subagent_registry,
-        )
+    def test_no_spec_can_reenter_the_graph(self, tmp_path):
+        """Nothing in the registry runs the whole compiled graph.
+
+        A ``kind="graph"`` spec — the old ``general-purpose`` — would make the
+        orchestrator its own sub-agent, so a delegated description got routed
+        again from the top instead of the hierarchy staying one-way. The
+        catch-all is now ``skills/general``, a department like any other.
+        """
+        from src.services.agent_orchestrator.subagents import build_subagent_registry
 
         _write_skill(tmp_path, "legal")
         registry = build_subagent_registry()
-        for name in _RUNTIME_SUBAGENTS:
-            assert name in registry
+        assert registry, "the registry must not be empty"
+        assert {s.kind for s in registry.values()} <= {"tool_loop", "a2a"}
+        # Every routable department is skill-backed, so the router can name it.
         assert any(s.kind == "tool_loop" and s.skill for s in registry.values())
 
     def test_duplicate_names_keep_the_first(self, tmp_path):
@@ -483,7 +478,7 @@ class TestDepartmentToolShortlisting:
 
 
 class TestRunDepartmentUnifiesBothEntryPoints:
-    """Fanout and the `task` tool share one executor."""
+    """Fanout goes through the same executor the registry names."""
 
     def test_prompt_comes_from_the_skill_file(self):
         import src.services.agent_orchestrator.subagents as subagents_mod

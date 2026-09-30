@@ -1,4 +1,10 @@
-"""Resolved-path file containment (not race-proof against concurrent mutation)."""
+"""Resolved-path file containment (not race-proof against concurrent mutation).
+
+This lives in ``tools_integration`` because it is the layer the file tools
+execute in: ``read_file``/``write_file``/``list_files`` are what need
+containment, so a lower service must not have to import a higher one to get
+it. ``agent_orchestrator`` imports down from here, never the reverse.
+"""
 
 import os
 from pathlib import Path
@@ -120,3 +126,34 @@ def clear_workspace() -> None:
         elif entry.is_file():
             _checked_file(entry, root)
             entry.unlink()
+
+
+def get_workspace_files() -> list[str]:
+    """List workspace files relative to the configured root.
+
+    Enumeration uses the shared call-time resolver and does not follow
+    directory symlinks, so links out of the workspace are never listed.
+
+    Lives here rather than in ``agent_orchestrator.memory`` because it is
+    workspace containment: the same concern as the validators above, and the
+    ``list_files`` tool that calls it is in this service. Keeping it here lets
+    ``tools_integration`` depend on nothing above it.
+    """
+    workspace_dir = get_workspace_root()
+    if not workspace_dir.is_dir():
+        return []
+    files = []
+    for root, dirs, _filenames in os.walk(workspace_dir, followlinks=False):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for f in _filenames:
+            full = Path(root) / f
+            # Files reached through a link chain must still be real files;
+            # links themselves are skipped rather than followed.
+            if full.is_symlink() or not full.is_file():
+                continue
+            try:
+                validate_read_path(str(full))
+            except (OSError, ValueError):
+                continue
+            files.append(full.relative_to(workspace_dir).as_posix())
+    return sorted(files)

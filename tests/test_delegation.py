@@ -5,8 +5,8 @@ Drives the Phase 3 compiled graph (START → orchestrator →
 so the orchestration contract is verified, not just the unit pieces.
 
 Covers: department detection → subagent_fanout → aggregation →
-responder, direct-to-responder when no departments, max-iteration
-guard, and parallel batch behavior.
+responder, direct-to-responder when no departments, multi-turn routing
+on a reused checkpoint thread, and parallel batch behavior.
 """
 
 import time
@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.agent_orchestrator import agent_factory
 from src.services.agent_orchestrator.graph import get_deep_agent, reset_deep_agent
+from src.services.agent_orchestrator.subagent_engine import SubagentRun
 from tests.fake_models import ScriptedChatModel, ai
 
 
@@ -30,13 +31,10 @@ def _initial_state(user_message: str) -> dict:
         "workspace_files": [],
         "next_message": None,
         "review_verdict": None,
-        "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
         "routing_decisions": [],
         "token_usage": {},
-        "iteration_count": 0,
-        "max_iterations": 25,
         "thread_id": "delegation-thread",
         "enhanced_query": "",
         "department_targets": [],
@@ -150,11 +148,17 @@ class TestOrchestratorFanout:
 
 class TestOrchestratorResponder:
 
-    def test_no_departments_routes_to_responder(self, monkeypatch):
-        """Orchestrator returns no departments → responder delivers answer."""
+    def test_unusable_router_output_falls_back_to_general(self, monkeypatch):
+        """A router reply with no usable JSON still reaches a department.
+
+        The router never leaves ``department_targets`` empty — it falls back to
+        ``general``, so the user gets a real answer instead of "I could not
+        route this request". The general sub-agent's reply is what reaches them.
+        """
         fake = ScriptedChatModel(
             scripts={
                 "orchestrator": [ai("I will handle this myself.")],
+                "subagent": [ai("General handled it.")],
             },
             default=ai("done"),
         )
@@ -165,15 +169,22 @@ class TestOrchestratorResponder:
             (m.content for m in result["messages"] if isinstance(m, AIMessage)),
             "",
         )
-        assert "handle this" in answer
+        assert "General handled it." in answer
         assert fake.counts.get("orchestrator", 0) == 1
-        assert fake.counts.get("subagent", 0) == 0
+        # The turn went through a sub-agent rather than answering directly.
+        assert fake.counts.get("subagent", 0) >= 1
 
-    def test_orchestrator_returns_non_json_responder(self, monkeypatch):
-        """Orchestrator returns plain text → departments empty → responder."""
+    def test_orchestrator_returns_non_json_routes_to_general(self, monkeypatch):
+        """Plain text from the router is a routing failure, not an answer.
+
+        The dispatcher's own prose is a control envelope it failed to format,
+        so it must not be passed to the user as an answer. It falls through to
+        ``general``, which answers on its own terms.
+        """
         fake = ScriptedChatModel(
             scripts={
                 "orchestrator": [ai("Nothing to delegate.")],
+                "subagent": [ai("General handled it.")],
             },
             default=ai("done"),
         )
@@ -184,54 +195,131 @@ class TestOrchestratorResponder:
             (m.content for m in result["messages"] if isinstance(m, AIMessage)),
             "",
         )
-        assert "Nothing to delegate." in answer
+        assert "General handled it." in answer
+        assert "Nothing to delegate." not in answer
 
 
 # ---------------------------------------------------------------------------
 # Iteration guard
 # ---------------------------------------------------------------------------
 
-class TestIterationGuard:
+class TestMultiTurnRouting:
+    """Every turn of a conversation must route, not just the first.
 
-    def test_max_iterations_returns_error_message(self, monkeypatch):
-        """iteration_count >= max_iterations → orchestrator returns error."""
-        fake = ScriptedChatModel(
-            scripts={
-                "orchestrator": [ai("Should not reach.")],
-            },
+    The orchestrator used to keep a checkpointed ``iteration_count`` and
+    force ``departments = []`` once it passed a maximum — a guard belonging
+    to the removed top-level ReAct dispatcher loop. Because the counter was
+    checkpointed, it carried across turns on a reused thread: the second turn
+    of any conversation saw a non-zero count, discarded its departments, and
+    answered "I could not route this request" while quoting the *first* turn's
+    query.
+
+    The entry points masked this by passing ``iteration_count: 0`` on every
+    invoke, so a test that reuses a thread while sending the full initial
+    state cannot see it. These tests send only the new user message, the way
+    the CLI and the Streamlit app actually do, and reuse one thread.
+    """
+
+    def _scripted(self, *envelopes):
+        return ScriptedChatModel(
+            scripts={"orchestrator": [ai(e) for e in envelopes]},
             default=ai("done"),
+        )
+
+    def test_second_turn_on_a_reused_thread_still_routes(self, monkeypatch):
+        fake = self._scripted(
+            '{"enhanced_query": "leave policy", "departments": ["hr"]}',
+            '{"enhanced_query": "pipeline status", "departments": ["sales"]}',
         )
         monkeypatch.setattr(agent_factory, "get_model", lambda: fake)
 
-        state = _initial_state("Query.")
-        state["iteration_count"] = 25
-        state["max_iterations"] = 25
-        result = _run_graph(state, "max-iter")
+        class StubEngine:
+            def __init__(self, *a, **k):
+                pass
+
+            async def invoke_parallel(self, subs, query, *a, **k):
+                return {s["name"]: SubagentRun(text=f"ANSWERED-BY({s['name']})")
+                        for s in subs}
+
+        monkeypatch.setattr(
+            "src.services.agent_orchestrator.graph.SubAgentEngine", StubEngine
+        )
+        reset_deep_agent()
+        agent = get_deep_agent()
+        cfg = {"configurable": {"thread_id": "multi-turn-thread"}}
+
+        # Each turn sends only the new message — the checkpointer supplies
+        # history. This is the shape main.py and app.py use.
+        first = agent.invoke(
+            {"messages": [HumanMessage(content="what is the leave policy?")]},
+            config=cfg,
+        )
+        second = agent.invoke(
+            {"messages": [HumanMessage(content="how is the pipeline?")]},
+            config=cfg,
+        )
+
+        first_answer = next(
+            m.content for m in reversed(first["messages"]) if isinstance(m, AIMessage)
+        )
+        second_answer = next(
+            m.content for m in reversed(second["messages"]) if isinstance(m, AIMessage)
+        )
+
+        assert "ANSWERED-BY(hr)" in first_answer
+        # The regression: turn two must reach *its own* department, not fall
+        # through to the responder quoting turn one.
+        assert "ANSWERED-BY(sales)" in second_answer
+        assert "could not route" not in second_answer
+        assert "leave policy" not in second_answer
+
+    def test_third_turn_on_a_reused_thread_still_routes(self, monkeypatch):
+        """The failure was cumulative, so check beyond the second turn too."""
+        fake = self._scripted(
+            '{"enhanced_query": "q1", "departments": ["hr"]}',
+            '{"enhanced_query": "q2", "departments": ["sales"]}',
+            '{"enhanced_query": "q3", "departments": ["marketing"]}',
+        )
+        monkeypatch.setattr(agent_factory, "get_model", lambda: fake)
+
+        class StubEngine:
+            def __init__(self, *a, **k):
+                pass
+
+            async def invoke_parallel(self, subs, query, *a, **k):
+                return {s["name"]: SubagentRun(text=f"ANSWERED-BY({s['name']})")
+                        for s in subs}
+
+        monkeypatch.setattr(
+            "src.services.agent_orchestrator.graph.SubAgentEngine", StubEngine
+        )
+        reset_deep_agent()
+        agent = get_deep_agent()
+        cfg = {"configurable": {"thread_id": "multi-turn-3-thread"}}
+
+        for text in ("first?", "second?", "third?"):
+            result = agent.invoke(
+                {"messages": [HumanMessage(content=text)]}, config=cfg
+            )
 
         answer = next(
-            (m.content for m in result["messages"] if isinstance(m, AIMessage)),
-            "",
+            m.content for m in reversed(result["messages"]) if isinstance(m, AIMessage)
         )
-        assert "Maximum iterations" in answer
+        assert "ANSWERED-BY(marketing)" in answer
 
-    def test_near_max_iteration_runs_normally(self, monkeypatch):
-        """iteration_count < max_iterations → orchestrator runs normally."""
-        fake = ScriptedChatModel(
-            scripts={
-                "orchestrator": [
-                    ai('{"enhanced_query": "q", "departments": []}'),
-                ],
-            },
-            default=ai("done"),
-        )
+    def test_no_iteration_keys_in_result_state(self, monkeypatch):
+        """The router writes no iteration counter back into checkpointed state.
+
+        Anything it wrote here persisted to the next turn, which is how a
+        per-turn router ended up behaving like a stateful loop.
+        """
+        fake = self._scripted('{"enhanced_query": "q", "departments": ["hr"]}')
         monkeypatch.setattr(agent_factory, "get_model", lambda: fake)
 
-        state = _initial_state("Query.")
-        state["iteration_count"] = 3
-        state["max_iterations"] = 25
-        result = _run_graph(state, "near-max")
+        result = _run_graph(_initial_state("Query."), "no-iteration-keys")
 
-        assert result is not None
+        assert "iteration_count" not in result
+        assert "max_iterations" not in result
 
 
 # ---------------------------------------------------------------------------

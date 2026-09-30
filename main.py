@@ -91,7 +91,7 @@ def run_turn(agent, config: dict, prompt: str) -> None:
     """Send one user turn and print the answer."""
     logger.info("USER >>> %s", prompt)
     result = agent.invoke(
-        {"messages": [HumanMessage(content=prompt)], "iteration_count": 0},
+        {"messages": [HumanMessage(content=prompt)]},
         config=config,
     )
     log_turn(result)
@@ -104,10 +104,7 @@ def run_turn(agent, config: dict, prompt: str) -> None:
 
     usage = result.get("token_usage") or {}
     if usage:
-        print(
-            f"[tokens: {usage.get('total', 0):,} total | "
-            f"iterations: {result.get('iteration_count', 0)}]"
-        )
+        print(f"[tokens: {usage.get('total', 0):,} total]")
 
 
 def main(argv: list[str] | None = None) -> int:

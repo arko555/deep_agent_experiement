@@ -13,12 +13,18 @@ nothing here runs until at least one server is configured.
 
 import json
 import logging
+from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from src.async_bridge import run_sync
 from src.config import get_mcp_servers
+from src.services.tools_integration.validation import (
+    ValidatedTool,
+    normalize_schema,
+    prune_unset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,24 +35,87 @@ _mcp_tools_cache: dict[str, BaseTool] | None = None
 _mcp_tools_cache_key: str = ""
 
 
-def _to_sync_tool(mcp_tool: BaseTool) -> StructuredTool:
+class MCPTool(ValidatedTool, StructuredTool):
+    """A sync-callable MCP tool that validates its payload and knows its kind.
+
+    ``kind`` is what lets dispatch choose the MCP transport from the tool
+    itself rather than from a name convention at the call site.
+    """
+
+    kind: str = "mcp"
+
+    def run(self, *args, **kwargs):
+        # Validate the raw input, not the parsed one: langchain-core skips
+        # parsing entirely for a no-arg tool, so `{"unexpected": 1}` would
+        # otherwise be discarded silently instead of refused. `invoke` passes
+        # the input positionally; `run` callers may name it.
+        if "tool_input" in kwargs:
+            tool_input = kwargs["tool_input"]
+        elif args:
+            tool_input = args[0]
+        else:
+            tool_input = None
+        self._validate_raw_input(tool_input)
+        return super().run(*args, **kwargs)
+
+
+def _unwrap_mcp_result(result: Any) -> Any:
+    """Reduce an MCP tool result to the text a sub-agent should read.
+
+    A real MCP server returns a list of content blocks
+    (``[{"type": "text", "text": ...}]``), which is what a sub-agent's
+    ``ToolMessage`` would otherwise carry — raw protocol structure presented to
+    a model as if it were the answer. Text blocks are joined; non-text blocks
+    (images, resources) have no sensible prose form, so their type is named
+    rather than dropped silently.
+
+    Anything that is not a content-block list is returned as-is, since a server
+    or adapter may already have unwrapped it.
+    """
+    if not isinstance(result, list) or not result:
+        return result
+    if not all(isinstance(block, dict) and "type" in block for block in result):
+        return result
+
+    texts = [b.get("text", "") for b in result if b.get("type") == "text"]
+    others = [b.get("type", "unknown") for b in result if b.get("type") != "text"]
+    if others:
+        texts.append(f"[non-text content: {', '.join(others)}]")
+    return "\n".join(t for t in texts if t)
+
+
+def _to_sync_tool(mcp_tool: BaseTool) -> "MCPTool":
     """Wrap an async MCP tool so it supports synchronous ``.invoke()``.
 
-    ``args_schema`` is carried over verbatim (MCP supplies a raw JSON Schema
-    dict). ``response_format`` is deliberately not set: the wrapper's ``func``
-    returns already-unwrapped content, so declaring
+    MCP describes its tools with a raw JSON Schema **dict**, and langchain-core
+    skips validation entirely for a dict ``args_schema`` — the call goes
+    straight to the server with whatever the model sent. Normalizing the dict
+    into a Pydantic model, and validating the raw input against it, is what
+    makes an MCP tool hold the same payload contract as a built-in: a bad call
+    is refused here instead of corrupting the request at the server.
+
+    ``response_format`` is deliberately not set: the wrapper's ``func``
+    already returns unwrapped text, so declaring
     ``content_and_artifact`` would unpack it a second time.
     """
 
     def _run(**kwargs):
-        return run_sync(mcp_tool.ainvoke(kwargs))
+        # `_parse_input` injects a default for every field that has one, so the
+        # omitted optionals arrive here as explicit None. Trim them: the server
+        # should receive the payload that was actually asked for.
+        return _unwrap_mcp_result(run_sync(mcp_tool.ainvoke(prune_unset(kwargs))))
 
-    return StructuredTool(
+    # A server may omit its schema entirely for a no-arg tool.
+    raw_schema = mcp_tool.args_schema or {"type": "object", "properties": {}}
+    schema = normalize_schema(raw_schema)
+
+    return MCPTool(
         name=mcp_tool.name,
         description=mcp_tool.description,
-        # MCP supplies a raw JSON Schema; a server may omit it for a no-arg tool.
-        args_schema=mcp_tool.args_schema or {"type": "object", "properties": {}},
+        args_schema=schema,
         func=_run,
+        # Recorded so dispatch can tell an MCP call from a local one.
+        kind="mcp",
     )
 
 

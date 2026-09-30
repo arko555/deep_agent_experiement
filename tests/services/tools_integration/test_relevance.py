@@ -135,15 +135,87 @@ class TestResponseParsing:
 
 class TestBehavior:
 
-    def test_does_not_contain_args_schema(self):
-        """args_schema is filtered from the prompt sent to the model."""
+    def test_parameter_spec_reaches_the_sorter(self):
+        """The sorter must see what a tool accepts, not just its name.
+
+        It is choosing from up to 20 candidates, and two same-named tools on
+        different servers can differ entirely in their parameters — relevance
+        that cannot see the spec is guessing.
+        """
         tool_defs = [
-            {"name": "a", "description": "A", "args_schema": {"type": "object"}},
+            {
+                "name": "workday_search",
+                "description": "Search employees",
+                "args_schema": {
+                    "type": "object",
+                    "properties": {"employee_id": {"type": "string"}},
+                    "required": ["employee_id"],
+                },
+            },
         ]
-        model = _FakeModel([AIMessage(content='["a"]')])
+        model = _FakeModel([AIMessage(content='["workday_search"]')])
+        sort_tools(model, "find employee", tool_defs)
+        user_msg = model.calls[0][1]["content"]
+        assert "employee_id" in user_msg
+        assert '"parameters"' in user_msg
+
+    def test_pydantic_schema_is_rendered_for_the_sorter(self):
+        """A built-in tool's schema is a Pydantic model, not a dict.
+
+        `json.dumps` cannot serialize one, so it is converted back to a JSON
+        Schema; without that, every @tool would raise inside sort_tools.
+        """
+        from pydantic import BaseModel, Field
+
+        class Args(BaseModel):
+            path: str = Field(description="File to read.")
+
+        tool_defs = [{"name": "read_file", "description": "Read", "args_schema": Args}]
+        model = _FakeModel([AIMessage(content='["read_file"]')])
+        result = sort_tools(model, "read a file", tool_defs)
+        assert result[0]["name"] == "read_file"
+        assert "path" in model.calls[0][1]["content"]
+
+    def test_caller_gets_the_original_schema_object_back(self):
+        """The rendered form is prompt-only.
+
+        The returned entries are the caller's dicts, so a Pydantic model must
+        not have been replaced by its JSON Schema on the way back.
+        """
+        from pydantic import BaseModel
+
+        class Args(BaseModel):
+            path: str
+
+        tool_defs = [{"name": "read_file", "description": "R", "args_schema": Args}]
+        model = _FakeModel([AIMessage(content='["read_file"]')])
+        result = sort_tools(model, "q", tool_defs)
+        assert result[0]["args_schema"] is Args
+
+    def test_oversized_schema_is_truncated(self):
+        """One verbose spec must not crowd the rest of the roster out.
+
+        Twenty tools' schemas are in this prompt; a single untruncated one
+        would dominate it.
+        """
+        tool_defs = [
+            {
+                "name": "verbose",
+                "description": "V",
+                "args_schema": {
+                    "type": "object",
+                    "properties": {
+                        f"field_{i}": {"type": "string",
+                                       "description": "x" * 100}
+                        for i in range(50)
+                    },
+                },
+            },
+        ]
+        model = _FakeModel([AIMessage(content='["verbose"]')])
         sort_tools(model, "q", tool_defs)
-        system_msg = model.calls[0][0]["content"]
-        assert "args_schema" not in system_msg
+        user_msg = model.calls[0][1]["content"]
+        assert "truncated" in user_msg
 
     def test_skips_names_not_in_tool_defs(self):
         tool_defs = [

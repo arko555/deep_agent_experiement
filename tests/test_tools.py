@@ -11,6 +11,14 @@ from src.services.tools_integration import tools as tools_mod
 from src.services.agent_orchestrator.subagents import SUBAGENTS
 
 
+class _StubTool:
+    """Minimal tool stand-in: allowlist resolution only reads ``.name``."""
+
+    def __init__(self, name, description=""):
+        self.name = name
+        self.description = description
+
+
 ALPHA_MODULE = """\
 from langchain_core.tools import tool
 
@@ -207,7 +215,39 @@ class TestFetchUrl:
 # ---------------------------------------------------------------------------
 
 def test_registry_toolsets_resolve_against_builtins():
+    """Non-namespace allowlist entries must name real tools.
+
+    A trailing ``*`` is a namespace claim, exempt here on purpose: it names a
+    server (``workday_*``), not a tool, and resolves only when that MCP server
+    is configured. CI runs without MCP servers, so requiring those to resolve
+    would make the test depend on the environment.
+    """
     tools = tools_mod.get_all_tools()
     for name, spec in SUBAGENTS.items():
-        missing = [t for t in spec.tools if t not in tools]
+        missing = [t for t in spec.tools if not t.endswith("*") and t not in tools]
         assert not missing, f"{name} toolset references unknown tools: {missing}"
+
+
+def test_namespace_allowlist_resolves_to_prefixed_tools():
+    """``workday_*`` claims every tool the workday MCP server exposes."""
+    from src.services.agent_orchestrator import subagents as subagents_mod
+
+    spec = SUBAGENTS.get("hr")
+    assert spec is not None, "expected the hr department to be discovered"
+    assert any(t.endswith("*") for t in spec.tools), (
+        "hr should claim its MCP server by namespace, not by a bare server name"
+    )
+
+    stub = {"workday_get_employee": _StubTool("workday_get_employee"),
+            "workday_list_positions": _StubTool("workday_list_positions"),
+            "read_file": _StubTool("read_file"),
+            "other_get_thing": _StubTool("other_get_thing")}
+
+    resolved = subagents_mod.select_department_tools(
+        spec, "what is my designation", tools_dict=stub,
+    )
+    names = [t.name for t in resolved]
+    assert "workday_get_employee" in names
+    assert "read_file" in names
+    assert "other_get_thing" not in names
+    assert len(names) == len(set(names)), "namespace claim must not duplicate tools"

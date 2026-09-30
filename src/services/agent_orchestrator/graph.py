@@ -1,12 +1,15 @@
 """LangGraph compilation for the deep agent.
 
-    START → orchestrator → tools → orchestrator   (ReAct loop)
-                        → subagent_fanout → responder → END
-                        → responder → END
+    START → orchestrator → subagent_fanout → responder → END
+                    ↘                  → responder ↗
+
+One direction, three nodes. The orchestrator routes and binds no tools; tool
+calls happen inside a sub-agent's own ReAct loop.
 """
 
 import asyncio
 import logging
+from datetime import datetime
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -25,34 +28,22 @@ logger = logging.getLogger(__name__)
 
 _compiled_graph = None
 
-# Consecutive unknown-tool calls tolerated before the ReAct loop gives up and
-# lets the responder answer. A model that has been told "no tool named X" and
-# asks again is not going to recover on its own; the ToolMessages already name
-# the valid tools, so the responder can summarise without one.
-MAX_INVALID_TOOL_RETRIES = 3
-
 
 def _local_orchestrator_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """Orchestrator node: enhance query, identify departments, call tools.
+    """Orchestrator node: enhance the query, name the departments.
 
     The thread id lives in the runtime config, not in state, so it is read
     from there — otherwise the dispatcher sees an empty message window.
 
-    The tool set comes from ``tools_integration.get_all_tools()``: the built-ins
-    plus every ``@tool`` function ``load_dynamic_tools`` discovers under
-    ``./tools`` (plus MCP and A2A tools when configured). Those imports are
-    function-local because ``agent_factory`` imports this module at load time.
+    No tool set is built here. This node used to call ``get_all_tools()`` and
+    hand the result to the dispatcher, which ignored it — so every turn paid
+    for loading the dynamic and MCP tool layers to produce a value the router
+    never looked at. The router routes; the sub-agents bind tools.
     """
     from src.services.agent_orchestrator.agent_factory import get_model
-    from src.services.tools_integration.tools import get_all_tools
 
     thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
-    return call_orchestrator(
-        state,
-        model=get_model(),
-        thread_id=thread_id,
-        tools=list(get_all_tools().values()),
-    )
+    return call_orchestrator(state, model=get_model(), thread_id=thread_id)
 
 
 def _subagent_fanout_node(state: AgentState) -> dict:
@@ -88,8 +79,56 @@ def _subagent_fanout_node(state: AgentState) -> dict:
         return {"subagent_results": {}}
 
     engine = SubAgentEngine()
-    results = asyncio.run(engine.invoke_parallel(subagents, enhanced_query))
-    return {"subagent_results": results}
+    runs = asyncio.run(engine.invoke_parallel(subagents, enhanced_query))
+
+    # Token spend and file writes happen inside the sub-agents now, so the
+    # parent folds them in here. The top-level tools node that used to do this
+    # is gone with the `task` tool; without this the audit trail the Streamlit
+    # app renders would be permanently empty.
+    child_in = sum(r.usage.get("input", 0) for r in runs.values())
+    child_out = sum(r.usage.get("output", 0) for r in runs.values())
+    updates: dict = {"subagent_results": {n: r.text for n, r in runs.items()}}
+
+    if child_in or child_out:
+        current = state.get("token_usage", {}) or {}
+        total_in = current.get("input", 0) + child_in
+        total_out = current.get("output", 0) + child_out
+        updates["token_usage"] = {
+            "input": total_in,
+            "output": total_out,
+            "total": total_in + total_out,
+        }
+
+    child_writes = [op for r in runs.values() for op in r.writes]
+    if child_writes:
+        updates["pending_writes"] = list(state.get("pending_writes", [])) + [
+            {
+                "tool": op.get("tool", "write_file"),
+                "tool_id": op.get("tool_id"),
+                "args": op.get("args", {}),
+                "status": op.get("status", "executed"),
+            }
+            for op in child_writes
+        ]
+
+    if child_writes:
+        updates["audit_log"] = [{
+            "timestamp": datetime.now().isoformat(),
+            "action": "tool_call",
+            "details": f"{len(child_writes)} file write(s) by sub-agents: "
+                       + ", ".join(
+                           op.get("args", {}).get("path", "?") for op in child_writes
+                       ),
+            "tool_calls": [
+                {
+                    "name": op.get("tool", "write_file"),
+                    "args": op.get("args", {}),
+                }
+                for op in child_writes
+            ],
+        }]
+
+    return updates
 
 
 def _responder_node(state: AgentState) -> dict:
@@ -153,50 +192,20 @@ def _fallback_answer(state: AgentState, enhanced_query: str) -> str:
     return "I could not produce an answer for this request."
 
 
-def _tools_node(state: AgentState) -> dict:
-    """Execute the tool calls the dispatcher requested.
-
-    A thin adapter over ``agent_factory.local_tools_node``. The import is
-    function-local because ``agent_factory`` imports this module at load time.
-    """
-    from src.services.agent_orchestrator.agent_factory import local_tools_node
-
-    return local_tools_node(state)
-
-
-def _route_after_tools(state: AgentState):
-    """After tools run: back to the dispatcher for another turn, or finish.
-
-    The dispatcher is re-entered so it can either call another tool or settle on
-    an answer. Two guards stop a tool-calling model from looping forever:
-
-    - ``consecutive_invalid_tools`` — the model asked for tools that don't
-      exist. Retrying the same impossible call is futile, so after a few
-      misses we let the responder answer from what we do have.
-    - The iteration budget checked in ``call_orchestrator``.
-    """
-    from src.services.agent_orchestrator.orchestrator import _is_budget_exhausted
-
-    if _is_budget_exhausted(state):
-        return "responder"
-    if state.get("consecutive_invalid_tools", 0) >= MAX_INVALID_TOOL_RETRIES:
-        logger.warning(
-            "Model requested unknown tools %d times in a row; ending the tool loop",
-            state.get("consecutive_invalid_tools", 0),
-        )
-        return "responder"
-    return "orchestrator"
-
-
-
 def get_deep_agent():
     """Compile and return the deep agent LangGraph.
 
     Shape::
 
-        START → orchestrator → tools → orchestrator   (ReAct loop)
-                            → subagent_fanout → responder → END
-                            → responder → END
+        START → orchestrator → subagent_fanout → responder → END
+                                    ↘              → responder ↗
+
+    Three nodes, one direction. There is no ``tools`` node: the orchestrator is
+    a router and binds no tools, and the ``task`` tool that would have made a
+    top-level tools node meaningful has been removed along with sub-agent
+    delegation. Every tool call happens inside a sub-agent's own ReAct loop
+    (``subagents.run_department``), which is bounded by that loop's iteration
+    budget rather than by a graph-level retry counter.
     """
     global _compiled_graph
     if _compiled_graph is not None:
@@ -205,41 +214,28 @@ def get_deep_agent():
     workflow = StateGraph(AgentState)
 
     workflow.add_node("orchestrator", _local_orchestrator_node)
-    workflow.add_node("tools", _tools_node)
     workflow.add_node("subagent_fanout", _subagent_fanout_node)
     workflow.add_node("responder", _responder_node)
 
     workflow.add_edge(START, "orchestrator")
 
-    # Single conditional edge out of the dispatcher. The tools branch is what
-    # makes write_file / internet_search / task / MCP / A2A reachable from the
-    # application: the model emits a tool call, this edge sends the turn to the
-    # tools node, and the results come back as ToolMessages.
+    # Single conditional edge out of the router: a department list goes to
+    # fanout, an empty one to the responder. There is no "tools" branch —
+    # that was the orchestrator calling tools itself, which the hierarchy
+    # does not allow.
     workflow.add_conditional_edges(
         "orchestrator",
         route_after_orchestrator,
         {
-            "tools": "tools",
             "subagent_fanout": "subagent_fanout",
             "responder": "responder",
         },
     )
 
     # Fanout delivers the synthesized answer directly. Looping back through the
-    # orchestrator would spend a second dispatcher LLM call whose departments
-    # are discarded by call_orchestrator (it forces [] once iteration_count > 0).
+    # orchestrator would spend a second router LLM call re-deciding a query that
+    # has already been routed; the graph is acyclic by design.
     workflow.add_edge("subagent_fanout", "responder")
-
-    # ReAct loop: tool results go back to the dispatcher so it can chain calls
-    # or finish. Bounded by the iteration budget, not by a hand-set hop cap.
-    workflow.add_conditional_edges(
-        "tools",
-        _route_after_tools,
-        {
-            "orchestrator": "orchestrator",
-            "responder": "responder",
-        },
-    )
 
     workflow.add_edge("responder", END)
 

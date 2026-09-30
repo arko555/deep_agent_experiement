@@ -13,12 +13,9 @@ def _state(**kwargs):
         "current_plan": [],
         "next_message": None,
         "review_verdict": None,
-        "recursion_depth": 0,
         "pending_writes": [],
         "audit_log": [],
         "token_usage": {},
-        "iteration_count": 0,
-        "max_iterations": 25,
         "thread_id": "test-thread",
         "enhanced_query": "",
         "department_targets": [],
@@ -75,33 +72,75 @@ class TestCallOrchestrator:
         result = call_orchestrator(state, fake)
         assert result["enhanced_query"] == "find papers"
         assert result["department_targets"] == ["research", "writer"]
-        assert result["iteration_count"] == 1
 
-    def test_detection_mode_no_departments_routes_to_responder(self):
+    def test_unusable_router_output_falls_back_to_general(self):
+        """An unparseable router reply still has to land somewhere.
+
+        The responder has no tools of its own, so an empty department list
+        would leave the user with "I could not route this request". The
+        router therefore falls back to the ``general`` department, which
+        handles greetings, refuses off-topic queries, and does the work.
+        """
         fake = FakeModel([AIMessage(content="I will handle this myself.")]
                         )
         state = _state()
         result = call_orchestrator(state, fake)
-        assert result["department_targets"] == []
-        assert result["iteration_count"] == 1
+        assert result["department_targets"] == ["general"]
 
-    def test_increments_iteration_count(self):
-        fake = FakeModel([AIMessage(content='{"enhanced_query": "q", "departments": []}')])
-        state = _state(iteration_count=5)
+    def test_empty_departments_list_falls_back_to_general(self):
+        """A well-formed envelope carrying no departments is not a dead end."""
+        fake = FakeModel([AIMessage(
+            content='{"enhanced_query": "q", "departments": []}'
+        )])
+        state = _state()
         result = call_orchestrator(state, fake)
-        assert result["iteration_count"] == 6
+        assert result["department_targets"] == ["general"]
 
-    def test_max_iterations_returns_error(self):
-        fake = FakeModel([AIMessage(content="should not reach")])
-        state = _state(iteration_count=25, max_iterations=25)
+    def test_invented_department_names_fall_back_to_general(self):
+        """A hallucinated department is dropped, then the fallback applies."""
+        fake = FakeModel([AIMessage(
+            content='{"enhanced_query": "q", "departments": ["legal", "nope"]}'
+        )])
+        state = _state()
         result = call_orchestrator(state, fake)
-        assert "Maximum iterations reached" in result["next_message"].content
+        assert result["department_targets"] == ["general"]
 
-    def test_max_iterations_config_via_state(self):
-        fake = FakeModel([AIMessage(content="should not reach")])
-        state = _state(iteration_count=3, max_iterations=3)
+    def test_router_has_no_iteration_budget(self):
+        """The router is single-shot: no counter, no ceiling, no error path.
+
+        It used to keep a checkpointed ``iteration_count`` and bail with
+        "Maximum iterations reached" once it hit a maximum. The graph is
+        acyclic now, so the router runs once per turn and there is nothing to
+        bound. It also must not write an iteration counter back into state —
+        a counter here leaked across turns on a reused checkpoint thread and
+        made every conversation after the first fail to route.
+        """
+        fake = FakeModel([AIMessage(
+            content='{"enhanced_query": "q", "departments": ["research"]}'
+        )])
+        result = call_orchestrator(_state(), fake)
+
+        assert "iteration_count" not in result
+        assert "max_iterations" not in result
+        # The one job it does have: still routes, and still answers.
+        assert result["department_targets"] == ["research"]
+        assert result["enhanced_query"] == "q"
+
+    def test_enhanced_query_is_not_derived_from_prior_state(self):
+        """Each turn's enhanced query is the router's own, not a carried-over one.
+
+        The old ``iteration_count == 0`` branch read ``state["enhanced_query"]``
+        back out of the checkpoint on later turns, so a second turn could
+        answer with the first turn's question.
+        """
+        fake = FakeModel([AIMessage(
+            content='{"enhanced_query": "this turn\'s question", "departments": ["sales"]}'
+        )])
+        state = _state(enhanced_query="a stale question from a previous turn")
+
         result = call_orchestrator(state, fake)
-        assert "Maximum iterations" in result["next_message"].content
+
+        assert result["enhanced_query"] == "this turn's question"
 
     def test_departments_from_llm_output(self):
         fake = FakeModel([AIMessage(content='Analyze: {"enhanced_query": "comprehensive review", "departments": ["research"]}')])

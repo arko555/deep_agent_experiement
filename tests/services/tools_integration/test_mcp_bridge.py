@@ -9,7 +9,7 @@ import pytest
 
 from langchain_core.tools import BaseTool, StructuredTool
 
-from src.services.tools_integration import mcp_bridge
+from src.services.tools_integration import mcp_bridge, mcp_client
 from src.services.tools_integration.mcp_bridge import (
     load_mcp_tools_async,
     _to_sync_tool,
@@ -67,7 +67,10 @@ def _isolate(monkeypatch, tmp_path):
     mcp_bridge.clear_mcp_tools_cache()
     _FakeMCPClient.instances = []
     monkeypatch.setattr(mcp_bridge, "MultiServerMCPClient", _FakeMCPClient)
-    monkeypatch.setattr(mcp_bridge, "run_sync", lambda coro: asyncio.run(coro))
+    # The bridge delegates tool wrapping to mcp_client, so `run_sync` — the
+    # seam that drives an async MCP coroutine synchronously — is patched
+    # there. Patching it on the bridge would no longer intercept anything.
+    monkeypatch.setattr(mcp_client, "run_sync", lambda coro: asyncio.run(coro))
     yield
     monkeypatch.undo()
     mcp_bridge.clear_mcp_tools_cache()

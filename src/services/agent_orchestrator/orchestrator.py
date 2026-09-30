@@ -6,27 +6,32 @@ import logging
 from langchain_core.messages import AIMessage, SystemMessage
 
 from src.services.agent_orchestrator.state import AgentState
-from src.config import get_max_iterations
 from src.utils import invoke_with_retry, get_message_text
 from src.services.session_memory.window import get_window as _get_window
 
 logger = logging.getLogger(__name__)
 
+# The router's default destination. `skills/general/SKILL.md` is the catch-all:
+# it handles greetings, politely refuses off-topic queries, and does the work
+# itself when no specialist department claims the request. Named here because
+# `call_orchestrator` falls back to it whenever the model returns nothing
+# usable — without a floor, an unparseable reply left the turn with no
+# department and the user got "I could not route this request".
+_FALLBACK_DEPARTMENT = "general"
+
 def _build_dispatcher_prompt() -> str:
-    """Build the dispatcher prompt with the real department roster.
+    """Build the router prompt from the real department roster.
 
-    The prompt used to claim departments were "described in the available
-    tool registry" — they are not, the registry holds tools only — so the
-    model had no way to know a department existed and the fanout branch never
-    fired. The roster now comes from ``skills/`` via ``list_departments()``,
-    which means a new SKILL.md appears here with no code change.
+    The dispatcher is a *router*. It has no tools and executes nothing: it
+    enhances the query and names the departments that should handle it, and
+    the departments do the tool work. That is what keeps communication
+    one-way — orchestrator → sub-agent → tool.
 
-    Departments are reachable two ways and the prompt has to separate them, or
-    one shadows the other: the ``task`` tool delegates to a *single* sub-agent
-    and returns its answer inline, while the JSON envelope fans out to
-    *several* departments in parallel and comes back as context. Without that
-    split, "prefer a tool" made the model call ``task`` for every departmental
-    query and the parallel fanout branch went unused.
+    The roster is rendered from ``skills/`` via ``list_departments()`` on every
+    call, so a new SKILL.md appears here with no code change. It matters more
+    than it used to: the description under each name is the only signal the
+    router has for choosing, and a wrong pick sends the query to a department
+    that will refuse it.
     """
     from src.services.agent_orchestrator.subagents import list_departments
 
@@ -36,35 +41,34 @@ def _build_dispatcher_prompt() -> str:
             f"- **{d['name']}**: {d['description']}" for d in departments
         )
         department_block = (
-            "These departments each have their own tools and run independently:\n"
+            "The departments available to handle the query:\n"
             f"{roster}\n\n"
-            "To hand work to one or more of them, return JSON: "
-            "{enhanced_query, departments: [...]}, listing only names from the "
-            "list above. Listing two or more runs them in parallel — use that "
-            "when a query has genuinely separate parts (e.g. research a topic "
-            "and draft a post about it). Use an empty list when no department "
-            "is a better fit than answering directly."
+            "Choose by matching the query against each department's description. "
+            "Route to the department whose remit clearly covers the query.\n"
+            "- If exactly one department fits, name just that one.\n"
+            "- If a query has genuinely separate parts that two departments own "
+            "(for example, research a topic and then write a post about it), "
+            "name both — they will run in parallel.\n"
+            f"- If no department's description fits, name '{_FALLBACK_DEPARTMENT}'. "
+            "Do not invent a department name; only the names listed above are valid."
         )
     else:
         department_block = (
-            "No departments are currently registered, so always return an empty "
-            "departments list and answer the user yourself."
+            "No departments are registered, so return an empty departments list."
         )
 
     return (
-        "You are the dispatcher. Given the conversation history and user query, "
-        "enhance the query, then either route it to departments or answer it "
-        "yourself. You are the only actor who talks to the user, so department "
-        "output arrives as context for you to synthesize into one final answer.\n\n"
+        "You are the router. You do not answer the user and you do not use any "
+        "tools — the department you pick does that, and the result comes back to "
+        "you to pass along.\n\n"
+        "Given the conversation history and the user's latest message, return "
+        "JSON of the form {enhanced_query, departments}, where:\n"
+        "- enhanced_query: the user's request restated with enough context from "
+        "the conversation to be actionable on its own.\n"
+        "- departments: the list of department names that should handle it.\n\n"
         f"{department_block}\n\n"
-        "You also have tools. When the query needs one concrete action — reading "
-        "or writing a file, searching the web, getting the current time, text "
-        "statistics — CALL the tool instead of describing what you would do. The "
-        "`task` tool delegates a *single* sub-task to one subagent and returns "
-        "its answer to you; reach for it when one subagent does the whole job. "
-        "Tool results come back to you, and you then answer the user in plain "
-        "language. Emit the JSON envelope instead when no single tool call "
-        "covers the request."
+        "Return only the JSON object, with no surrounding prose and no markdown "
+        "fence."
     )
 
 
@@ -73,29 +77,37 @@ def _build_dispatcher_prompt() -> str:
 DISPATCHER_SYSTEM_PROMPT = _build_dispatcher_prompt()
 
 
-def _is_budget_exhausted(state: AgentState) -> bool:
-    """True when this turn has spent its orchestrator iteration budget."""
-    max_iterations = state.get("max_iterations") or get_max_iterations()
-    return state.get("iteration_count", 0) >= max_iterations
-
-
 def call_orchestrator(
     state: AgentState,
     model,
     thread_id: str | None = None,
     max_history_messages: int = 20,
-    tools: list | None = None,
 ) -> dict:
-    """Dispatcher orchestrator: enhance query, identify departments.
+    """Router: build the enhanced query and name the departments for it.
 
-    This is the Phase 3 orchestrator. It differs from the legacy
-    orchestrator in ``plan.py`` in that it:
+    Exactly two jobs, both done in one model call:
 
-    - Gets the message window from session_memory (not from state messages).
-    - Uses a dispatcher system prompt (no AGENTS.md).
-    - Returns structured output: {enhanced_query, departments: [...]}.
-    - Routes to subagent_fanout if departments are found, or responder
-      if none are detected.
+    1. Restate the user's request with enough of the conversation history
+       folded in to be actionable on its own — that is ``enhanced_query``.
+    2. Name the departments that should handle it, from the roster in the
+       dispatcher system prompt.
+
+    There is no iteration budget here, and there is no loop to bound. The
+    router runs once per turn; the graph's own topology is acyclic
+    (orchestrator → fanout → responder), so a second router call would be a
+    second decision about a query already decided. Iteration counting lives
+    where iteration actually happens: inside a sub-agent's ReAct tool loop
+    (``subagents.run_tool_loop``), which is bounded by its own turn budget.
+
+    This node previously kept ``iteration_count`` in the checkpointed state
+    and forced ``departments = []`` once it exceeded a maximum. That guard
+    belonged to the removed top-level ReAct dispatcher loop, and because the
+    counter was checkpointed it leaked across turns on a reused thread: the
+    second turn of any conversation saw a non-zero count, dropped its
+    departments, and answered "I could not route this request" — quoting the
+    *first* turn's query. Both entry points were masking it by passing
+    ``iteration_count: 0`` on every invoke. The counter is gone from the
+    state schema entirely rather than reset, so nothing has to compensate.
 
     Args:
         state: The current AgentState.
@@ -103,30 +115,23 @@ def call_orchestrator(
         thread_id: Conversation thread id, taken from the graph's runtime
             config by the caller. Falls back to the state, then ``"default"``.
         max_history_messages: Maximum number of conversation messages to keep.
-        tools: LangChain tool objects bound to the model for this turn. These
-            come from ``tools_integration`` — built-ins plus everything
-            ``load_dynamic_tools`` discovers under ``./tools``. When the model
-            calls one, the turn routes to the tools node instead of the
-            fanout/responder.
+
+    The ``tools`` parameter this used to accept is gone. The dispatcher never
+    bound tools, so every caller that passed a tool set was paying to load the
+    dynamic and MCP tool layers for a value that was then discarded.
 
     Returns:
         A dict updating state:
         - ``next_message``: An AIMessage with the dispatcher's JSON output
           ({enhanced_query, departments}).
-        - ``iteration_count``: Incremented by 1.
         - ``enhanced_query``: The LLM-enhanced version of the query.
-        - ``department_targets``: List of department names (empty → responder).
+        - ``department_targets``: Department names. Never empty — an
+          unusable router response falls back to ``general``.
     """
-    iteration_count = state.get("iteration_count", 0)
-    max_iterations = state.get("max_iterations") or get_max_iterations()
-    if iteration_count >= max_iterations:
-        error_msg = AIMessage(content="Maximum iterations reached. Stopping to prevent runaway execution.")
-        return {"next_message": error_msg, "iteration_count": iteration_count,
-                "enhanced_query": "", "department_targets": []}
-
     # Get message window from session_memory (Phase 3 requirement). The graph
     # checkpointer and session_memory share one saver, so this returns the real
-    # conversation — including the current turn's user message.
+    # conversation — including the current turn's user message. This history
+    # is what the enhanced query is built from.
     resolved_thread = thread_id or state.get("thread_id") or "default"
     messages = _get_window(resolved_thread, max_messages=max_history_messages)
 
@@ -135,12 +140,10 @@ def call_orchestrator(
         SystemMessage(content=_build_dispatcher_prompt())
     ] + list(messages)
 
-    # Bind the tool set so the dispatcher can actually call a tool. The tools
-    # node reads ``state["messages"][-1]``, so a tool-calling response must also
-    # be appended to the message log below — otherwise the tools node sees the
-    # user's HumanMessage and finds no ``tool_calls`` on it.
-    tool_calling_model = model.bind_tools(tools) if tools else model
-    response = invoke_with_retry(tool_calling_model, formatted_messages)
+    # No bind_tools. The dispatcher routes; it does not execute. Tool calls
+    # happen inside sub-agents, which is what keeps the hierarchy one-way:
+    # orchestrator -> sub-agent -> tool.
+    response = invoke_with_retry(model, formatted_messages)
 
     # Parse the LLM response to extract enhanced_query and departments.
     enhanced_query = ""
@@ -152,6 +155,15 @@ def call_orchestrator(
         enhanced_query = parsed.get("enhanced_query", content)
         departments = _validate_departments(parsed.get("departments", []))
 
+    # The router must always land somewhere. An empty or wholly-invented
+    # department list would fall through to the responder, which has no tools
+    # of its own and can only tell the user it could not route the request.
+    if not departments:
+        departments = [_FALLBACK_DEPARTMENT]
+        logger.info(
+            "Router returned no usable department; defaulting to %r", _FALLBACK_DEPARTMENT
+        )
+
     logger.info(
         "Orchestrator: enhanced_query=%r, departments=%r",
         enhanced_query[:100] if enhanced_query else content[:100],
@@ -160,17 +172,9 @@ def call_orchestrator(
 
     updates = {
         "next_message": response,
-        "iteration_count": iteration_count + 1,
-        "enhanced_query": (enhanced_query or content) if iteration_count == 0 else state.get("enhanced_query", enhanced_query or content),
-        "department_targets": departments if iteration_count == 0 else [],
+        "enhanced_query": enhanced_query or content,
+        "department_targets": departments,
     }
-
-    # A tool-calling response must land in the message log: the tools node
-    # reads messages[-1] to find the calls. A pure-envelope response must NOT,
-    # because the responder appends the user-facing answer and the raw JSON
-    # envelope would pollute history.
-    if getattr(response, "tool_calls", None):
-        updates["messages"] = [response]
 
     try:
         usage = getattr(response, "usage_metadata", None)
@@ -193,13 +197,24 @@ def _validate_departments(departments: list) -> list[str]:
     The model can invent a name. Without this check an unknown department
     reaches ``subagent_fanout``, where it resolves to nothing and the turn
     produces a confusing "unknown department" error instead of an answer.
-    Dropping it lets the responder answer directly.
+
+    An empty result is legitimate here — ``call_orchestrator`` applies the
+    ``general`` fallback afterwards.
     """
     from src.services.agent_orchestrator.subagents import list_departments
 
     valid = {d["name"] for d in list_departments()}
     kept: list[str] = []
-    for name in departments or []:
+    # A non-list (the model returned a bare string, or a nested structure)
+    # is not worth guessing at — the caller falls back to `general`.
+    if not isinstance(departments, list):
+        if departments:
+            logger.warning(
+                "Dispatcher returned departments of type %s, expected list; ignoring.",
+                type(departments).__name__,
+            )
+        return kept
+    for name in departments:
         if not isinstance(name, str):
             continue
         cleaned = name.strip()
