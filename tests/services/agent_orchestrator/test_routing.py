@@ -9,9 +9,7 @@ from src.services.agent_orchestrator.state import AgentState
 def _state(**kwargs):
     return {
         "messages": [],
-        "current_plan": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
         "token_usage": {},

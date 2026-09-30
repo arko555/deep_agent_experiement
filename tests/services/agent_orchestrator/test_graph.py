@@ -12,15 +12,10 @@ from tests.fake_models import ScriptedChatModel
 def _initial_state(user_message: str) -> dict:
     return {
         "messages": [HumanMessage(content=user_message)] if user_message else [],
-        "current_plan": [],
-        "workspace_files": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
-        "routing_decisions": [],
         "token_usage": {},
-        "thread_id": "test-thread",
         "enhanced_query": "",
         "department_targets": [],
         "subagent_results": {},

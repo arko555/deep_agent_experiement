@@ -10,13 +10,10 @@ from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 def _state(**kwargs):
     return {
         "messages": [],
-        "current_plan": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
         "token_usage": {},
-        "thread_id": "test-thread",
         "enhanced_query": "",
         "department_targets": [],
         "subagent_results": {},
@@ -167,7 +164,6 @@ class TestCallOrchestratorSessionMemory:
         )
 
         fake = FakeModel([AIMessage(content='{"enhanced_query": "q", "departments": []}')])
-        state = _state(thread_id="thread-1")
-        call_orchestrator(state, fake)
+        call_orchestrator(_state(), fake, thread_id="thread-1")
         assert captured["thread_id"] == "thread-1"
         assert captured["max_messages"] == 20

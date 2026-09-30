@@ -127,7 +127,7 @@ def call_orchestrator(
     # checkpointer and session_memory share one saver, so this returns the real
     # conversation — including the current turn's user message. This history
     # is what the enhanced query is built from.
-    resolved_thread = thread_id or state.get("thread_id") or "default"
+    resolved_thread = thread_id or "default"
     messages = _get_window(resolved_thread, max_messages=max_history_messages)
 
     # Built per call so a department added to skills/ mid-process is listed.
