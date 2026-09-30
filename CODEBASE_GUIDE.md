@@ -173,16 +173,14 @@ re-deciding a query that has already been routed.
 ├── CODEBASE_GUIDE.md          ← this file
 ├── CLAUDE.md                  ← project rules for the agent working on the repo
 ├── AGENTS.md                  ← project context injected into the *agent's* prompt
-├── IMPLEMENTATION_PLAN.md     ← phase-by-phase build plan
 ├── README.md                  ← user-facing setup and usage
 ├── pyproject.toml             ← deps, ruff, mypy, pytest config
 ├── agent.py                   ← 3-line re-export shim
 ├── main.py                    ← CLI (REPL, one-shot query, --tools listing)
 ├── app.py                     ← Streamlit UI entry point
-├── tf_idf.py                  ← standalone demo, fully commented out
 ├── src/
 │   ├── config.py              ← env-var getters, read at call time
-│   ├── types.py               ← ToolSpec / SubAgent dataclasses
+│   ├── types.py               ← ToolKind enum (local / mcp / a2a)
 │   ├── utils.py               ← retry, transient classification, text extraction
 │   ├── async_bridge.py        ← one event loop on a daemon thread
 │   └── services/
@@ -198,10 +196,11 @@ re-deciding a query that has already been routed.
 │   ├── sales/SKILL.md         ← pipeline, accounts, deals
 │   └── writer/SKILL.md        ← drafting and content
 ├── tools/
+│   ├── mock_workday_server.py ← mock Workday MCP server for end-to-end runs
 │   ├── sample_tool.py         ← the extension template
 │   └── text_stats.py          ← dependency-free dynamic-tool reference
-├── tests/                     ← 447 tests, plus tests/fixtures/mcp_server.py
-└── workspace/                 ← agent file output (git-tracked sample notes)
+├── tests/                     ← 384 tests, plus tests/fixtures/mcp_server.py
+└── workspace/                 ← agent file output (two git-tracked samples)
 ```
 
 Only two directories are data-driven at runtime: `skills/` and `tools/`. Add a
@@ -244,8 +243,6 @@ fix is to have exactly one saver and route everyone through `get_saver()`.
   back to `list()[0]`.
 - `append_message(thread_id, message)` — read, append, write a new checkpoint
   with a fresh id, update the index.
-- `get_turn_token_usage(thread_id)` — pull `token_usage` out of the newest
-  checkpoint's metadata.
 
 ### `window.py` — what the orchestrator actually sees (CORE)
 
@@ -261,9 +258,6 @@ with one summary `HumanMessage`, and formats the summary as a numbered
 role-labeled list. The important detail is that it never splits a tool call from
 its `ToolMessage` — an orphaned tool result is a validation error for most
 providers, so the function cuts on boundaries only.
-
-`_extract_role_label` handles the several shapes a message can arrive in
-(`AIMessage`, `HumanMessage`, `SystemMessage`, dicts).
 
 ### `__init__.py`
 
@@ -325,7 +319,7 @@ otherwise the running process keeps the old graph. Tests call it between cases.
 
 ### `orchestrator.py` — the dispatcher (CORE)
 
-`DISPATCHER_SYSTEM_PROMPT` is short on purpose. The legacy prompt (in the
+`_build_dispatcher_prompt()` is short on purpose. The legacy prompt (in the
 deleted `plan.py`) was a long planner prompt; this one asks for a JSON contract
 and nothing more, because the fanout node supplies the actual specialists.
 
@@ -343,8 +337,7 @@ falls through to "treat the raw text as the answer".
 `route_after_orchestrator`. This file used to hold three more routers and a
 `max_iterations` branch that was unreachable. It is now ~40 lines: the
 department check, a `_has_tool_calls` guard routing a stray tool-call message
-to the responder (see §2 step 2), and a `route_from_orchestrator` alias kept
-because the package `__init__` exports it.
+to the responder (see §2 step 2).
 
 ### `state.py` — the graph state (CORE)
 
@@ -420,9 +413,7 @@ to embed the enhanced query in the system prompt *and* pass it as the
 
 The loop body is a **single** model call, not a ReAct loop. The sub-agent gets
 the enhanced query, a role prompt, and the top-5 relevant tool definitions, and
-answers. Module-level `invoke_parallel(...)` is a module-level coroutine
-convenience wrapper — note it is `async def` now, which is a public API change
-for anything importing it from `agent_orchestrator.__init__`.
+answers.
 
 ### `agent_factory.py` — model clients, tracer, cache hooks (CORE)
 
@@ -431,8 +422,7 @@ Three concerns, all of them infrastructure:
 **1. `DeepAgentTracer`** — a real `BaseCallbackHandler` recording
 `on_chat_model_start/end`, `on_llm_start/end`, `on_tool_start/end`,
 `on_chain_start/end` into a list. Only constructed when `OBSERVABILITY=1`.
-`get_tracer()` returns it or `None`. Events are inspectable via `get_events()`
-and clearable via `clear()`.
+Events are inspectable via `get_events()` and clearable via `clear()`.
 
 `_maybe_attach_callbacks` wraps the model with `with_config(callbacks=[tracer])`.
 Because `with_config` merges callbacks into every downstream invoke, the
@@ -498,18 +488,12 @@ module used to carry a second, subtly different version that did not sort
   front-matter block and return metadata or the body with the frontmatter
   stripped (rejoining on `---`, so a `---` line inside the body survives).
   Both route through `validate_read_path`.
-- `get_skills_summary()` — one-line-per-skill markdown summary, memoized on
-  the `skills/` tree hash so an edit invalidates it without a restart.
 - `get_memory_content()` — read `./AGENTS.md` if present. Appended to every
   sub-agent's role prompt as well.
 
 The legacy long planner prompt (`get_system_prompt`) is **gone** — it died
 with the old plan.py orchestrator. What remains is read-path helpers only.
 
-Two re-exports are deliberate compatibility shims: `get_workspace_files` and
-`get_workspace_root` moved to `tools_integration.guardrails` (workspace
-containment belongs beside the validators), but three modules still import
-them from here, so they stay in `__all__` until those importers are repointed.
 
 ### `subagents.py` — the sub-agent registry (CORE)
 
@@ -552,9 +536,8 @@ current query. Names that do not resolve are dropped with a warning — a stale
 name in a SKILL.md must not become a tool the model can call but never execute.
 A trailing `*` claims a whole `server*` namespace, which is how a department
 claims its MCP tools without naming each one in static frontmatter. The result
-is **real `BaseTool` objects**, not the metadata dicts
-`get_tool_definitions` returns; resolving names back to callables is what makes
-the shortlist bindable at all. A failing sorter falls back to the capped
+is **real `BaseTool` objects**, not metadata dicts; resolving names back to
+callables is what makes the shortlist bindable at all. A failing sorter falls back to the capped
 allowlist. The sub-agent does not pick its own tools — this function is the
 single filter. (If the allowlist is 5 tools or fewer the shortlist step is
 skipped entirely — there is nothing to rank.)
@@ -646,7 +629,7 @@ a multi-tenant service.
 - `review.py` — critic / plan_checker / reflection passes. Removed; the
   `review_verdict` state field and the tracer's role names are their residue.
 - `tools_integration/rag.py` — the old TF-IDF retrieval layer. Replaced by
-  `fetch_url` + `internet_search`; see `tf_idf.py` in §9.
+  `fetch_url` + `internet_search`.
 
 If you read an old blog post or commit message referencing these, the code is
 gone.
@@ -751,11 +734,6 @@ objects (`_tools`, which is what dispatch needs).
 
 - `register_builtin(name, callable_, risk_level="low", ...)` — the path used
   for built-ins; description comes from the tool or its docstring.
-- `get_tools_for_role(role)` — everything with no `allowed_roles`, or with this
-  role, or with `*`. This is a separate concern from sub-agent visibility: it
-  answers "may this role see the tool", and `dispatch()` takes the same role
-  argument.
-- `get_tool_definitions(names)` — the JSON-schema-shaped dicts the LLM ranks.
 - `select_for_query(allowed, query, max_tools)` — the registry's half of the
   department filter: resolves names to real tools, drops unknown names with a
   warning, and narrows to `max_tools` by relevance. `subagents.select_department_tools`
@@ -775,9 +753,8 @@ objects (`_tools`, which is what dispatch needs).
   the message body, since A2A carries text rather than a structured payload.
   Validation happens *before* the transport is chosen: a malformed payload is
   the same mistake whichever protocol would have carried it.
-- `execute(...)` — retained for `executor.ToolExecutor`; equivalent to
-  `dispatch`.
-- `RequiresApprovalError` — raised for high-risk tools.
+- `RequiresApprovalError` — raised when a tool declares `requires_approval`
+  and no approval was given.
 
 There is no `get_visible_tools(subagent_name)`. It resolved a department's
 tools by role behind a 20-tool cap, and nothing ever bound the result — a
@@ -791,18 +768,13 @@ There is deliberately **no `http` member**: no such tool type exists, and
 adding one is a genuine SSRF surface needing scheme checks, private-IP
 rejection, and reuse of `research_fetch`'s guardrails.
 
-### `executor.py` — risk-tiered execution (CORE)
+### The risk-tier wrapper that was here
 
-A thin wrapper over the registry, present mostly so the policy is in one place
-and the call site names a tier rather than re-implementing the checks. Tiers:
-`low` executes directly, `medium` validates then executes, `high` raises
-`RequiresApprovalError`. `execute` is `async`; `execute_sync` wraps it with
-`asyncio.run`.
-
-**The tiers are declared but not active.** `dispatch` enforces `requires_approval`
-and `allowed_roles`, but `create_tool_registry` registers every tool with
-`allowed_roles=("*",)` and no tool declares `requires_approval`, so no call is
-actually gated. The hooks work; the policy does not exist yet. Which tools
+`executor.py` (`ToolExecutor`, risk tiers low/medium/high) was deleted in the
+dead-code cleanup: it had no live-path caller, and its `execute` was an alias
+of `registry.dispatch`. The *data* it served stays — `requires_approval` and
+`allowed_roles` remain on `ToolSpecMetadata`, and `dispatch` still enforces
+them — but no tool declares either, so no call is gated today. Which tools
 *should* gate is a decision, not a refactor.
 
 ### `decorator.py` — `@tool_spec` (CORE)
@@ -860,24 +832,15 @@ entries are still the caller's own dicts.
 
 This is async. The `fetch_url` tool calls it through `async_bridge.run_sync`.
 
-### `mcp_client.py` and `mcp_bridge.py` — MCP server tools
+### `mcp_client.py` — MCP server tools
 
-Two implementations of the same thing. Read both; they are near-duplicates and
-knowing which is live saves confusion.
+`load_mcp_tools()` is sync, driven through `async_bridge.run_sync`. Servers come
+from `config.get_mcp_servers()`. Nothing runs until `MCP_SERVERS` is set.
+(A second, async-native `mcp_bridge.py` implementation was deleted in the
+dead-code cleanup: it survived only via a package re-export, and its separate
+cache was a guaranteed no-op in production.)
 
-`mcp_client.py` — **the one on the live path.** `load_mcp_tools()` is sync,
-driven through `async_bridge.run_sync`. Servers come from
-`config.get_mcp_servers()`. Nothing runs until `MCP_SERVERS` is set.
-
-`mcp_bridge.py` — async-native. `load_mcp_tools_async()` plus a sync
-`load_mcp_tools()` that calls `asyncio.run(...)` on it. The `__init__.py` exports
-*this* one, so `from tools_integration import load_mcp_tools` and
-`from tools_integration.mcp_client import load_mcp_tools` are **different
-functions** that return the same thing. The registry cache is per-module, so
-each one keeps its own copy. If you touch MCP loading, be deliberate about
-which import you use.
-
-Both wrap each MCP tool as a sync `StructuredTool`, because
+`mcp_client` wraps each MCP tool as a sync `StructuredTool`, because
 `langchain-mcp-adapters` builds tools with `coroutine=` and no `func` — a plain
 `.invoke()` raises `NotImplementedError`. Server names prefix every tool
 (`<server>_<tool>`) so two servers cannot silently collide. Cached by the
@@ -903,16 +866,11 @@ Three things happen in the wrapper that are easy to miss:
   *not* set — the `func` already returns plain text, and declaring
   `content_and_artifact` would unpack it a second time.
 
-Both loaders now delegate to `mcp_client._to_sync_tool`, so this behavior holds
-regardless of which import you use.
 
-### `a2a_client.py` and `a2a_bridge.py` — remote agents over A2A
+### `a2a_client.py` — remote agents over A2A
 
-Same duplication, same live/dead split: `a2a_client.py` is live (it uses
-`async_bridge`), `a2a_bridge.py` is the async-native version with a
-`trace_id` parameter. `tools_integration.__init__` exports the bridge's.
-
-Both: fetch the agent card from the base URL, send one text message, then poll.
+Fetch the agent card from the base URL, send one text message, then poll.
+(An async-native `a2a_bridge.py` duplicate was deleted with the cleanup.)
 `TERMINAL_STATES` are done/failed/canceled/rejected. `INTERRUPTED_STATES`
 (`input-required`, `auth-required`) are non-terminal but will never advance on
 their own, so polling them would spin forever — treat them as a stop condition.
@@ -926,7 +884,7 @@ The httpx client is created and closed inside the single coroutine on purpose �
 httpx binds its connection pool to the loop that created it, so a client must
 not outlive or cross loops.
 
-### `registry.py` / `executor.py` — see above.
+
 
 ### `__init__.py`
 
@@ -948,7 +906,6 @@ or a non-dict).
 | Env var | Getter | Default |
 |---|---|---|
 | `AGENT_MAX_ITERATIONS` | `get_max_iterations()` | 25 |
-| `AGENT_MAX_SUBAGENT_DEPTH` | `get_max_subagent_depth()` | 3 |
 | `MAX_PARALLEL_TASKS` | `get_max_parallel_tasks()` | 4 (floor 1) |
 | `SUBAGENT_TIMEOUT_SECONDS` | `get_subagent_timeout_seconds()` | 600 |
 | `MCP_SERVERS` | `get_mcp_servers()` | `{}` |
@@ -1003,11 +960,11 @@ Windows caveat in the docstring: the stdio MCP transport wants a
 `ProactorEventLoop`, and this module inherits the platform default. Only
 exercised on macOS today.
 
-### `src/types.py` (mostly unused)
+### `src/types.py`
 
-`ToolSpec` and `SubAgent` dataclasses. `ToolSpec` is consumed by
-`ToolRegistry.register`. `SubAgent` has no live caller — `SubagentSpec` in
-`subagents.py` is the real one. Kept for type clarity and tests.
+`ToolKind` — the StrEnum discriminating tool transports (`local` / `mcp` /
+`a2a`, deliberately no `http`). Consumed by `ToolRegistry.register` and the
+dispatch routing.
 
 ---
 
@@ -1111,32 +1068,19 @@ Project rules for whoever (or whatever) is editing this repo: commands, the
 dependency order, the flow, the sub-agent limits, the cache-invalidation
 contract, and the model routing order. Read it before you change architecture.
 
-### `IMPLEMENTATION_PLAN.md`, `README.md`
+### `README.md`
 
-The phase plan this codebase was built against, and the user-facing setup guide.
-
-### `tf_idf.py` — fully commented out (NOT IN USE)
-
-Every line is prefixed with `#`. It contains a from-scratch TF-IDF vectorizer
-(no sklearn) and a sliding-window attention demo in PyTorch. It was the demo for
-the old `rag.py` retrieval layer, which has since been deleted. Keep it as
-reading material if you want a compact TF-IDF or a small attention
-implementation; it does not run and nothing imports it.
+The user-facing setup guide.
 
 ### `workspace/` — git-tracked sample output
 
-Eight markdown files (`a.md`, `notes.md`, `research_notes.md`, `notes_1.md`,
-`notes_3.md`, `notes_23.md`, `multi_agent_research.md`,
-`research_multi_agent_systems.md`). These are real agent output, committed as
-examples. `CLAUDE.md` says memory files are `SKILL.md` only and there is no
-per-session `AGENTS.md`; `workspace/` is scratch output, not memory. A test or
-the Streamlit reset button can clear it — the reset button deletes the
-contents, not the directory.
-
-### `app_new.log`
-
-Streamlit's `FileHandler` target. Git-tracked by accident. Safe to ignore or
-untrack.
+Two markdown files (`multi_agent_research.md`,
+`research_multi_agent_systems.md`), kept as examples of real agent output.
+`CLAUDE.md` says memory files are `SKILL.md` only and there is no per-session
+`AGENTS.md`; `workspace/` is scratch output, not memory. A test or the
+Streamlit reset button can clear it — the reset button deletes the contents,
+not the directory. Scratch files and runtime logs are gitignored; the Streamlit
+app logs to stdout only, and the CLI writes `deep_agent.log` (gitignored).
 
 ---
 
@@ -1155,7 +1099,6 @@ Everything is env-var driven. There is no config file.
 | `TAVILY_API_KEY` | `tools.internet_search` | missing → tool returns a setup message, not a crash |
 | `OBSERVABILITY` | `agent_factory` | `=1` attaches `DeepAgentTracer` |
 | `AGENT_MAX_ITERATIONS` | `subagents.run_department` | per-sub-agent ReAct turn budget |
-| `AGENT_MAX_SUBAGENT_DEPTH` | *(unused)* | no sub-agent nesting left to bound |
 | `MAX_PARALLEL_TASKS` | `subagent_engine` | concurrency cap |
 | `SUBAGENT_TIMEOUT_SECONDS` | `subagent_engine` | wall-clock guard, shared per batch |
 | `MCP_SERVERS` | `mcp_client` | JSON object of server connections |
@@ -1168,7 +1111,7 @@ second call if you add a module that must see `.env` at import time.
 
 ## 11. Tests
 
-447 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
+384 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
 
 Layout mirrors `src/`:
 
@@ -1184,8 +1127,7 @@ tests/
     ├── agent_orchestrator/   test_aggregator, test_graph, test_orchestrator,
     │                         test_routing, test_subagent_engine, test_verification
     ├── session_memory/       test_compression, test_window
-    └── tools_integration/    test_a2a_bridge, test_discovery, test_executor,
-                              test_mcp_bridge, test_registry, test_relevance
+    └── tools_integration/    test_discovery, test_registry, test_relevance
 ```
 
 `tests/fake_models.py::ScriptedChatModel` is the key piece of test
@@ -1203,8 +1145,9 @@ module and the MCP wrapper's validation behavior) and `test_mcp_live.py`
 (spins up `tests/fixtures/mcp_server.py` and exercises a real MCP round trip
 — everything else fakes the transport).
 
-Current baseline: **447 pass, 0 fail.** ruff reports 93 findings (53
-auto-fixable) and mypy 11 errors in 4 files, all pre-existing. Run
+Current baseline: **384 pass, 0 fail.** ruff is clean. mypy reports 9 errors
+in 4 files (checkpoint.py's MemorySaver dict-vs-RunnableConfig signatures and
+untyped third-party stubs), all pre-existing. Run
 `uv run ruff check .` and `uv run mypy src` to see the current numbers rather
 than trusting these.
 
