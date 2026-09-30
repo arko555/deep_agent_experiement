@@ -29,9 +29,6 @@ from langchain_core.callbacks import BaseCallbackHandler
 from src.services.tools_integration.mcp_client import (
     clear_mcp_tools_cache as clear_mcp_client_cache,
 )
-from src.services.tools_integration.mcp_bridge import (
-    clear_mcp_tools_cache as clear_mcp_bridge_cache,
-)
 from src.services.tools_integration.guardrails import get_workspace_root
 
 load_dotenv()
@@ -233,7 +230,6 @@ def clear_caches():
     """
     _model_cache.clear()
     clear_mcp_client_cache()
-    clear_mcp_bridge_cache()
 
 
 def reset_deep_agent():
