@@ -3,7 +3,7 @@
 import json
 import logging
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 
 from src.services.agent_orchestrator.state import AgentState
 from src.utils import invoke_with_retry, get_message_text

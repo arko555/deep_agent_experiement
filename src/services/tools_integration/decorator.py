@@ -1,6 +1,5 @@
 """@tool_spec decorator: attach risk, role, and approval metadata to tools."""
 
-import functools
 from dataclasses import dataclass
 from typing import Optional
 

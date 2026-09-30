@@ -371,11 +371,11 @@ def create_tool_registry() -> ToolRegistry:
     dynamic_names = set(load_dynamic_tools("./tools"))
     mcp_names = set(load_mcp_tools())
 
-    for name, tool in get_all_tools().items():
+    for name, tool_obj in get_all_tools().items():
         # Register the tool object itself; `tool_spec` metadata hangs off the
         # underlying function.
-        callable_ = tool
-        spec = getattr(getattr(tool, "func", tool), "__tool_spec__", None)
+        callable_ = tool_obj
+        spec = getattr(getattr(tool_obj, "func", tool_obj), "__tool_spec__", None)
 
         if spec is not None:
             # Honour the tool's own declaration (risk level + role scoping).

@@ -26,8 +26,12 @@ from dotenv import load_dotenv
 from langchain_openrouter import ChatOpenRouter
 from langchain_core.callbacks import BaseCallbackHandler
 
-from src.services.tools_integration.mcp_client import clear_mcp_tools_cache as clear_mcp_client_cache
-from src.services.tools_integration.mcp_bridge import clear_mcp_tools_cache as clear_mcp_bridge_cache
+from src.services.tools_integration.mcp_client import (
+    clear_mcp_tools_cache as clear_mcp_client_cache,
+)
+from src.services.tools_integration.mcp_bridge import (
+    clear_mcp_tools_cache as clear_mcp_bridge_cache,
+)
 from src.services.tools_integration.guardrails import get_workspace_root
 
 load_dotenv()

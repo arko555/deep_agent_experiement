@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 import time
-import base64
 import logging
 import uuid
 from datetime import datetime
@@ -343,7 +342,7 @@ if prompt := st.chat_input("What would you like me to do?"):
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
-            st.error(f"❌ **Agent Execution Error**")
+            st.error("❌ **Agent Execution Error**")
             st.info(f"**Error Details:** {e}")
 
     # 3. Persist assistant messages and always refresh UI
