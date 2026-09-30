@@ -220,11 +220,6 @@ def _format_error(exc: Exception, args: dict[str, Any]) -> str:
     return f"Invalid arguments for this tool: {exc}"
 
 
-def tool_spec_for(tool: Any) -> Any:
-    """Best-effort read of a LangChain tool's declared argument schema."""
-    return getattr(tool, "args_schema", None)
-
-
 class ValidatedTool:
     """Mixin that validates a tool's raw input against its declared schema.
 

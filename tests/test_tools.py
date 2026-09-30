@@ -71,13 +71,19 @@ class TestDynamicToolCache:
 
 class TestDynamicToolValidation:
 
-    def test_module_without_tools_is_warned(self, tmp_path, monkeypatch, caplog):
+    def test_module_without_tools_is_ignored_silently(self, tmp_path, monkeypatch, caplog):
+        """A module with no @tool functions is skipped, not warned about.
+
+        MCP server scripts legitimately live under ``tools/`` (FastMCP
+        servers are loaded through the MCP layer, not as local callables),
+        so a tool-less module is normal, not a misconfiguration.
+        """
         monkeypatch.chdir(tmp_path)
         (tmp_path / "tools").mkdir()
         (tmp_path / "tools" / "notools.py").write_text("def foo():\n    return 1\n")
         with caplog.at_level(logging.WARNING, logger="src.services.tools_integration.tools"):
             tools = tools_mod.get_all_tools()
-        assert any("no @tool functions" in m for m in caplog.messages)
+        assert not any("no @tool functions" in m for m in caplog.messages)
         assert "foo" not in tools
 
     def test_builtin_wins_collision_with_warning(self, tmp_path, monkeypatch, caplog):

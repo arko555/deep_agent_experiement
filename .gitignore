@@ -11,8 +11,16 @@ wheels/
 .streamlit
 .env
 
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # Runtime logs
-deep_agent.log
+*.log
 
 # macOS
 .DS_Store
+
+# Local editor/agent state
+.claude/settings.local.json

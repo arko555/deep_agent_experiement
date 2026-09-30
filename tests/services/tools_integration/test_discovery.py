@@ -1,7 +1,6 @@
 """Tests for discover_subagents and discover_tools (Phase 2.3)."""
 
 import os
-import pytest
 from pathlib import Path
 
 from src.services.tools_integration.discovery import (

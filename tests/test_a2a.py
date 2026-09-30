@@ -213,7 +213,7 @@ class TestExecutionDispatch:
         """
         from src.services.agent_orchestrator.subagent_engine import SubAgentEngine
         from src.services.agent_orchestrator.subagents import (
-            SUBAGENTS, SubagentSpec,
+            SUBAGENTS,
         )
         import src.services.tools_integration.a2a_client as a2a_mod
 

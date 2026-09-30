@@ -16,15 +16,19 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from langchain_anthropic import ChatAnthropic
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
+# OpenRouter-only for now: the other provider clients are imported by the
+# commented fallback chain in _get_cached_model below. Re-import when
+# restoring that chain.
+# from langchain_anthropic import ChatAnthropic
+# from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_openai import ChatOpenAI
+# from langchain_ollama import ChatOllama
 from langchain_openrouter import ChatOpenRouter
-from langchain_ollama import ChatOllama
 from langchain_core.callbacks import BaseCallbackHandler
 
-from src.services.tools_integration.mcp_client import clear_mcp_tools_cache as clear_mcp_client_cache
-from src.services.tools_integration.mcp_bridge import clear_mcp_tools_cache as clear_mcp_bridge_cache
+from src.services.tools_integration.mcp_client import (
+    clear_mcp_tools_cache as clear_mcp_client_cache,
+)
 from src.services.tools_integration.guardrails import get_workspace_root
 
 load_dotenv()
@@ -33,9 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 # --- Cached Compiled Graph ---
-# Compile once, reuse across all invocations (including recursive subagents).
-# Safe because node lambdas call get_model() at runtime, not compile time.
-_compiled_graph = None
+# The compiled graph is owned by graph.py (_compiled_graph there); this module
+# holds model clients and reset hooks only.
 
 
 # --- Observability Hooks (4.4, made real in 8.3) ---
@@ -104,11 +107,6 @@ class DeepAgentTracer(BaseCallbackHandler):
 _tracer = DeepAgentTracer() if os.getenv("OBSERVABILITY") == "1" else None
 
 
-def get_tracer() -> DeepAgentTracer | None:
-    """Return the global tracer instance, or None if observability is disabled."""
-    return _tracer
-
-
 def _maybe_attach_callbacks(model):
     """Wrap a model with the observability callback when enabled (8.3).
 
@@ -141,37 +139,65 @@ def _get_cached_model():
 
     The cache lives for the process lifetime and is cleared by
     reset_deep_agent(), so a config change requires an explicit reset — same
-    contract as the compiled-graph cache."""
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    openai_key = os.getenv("OPENAI_API_KEY")
-    openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    google_key = os.getenv("GOOGLE_API_KEY")
+    contract as the compiled-graph cache.
 
-    if anthropic_key:
-        key = _cache_key("anthropic", os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
-        if key not in _model_cache:
-            _model_cache[key] = ChatAnthropic(model=key[1], temperature=0)
-        return _model_cache[key]
-    elif openrouter_key:
-        key = _cache_key("openrouter", os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"))
-        if key not in _model_cache:
-            _model_cache[key] = ChatOpenRouter(model=key[1], api_key=openrouter_key, temperature=0)
-        return _model_cache[key]
-    elif openai_key:
-        key = _cache_key("openai", os.getenv("OPENAI_MODEL", "gpt-4o"))
-        if key not in _model_cache:
-            _model_cache[key] = ChatOpenAI(model=key[1], temperature=0)
-        return _model_cache[key]
-    elif google_key:
-        key = _cache_key("google", os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"))
-        if key not in _model_cache:
-            _model_cache[key] = ChatGoogleGenerativeAI(model=key[1], temperature=0)
-        return _model_cache[key]
-    else:
-        key = _cache_key("ollama", "gemma4:12b-mlx")
-        if key not in _model_cache:
-            _model_cache[key] = ChatOllama(model="gemma4:12b-mlx", temperature=0.0)
-        return _model_cache[key]
+    OpenRouter-only for now. The full fallback chain (Anthropic → OpenRouter
+    → OpenAI → Google → Ollama) is kept below, commented out, because the
+    environment of a tool like Claude Code exports its own
+    ``ANTHROPIC_API_KEY``/``ANTHROPIC_BASE_URL`` — which load_dotenv() cannot
+    override — so the Anthropic-first order silently hijacked model selection
+    and every call failed against that router. Restore the chain by swapping
+    the two blocks back; the imports at the top of this file already cover
+    the other providers.
+    """
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    model_name = os.getenv("OPENROUTER_MODEL")
+    if not openrouter_key or not model_name:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY and OPENROUTER_MODEL must both be set in .env. "
+            "There is no fallback model: the model id must be configured "
+            "explicitly. (The OpenRouter-only selection is active; other "
+            "providers are commented out in agent_factory._get_cached_model.)"
+        )
+    key = _cache_key("openrouter", model_name)
+    if key not in _model_cache:
+        _model_cache[key] = ChatOpenRouter(
+            model=key[1], api_key=openrouter_key, temperature=0,
+        )
+    return _model_cache[key]
+
+    # --- Multi-provider fallback chain, disabled while OpenRouter-only ---
+    # anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    # openai_key = os.getenv("OPENAI_API_KEY")
+    # google_key = os.getenv("GOOGLE_API_KEY")
+    #
+    # if anthropic_key:
+    #     key = _cache_key("anthropic", os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
+    #     if key not in _model_cache:
+    #         _model_cache[key] = ChatAnthropic(model=key[1], temperature=0)
+    #     return _model_cache[key]
+    # elif openrouter_key:
+    #     key = _cache_key("openrouter", os.getenv("OPENROUTER_MODEL", "stealth/space-bunny-alpha"))
+    #     if key not in _model_cache:
+    #         _model_cache[key] = ChatOpenRouter(
+    #             model=key[1], api_key=openrouter_key, temperature=0,
+    #         )
+    #     return _model_cache[key]
+    # elif openai_key:
+    #     key = _cache_key("openai", os.getenv("OPENAI_MODEL", "gpt-4o"))
+    #     if key not in _model_cache:
+    #         _model_cache[key] = ChatOpenAI(model=key[1], temperature=0)
+    #     return _model_cache[key]
+    # elif google_key:
+    #     key = _cache_key("google", os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"))
+    #     if key not in _model_cache:
+    #         _model_cache[key] = ChatGoogleGenerativeAI(model=key[1], temperature=0)
+    #     return _model_cache[key]
+    # else:
+    #     key = _cache_key("ollama", "gemma4:12b-mlx")
+    #     if key not in _model_cache:
+    #         _model_cache[key] = ChatOllama(model="gemma4:12b-mlx", temperature=0.0)
+    #     return _model_cache[key]
 
 
 # --- Graph Construction ---
@@ -204,7 +230,6 @@ def clear_caches():
     """
     _model_cache.clear()
     clear_mcp_client_cache()
-    clear_mcp_bridge_cache()
 
 
 def reset_deep_agent():
@@ -219,7 +244,5 @@ def reset_deep_agent():
     from src.services.agent_orchestrator.graph import reset_deep_agent as _reset
     from src.services.agent_orchestrator import subagents
 
-    global _compiled_graph
-    _compiled_graph = None
     subagents._TOOL_REGISTRY = None
     _reset()

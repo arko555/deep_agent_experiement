@@ -80,6 +80,26 @@ def _configure(monkeypatch, servers=None):
 
 class TestSyncWrapping:
 
+    def test_to_sync_tool_wraps_async_tool_as_structured(self):
+        """Direct unit test of _to_sync_tool, ported from the deleted bridge suite."""
+        from langchain_core.tools import BaseTool
+
+        from src.services.tools_integration.mcp_client import _to_sync_tool
+
+        async_tool = _FakeMCPTool("t", result="sync ok")
+        sync = _to_sync_tool(async_tool)
+        assert isinstance(sync, BaseTool)
+        assert sync.name == "t"
+        assert sync.invoke({"x": 9}) == "sync ok"
+        assert async_tool.received == [{"x": 9}]
+
+    def test_to_sync_tool_preserves_description(self):
+        from src.services.tools_integration.mcp_client import _to_sync_tool
+
+        async_tool = _FakeMCPTool("t", description="my desc")
+        sync = _to_sync_tool(async_tool)
+        assert sync.description == "my desc"
+
     def test_mcp_tools_are_sync_invocable(self, monkeypatch):
         _configure(monkeypatch)
         fake_tool = _FakeMCPTool("svc_echo", result="hello")

@@ -3,7 +3,7 @@
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.session_memory.window import DEFAULT_MAX_MESSAGES, get_window
-from src.services.session_memory.checkpoint import append_message, get_session
+from src.services.session_memory.checkpoint import append_message
 
 
 class TestGetWindowUnderThreshold:

@@ -13,8 +13,15 @@ from src.services.tools_integration.guardrails import (
     validate_and_normalize_path,
     validate_read_path,
 )
-from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body, get_workspace_files
-from src.services.tools_integration.tools import edit_file, list_files, read_file, search_files, write_file
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
+from src.services.tools_integration.guardrails import get_workspace_files
+from src.services.tools_integration.tools import (
+    edit_file,
+    list_files,
+    read_file,
+    search_files,
+    write_file,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -108,10 +115,16 @@ class TestValidatePathNonStrictRedirect:
 
 class TestValidateReadPath:
 
-    def test_workspace_path_allowed(self):
+    def test_workspace_path_allowed(self, tmp_path, monkeypatch):
+        # Build the allowed file locally: the repo's own workspace/ must not
+        # be a test dependency.
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "a.md").write_text("x")
         assert validate_read_path("workspace/a.md") == "workspace/a.md"
 
-    def test_workspace_dot_slash_normalized(self):
+    def test_workspace_dot_slash_normalized(self, tmp_path, monkeypatch):
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "a.md").write_text("x")
         assert validate_read_path("./workspace/a.md") == "workspace/a.md"
 
     def test_skills_path_allowed(self):
@@ -316,9 +329,9 @@ def test_ui_helpers_share_policy_without_starting_streamlit(tmp_path, monkeypatc
 
 
 def test_graph_initialization_uses_custom_workspace(tmp_path, monkeypatch):
-    from src.services.agent_orchestrator import agent_factory
+    from src.services.agent_orchestrator import agent_factory, graph
     monkeypatch.setenv("WORKSPACE_ROOT", "custom")
-    monkeypatch.setattr(agent_factory, "_compiled_graph", None)
+    monkeypatch.setattr(graph, "_compiled_graph", None)
     agent_factory.get_deep_agent()
     assert (tmp_path / "custom").is_dir()
     assert not (tmp_path / "workspace").exists()

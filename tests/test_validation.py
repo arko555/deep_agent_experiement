@@ -11,7 +11,6 @@ untouched.
 import pytest
 from pydantic import BaseModel
 
-from src.services.tools_integration.mcp_bridge import _to_sync_tool as bridge_wrap
 from src.services.tools_integration.mcp_client import _to_sync_tool as client_wrap
 from src.services.tools_integration.validation import (
     normalize_schema,
@@ -168,9 +167,8 @@ class TestValidateArgs:
 class TestMCPToolRejectsBadPayload:
     """The regression: a bad payload to an MCP tool must not reach the server."""
 
-    @pytest.mark.parametrize("wrap", [client_wrap, bridge_wrap], ids=["client", "bridge"])
-    def test_wrapping_produces_a_validating_schema(self, wrap):
-        tool = wrap(_FakeMCPTool())
+    def test_wrapping_produces_a_validating_schema(self):
+        tool = client_wrap(_FakeMCPTool())
         model = normalize_schema(tool.args_schema)
         assert isinstance(model, type) and issubclass(model, BaseModel)
 

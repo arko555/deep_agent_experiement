@@ -1,7 +1,6 @@
 """Tests for SubAgentEngine parallel dispatch."""
 
 import asyncio
-import pytest
 
 from src.services.agent_orchestrator.subagent_engine import SubAgentEngine, SubagentRun
 

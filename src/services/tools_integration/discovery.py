@@ -63,7 +63,8 @@ def _dir_tree_hash(directory: str) -> str:
                 parts.append(f"{fp}:{stat.st_mtime}:{stat.st_size}")
             except OSError:
                 parts.append(f"{fp}:missing")
-    return hashlib.md5("\n".join(parts).encode()).hexdigest() if parts else hashlib.md5(b"empty").hexdigest()
+    joined = "\n".join(parts).encode()
+    return hashlib.md5(joined).hexdigest() if parts else hashlib.md5(b"empty").hexdigest()
 
 
 def _directory_tree_key(paths: list[str]) -> str:
@@ -85,7 +86,7 @@ def _parse_skill_file(filepath: str) -> dict[str, Any] | None:
     continuation line.
     """
     try:
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             content = f.read()
     except (OSError, UnicodeDecodeError):
         return None
@@ -245,7 +246,7 @@ def discover_tools(tools_dir: str | None = None) -> list[dict[str, Any]]:
             logger.warning("Failed to load tool module %s: %s", py_file.name, e)
             continue
 
-        for name, obj in inspect.getmembers(module, inspect.isfunction):
+        for _name, obj in inspect.getmembers(module, inspect.isfunction):
             spec_meta = getattr(obj, "__tool_spec__", None)
             if spec_meta is None:
                 continue

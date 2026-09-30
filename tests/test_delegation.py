@@ -27,15 +27,10 @@ from tests.fake_models import ScriptedChatModel, ai
 def _initial_state(user_message: str) -> dict:
     return {
         "messages": [HumanMessage(content=user_message)],
-        "current_plan": [],
-        "workspace_files": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
-        "routing_decisions": [],
         "token_usage": {},
-        "thread_id": "delegation-thread",
         "enhanced_query": "",
         "department_targets": [],
         "subagent_results": {},
@@ -87,7 +82,11 @@ class TestOrchestratorFanout:
 
         messages = result["messages"]
         answer = next(
-            (m.content for m in messages if isinstance(m, AIMessage) and "summarize" not in m.content),
+            (
+                m.content
+                for m in messages
+                if isinstance(m, AIMessage) and "summarize" not in m.content
+            ),
             "",
         )
         assert "Research summary complete." in answer
@@ -351,7 +350,10 @@ class _ParallelFake:
                 self._orch_calls += 1
                 first = self._orch_calls == 1
             if first:
-                return ai('{"enhanced_query": "Research A and B", "departments": ["research", "writer"]}', usage=(5, 1))
+                return ai(
+                    '{"enhanced_query": "Research A and B",'
+                    ' "departments": ["research", "writer"]}', usage=(5, 1),
+                )
             return ai("Parallel report.", usage=(5, 1))
         with self._lock:
             self._n += 1

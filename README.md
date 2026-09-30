@@ -315,7 +315,7 @@ role metadata (see `tools/sample_tool.py` and `tools/text_stats.py`).
 ## 🧪 Testing & Development
 
 ```bash
-uv run pytest                # 447 tests — no API keys or network needed
+uv run pytest                # 384 tests — no API keys or network needed
 uv run ruff check .          # lint
 uv run mypy src              # type check
 uv run python main.py        # CLI REPL

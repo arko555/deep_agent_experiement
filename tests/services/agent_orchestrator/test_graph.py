@@ -1,6 +1,5 @@
 """Tests for graph.py — Phase 3 graph assembly."""
 
-import pytest
 
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -12,15 +11,10 @@ from tests.fake_models import ScriptedChatModel
 def _initial_state(user_message: str) -> dict:
     return {
         "messages": [HumanMessage(content=user_message)] if user_message else [],
-        "current_plan": [],
-        "workspace_files": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
-        "routing_decisions": [],
         "token_usage": {},
-        "thread_id": "test-thread",
         "enhanced_query": "",
         "department_targets": [],
         "subagent_results": {},
@@ -35,8 +29,7 @@ class FakeModel:
         self._responses = deque(responses)
 
     def invoke(self, messages, **kwargs):
-        resp = self._responses.popleft() if self._responses else self._responses[0]
-        return resp
+        return self._responses.popleft() if self._responses else self._responses[0]
 
     def bind_tools(self, tools, **kwargs):
         return self

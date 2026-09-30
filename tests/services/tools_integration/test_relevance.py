@@ -1,7 +1,6 @@
 """Tests for sort_tools (Phase 2.4)."""
 
 import json
-import pytest
 from langchain_core.messages import AIMessage
 
 from src.services.tools_integration.relevance import sort_tools

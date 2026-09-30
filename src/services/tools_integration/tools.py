@@ -107,7 +107,10 @@ def read_file(path: str) -> str:
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """Write content to a file in the `./workspace` directory. Use this to save reports, drafts, or notes."""
+    """Write content to a file in the `./workspace` directory.
+
+    Use this to save reports, drafts, or notes.
+    """
     try:
         clean_path = validate_and_normalize_path(path, must_be_in_workspace=True)
         os.makedirs(os.path.dirname(clean_path), exist_ok=True)
@@ -120,7 +123,7 @@ def write_file(path: str, content: str) -> str:
 
 @tool
 def edit_file(path: str, search_text: str, replace_text: str) -> str:
-    """Edit an existing file in the `./workspace` directory by replacing search_text with replace_text."""
+    """Edit a `./workspace` file by replacing search_text with replace_text."""
     try:
         clean_path = validate_and_normalize_path(path, must_be_in_workspace=True)
         if not os.path.exists(clean_path):
@@ -267,7 +270,11 @@ def load_dynamic_tools(tools_dir: str) -> dict[str, BaseTool]:
                     if isinstance(obj, BaseTool)
                 }
                 if not found_tools:
-                    logger.warning(
+                    # A module with no tools is normal for MCP server scripts
+                    # (FastMCP servers live here too and are loaded through the
+                    # MCP layer, not as local callables) — that is not a
+                    # problem worth a warning.
+                    logger.debug(
                         "Dynamic tool module %s defines no @tool functions; ignored.", entry
                     )
                     continue
@@ -367,11 +374,11 @@ def create_tool_registry() -> ToolRegistry:
     dynamic_names = set(load_dynamic_tools("./tools"))
     mcp_names = set(load_mcp_tools())
 
-    for name, tool in get_all_tools().items():
+    for name, tool_obj in get_all_tools().items():
         # Register the tool object itself; `tool_spec` metadata hangs off the
         # underlying function.
-        callable_ = tool
-        spec = getattr(getattr(tool, "func", tool), "__tool_spec__", None)
+        callable_ = tool_obj
+        spec = getattr(getattr(tool_obj, "func", tool_obj), "__tool_spec__", None)
 
         if spec is not None:
             # Honour the tool's own declaration (risk level + role scoping).

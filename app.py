@@ -1,24 +1,24 @@
 import streamlit as st
 import os
-import time
-import base64
 import logging
 import uuid
 from datetime import datetime
 from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
-from src.services.tools_integration.guardrails import clear_workspace, get_workspace_root, validate_read_path
-from src.services.agent_orchestrator.memory import get_workspace_files, get_memory_content, get_skill_info
+from src.services.tools_integration.guardrails import (
+    clear_workspace,
+    get_workspace_root,
+    validate_read_path,
+)
+from src.services.tools_integration.guardrails import get_workspace_files
+from src.services.agent_orchestrator.memory import get_memory_content, get_skill_info
 
 # --- Logging Configuration ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app_new.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("DeepAgentApp")
 logger.info("App started")
@@ -112,8 +112,6 @@ if "messages" not in st.session_state:
 if "agent" not in st.session_state:
     with st.spinner("Initializing Deep Agent..."):
         st.session_state.agent = get_deep_agent()
-if "current_plan" not in st.session_state:
-    st.session_state.current_plan = []
 if "workspace_files" not in st.session_state:
     st.session_state.workspace_files = []
 if "audit_log" not in st.session_state:
@@ -151,7 +149,8 @@ def add_audit_entry(action: str, details: str):
 
 # --- Sidebar ---
 with st.sidebar:
-    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200) # Placeholder
+    # Placeholder logo
+    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200)
     st.title("Deep Agent Context")
 
     st.divider()
@@ -240,18 +239,9 @@ with st.sidebar:
             update_workspace_files()
             st.rerun()
 
-    # Plan Placeholder in Sidebar
-    plan_section = st.empty()
-    if st.session_state.current_plan:
-        with plan_section.container():
-            st.divider()
-            st.subheader("📋 Current Plan")
-            for i, task in enumerate(st.session_state.current_plan):
-                st.checkbox(str(task), key=f"plan_init_{i}", value=False, disabled=True)
-
 # --- Main Interface ---
 st.title("🚀 Deep Agent Orchestrator")
-st.markdown("*Demonstrating hierarchical planning, specialist subagents, and dynamic skill loading.*")
+st.markdown("*Demonstrating specialist subagents and dynamic skill loading.*")
 
 # Display chat history
 for message in st.session_state.messages:
@@ -274,7 +264,6 @@ if prompt := st.chat_input("What would you like me to do?"):
     # Render user message will happen on rerun after agent completion
     # 2. Process agent response
     with st.spinner("🤖 Agent is thinking..."):
-        full_response = ""
         turn_messages = []  # Collect all intermediate messages for chat history
 
         try:
@@ -313,10 +302,7 @@ if prompt := st.chat_input("What would you like me to do?"):
                                     continue  # Skip system messages in chat UI
 
                                 # Display in thinking container
-                                if node_name == "agent":
-                                    st.markdown(f"**Agent Thought:** {msg.content}")
-                                elif node_name == "responder":
-                                    full_response = msg.content
+                                if node_name == "responder":
                                     st.success("✅ Final response generated.")
 
                                 # Only capture the final responder message in chat history
@@ -325,15 +311,6 @@ if prompt := st.chat_input("What would you like me to do?"):
                                         "role": role,
                                         "content": msg.content,
                                     })
-
-                    # --- Handle Todo Updates directly ---
-                    if "todos" in data:
-                        st.session_state.current_plan = data["todos"]
-                        with plan_section.container():
-                            st.divider()
-                            st.subheader("📋 Current Plan")
-                            for i, t in enumerate(st.session_state.current_plan):
-                                st.checkbox(str(t), key=f"plan_update_{i}_{time.time()}", value=False, disabled=True)
 
                     # --- Handle Audit Log updates ---
                     if "audit_log" in data:
@@ -346,7 +323,7 @@ if prompt := st.chat_input("What would you like me to do?"):
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
-            st.error(f"❌ **Agent Execution Error**")
+            st.error("❌ **Agent Execution Error**")
             st.info(f"**Error Details:** {e}")
 
     # 3. Persist assistant messages and always refresh UI

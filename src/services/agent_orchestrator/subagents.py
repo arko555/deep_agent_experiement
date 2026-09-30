@@ -55,7 +55,7 @@ class SubagentSpec:
     """One subagent type, as registered in SUBAGENTS."""
 
     description: str   # the only signal the router has for choosing this one
-    kind: str          # "tool_loop" (restricted tools), "graph" (full graph), or "a2a" (remote agent)
+    kind: str          # "tool_loop" (restricted tools) or "a2a" (remote agent)
     parallelizable: bool = False  # may run concurrently with sibling tasks
     aliases: tuple = ()            # accepted alternate names for subagent_type
     skill: str | None = None       # skills/<skill>/SKILL.md — prompt source (tool_loop only)
@@ -102,13 +102,12 @@ def _skill_specs(skills_dir: str | None = None) -> dict[str, SubagentSpec]:
     return specs
 
 
-# There is no hardcoded runtime subagent. A `general-purpose` spec used to live
-# here, running the whole compiled graph as a "sub-agent" — which made the
-# orchestrator its own sub-agent, so a delegated description would be routed
-# again from the top and the hierarchy stopped being one-way. The catch-all is
-# now `skills/general/SKILL.md`: a real department with a real prompt and a real
-# tool allowlist, chosen by the router rather than by a self-referential spec.
-# Its `kind` is `tool_loop` like every other skill.
+# There is no hardcoded runtime subagent. A `general-purpose` spec running the
+# whole compiled graph as a "sub-agent" would make the orchestrator its own
+# sub-agent — a delegated description gets routed again from the top and the
+# hierarchy stops being one-way. The catch-all is `skills/general/SKILL.md`: a
+# real department with a real prompt and a real tool allowlist, chosen by the
+# router rather than by a self-referential spec.
 
 
 def _a2a_specs() -> dict[str, SubagentSpec]:
@@ -418,9 +417,9 @@ def select_department_tools(
        query, so a department is handed the tools its current task needs
        rather than its whole declared set.
 
-    The return value is real ``BaseTool`` objects. ``get_tool_definitions``
-    returns metadata only, so resolving names back to callables here is what
-    makes the sub-agent able to actually *call* what it was offered.
+    The return value is real ``BaseTool`` objects, not metadata dicts —
+    resolving names back to callables is what makes the sub-agent able to
+    actually *call* what it was offered.
 
     Stage 3 delegates to ``ToolRegistry.select_for_query``, which owns the
     relevance shortlist; this function owns the allowlist, namespace matching,

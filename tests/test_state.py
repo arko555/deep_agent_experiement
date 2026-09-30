@@ -1,6 +1,5 @@
 """Tests for state integrity — verify AgentState transitions are well-defined."""
 
-from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.agent_orchestrator.state import AgentState
 
@@ -12,18 +11,13 @@ from src.services.agent_orchestrator.state import AgentState
 class TestAgentStateDefaults:
 
     def test_messages_is_list(self):
-        state = {}
         # AgentState is a TypedDict Python doesn't enforce types at runtime,
         # but we verify the expected keys exist in our node logic.
         expected_keys = [
             "messages",
-            "current_plan",
-            "workspace_files",
             "next_message",
-            "review_verdict",
             "pending_writes",
             "audit_log",
-            "routing_decisions",
             "token_usage",
         ]
         # Just verify the TypedDict definition lists these keys.
@@ -61,13 +55,9 @@ def _build_state(**overrides):
     """Build a valid AgentState with sensible defaults + overrides."""
     state: AgentState = {
         "messages": [],
-        "current_plan": [],
-        "workspace_files": [],
         "next_message": None,
-        "review_verdict": None,
         "pending_writes": [],
         "audit_log": [],
-        "routing_decisions": [],
         "token_usage": {"input": 0, "output": 0, "total": 0},
     }
     state.update(overrides)

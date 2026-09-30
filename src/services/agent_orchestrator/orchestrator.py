@@ -3,7 +3,7 @@
 import json
 import logging
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 
 from src.services.agent_orchestrator.state import AgentState
 from src.utils import invoke_with_retry, get_message_text
@@ -72,11 +72,6 @@ def _build_dispatcher_prompt() -> str:
     )
 
 
-# Built per call rather than at import so a SKILL.md added at runtime is
-# reflected. The module-level name is kept for callers that import it.
-DISPATCHER_SYSTEM_PROMPT = _build_dispatcher_prompt()
-
-
 def call_orchestrator(
     state: AgentState,
     model,
@@ -132,13 +127,14 @@ def call_orchestrator(
     # checkpointer and session_memory share one saver, so this returns the real
     # conversation — including the current turn's user message. This history
     # is what the enhanced query is built from.
-    resolved_thread = thread_id or state.get("thread_id") or "default"
+    resolved_thread = thread_id or "default"
     messages = _get_window(resolved_thread, max_messages=max_history_messages)
 
     # Built per call so a department added to skills/ mid-process is listed.
     formatted_messages = [
-        SystemMessage(content=_build_dispatcher_prompt())
-    ] + list(messages)
+        SystemMessage(content=_build_dispatcher_prompt()),
+        *messages,
+    ]
 
     # No bind_tools. The dispatcher routes; it does not execute. Tool calls
     # happen inside sub-agents, which is what keeps the hierarchy one-way:
@@ -184,7 +180,11 @@ def call_orchestrator(
             current_usage = state.get("token_usage", {})
             total_in = current_usage.get("input", 0) + input_tokens
             total_out = current_usage.get("output", 0) + output_tokens
-            updates["token_usage"] = {"input": total_in, "output": total_out, "total": total_in + total_out}
+            updates["token_usage"] = {
+                "input": total_in,
+                "output": total_out,
+                "total": total_in + total_out,
+            }
     except Exception:
         pass
 

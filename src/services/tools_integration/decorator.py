@@ -1,8 +1,6 @@
 """@tool_spec decorator: attach risk, role, and approval metadata to tools."""
 
-import functools
 from dataclasses import dataclass
-from typing import Optional
 
 from src.types import ToolKind
 
@@ -22,14 +20,14 @@ class ToolSpecMetadata:
 
 
 def tool_spec(
-    name: Optional[str] = None,
-    description: Optional[str] = None,
+    name: str | None = None,
+    description: str | None = None,
     risk_level: str = "low",
     requires_approval: bool = False,
-    allowed_roles: Optional[tuple] = None,
+    allowed_roles: tuple | None = None,
     kind: ToolKind = ToolKind.LOCAL,
 ):
-    """Decorator that attaches ToolSpec metadata to a tool function.
+    """Decorator that attaches tool metadata to a tool function.
 
     Applied to @tool-decorated functions to register them in
     ToolRegistry with risk-tier and role-scoping information.
