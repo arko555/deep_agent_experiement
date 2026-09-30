@@ -53,16 +53,12 @@ This is the part to keep in your head. Everything else is detail hanging off it.
 `main.py` (CLI) and `app.py` (Streamlit) both do the same thing:
 
 ```python
-agent.invoke({"messages": [HumanMessage(content=prompt)], "iteration_count": 0},
+agent.invoke({"messages": [HumanMessage(content=prompt)]},
              config={"configurable": {"thread_id": ...}})
 ```
 
-Two things matter:
-
-- Only the **new** message is sent. History lives in the checkpointer, keyed by
-  `thread_id`.
-- `iteration_count` resets to 0 every turn, so the per-turn budget is not
-  consumed by earlier turns.
+Only the **new** message is sent. History lives in the checkpointer, keyed by
+`thread_id`. That is the whole contract — there is no per-turn state to reset.
 
 `thread_id` is the entire memory identity. The CLI mints `cli-<uuid>` per
 process; Streamlit mints one `uuid` into `st.session_state` and reuses it.
@@ -78,35 +74,55 @@ not cosmetic: the dispatcher builds its prompt from
 an empty window on every single turn. This was a real bug — see §12.
 
 `call_orchestrator` then:
-1. Checks the iteration budget. Over budget → returns a "Maximum iterations
-   reached" `AIMessage` and no departments, which routes to the responder.
-2. Fetches the message window from `session_memory` (default 20 messages,
-   compressed if longer).
-3. Prepends `DISPATCHER_SYSTEM_PROMPT`, which asks for JSON:
+1. Fetches the message window from `session_memory` (default 20 messages,
+   compressed if longer). This history is what the enhanced query is built
+   from.
+2. Prepends the dispatcher system prompt, which lists the live department
+   roster and asks for JSON:
    `{"enhanced_query": ..., "departments": [...]}`.
-4. Parses that JSON. The parser is deliberately lenient — it takes the text
+3. Parses that JSON. The parser is deliberately lenient — it takes the text
    between the first `{` and the last `}` and requires `departments` to be a
    list. Prose around the JSON is fine.
-5. Accumulates `usage_metadata` into `token_usage`.
+4. Validates each department name against the live roster
+   (`_validate_departments`), dropping invented ones with a warning.
+5. Applies the `general` fallback if the validated list is empty — the router
+   always lands somewhere, and `skills/general/SKILL.md` is the catch-all that
+   greets, answers, or refuses.
+6. Accumulates `usage_metadata` into `token_usage`.
 
-It returns `next_message` (the raw response), `enhanced_query`,
-`department_targets`, and the bumped counter.
+`DISPATCHER_SYSTEM_PROMPT` is built per call (`_build_dispatcher_prompt()`)
+from `list_departments()`, so a SKILL.md added at runtime appears in the
+roster without a restart. The module-level name is kept only for importers.
 
-Only on `iteration_count == 0` are `enhanced_query` and `department_targets`
-actually adopted. Later iterations keep the first values and force departments
-to `[]`, which prevents the loop from re-dispatching forever.
+It returns `next_message` (the raw response), `enhanced_query`, and
+`department_targets`. Those are its only two jobs: restate the request with
+enough history folded in to be actionable, and name who should handle it.
+
+**There is no iteration budget here.** The graph is acyclic, so the router runs
+once per turn and has nothing to count. Iteration counting lives where
+iteration actually happens — inside a sub-agent's ReAct tool loop, bounded by
+`AGENT_MAX_ITERATIONS` (`subagents.run_tool_loop`). A per-turn router that
+carries a counter in checkpointed state is a bug, not a safety feature: see
+§12 for the one that shipped.
 
 ### Step 2 — conditional edge
 
-`routing.py::route_after_orchestrator` checks tool calls first, then
-departments: tool call → `tools`, departments present → `subagent_fanout`,
-otherwise → `responder`. Tool calls win because a model that wants a tool emits
-one *instead of* the JSON envelope.
+`routing.py::route_after_orchestrator` is two checks over one field:
+departments present → `subagent_fanout`, otherwise → `responder`. There is no
+`tools` branch — the router binds no tools, so it cannot emit a tool call. A
+`_has_tool_calls` guard is kept anyway: it routes a turn whose last AI message
+carries tool calls to the *responder*, because such a message falling into
+`subagent_fanout` would leave an unconsumed tool request and a model told it
+cannot act on its own ask. The guard should be unreachable; it is cheap
+insurance against a tool ever being bound to the router again.
 
 Departments reach this edge only after `_validate_departments` drops names that
 resolve to no registered department. The model can invent a name, and without
 that check an invented department reaches the executor and surfaces as a
-confusing "unknown department" error instead of an answer.
+confusing "unknown department" error instead of an answer. And the list is
+never empty going *in*: an unusable router reply falls back to `general`
+(see §5, `orchestrator.py`), so the empty-departments route is itself a
+should-never-happen path.
 
 ### Step 3a — fanout node (departments found)
 
@@ -145,8 +161,8 @@ value left over from a previous turn gets replayed as this turn's answer.
 ### Step 4 — END
 
 `fanout → responder → END`. Fanout does **not** loop back through the
-orchestrator: a second dispatcher call would spend a token round-trip and then
-have its departments thrown away by the `iteration_count > 0` rule.
+orchestrator: a second dispatcher call would spend a token round-trip
+re-deciding a query that has already been routed.
 
 ---
 
@@ -161,7 +177,7 @@ have its departments thrown away by the `iteration_count > 0` rule.
 ├── README.md                  ← user-facing setup and usage
 ├── pyproject.toml             ← deps, ruff, mypy, pytest config
 ├── agent.py                   ← 3-line re-export shim
-├── main.py                    ← CLI REPL entry point
+├── main.py                    ← CLI (REPL, one-shot query, --tools listing)
 ├── app.py                     ← Streamlit UI entry point
 ├── tf_idf.py                  ← standalone demo, fully commented out
 ├── src/
@@ -174,11 +190,17 @@ have its departments thrown away by the `iteration_count > 0` rule.
 │       ├── agent_orchestrator/
 │       └── tools_integration/
 ├── skills/
-│   ├── research/SKILL.md
-│   └── writer/SKILL.md
+│   ├── general/SKILL.md       ← the catch-all department
+│   ├── hr/SKILL.md            ← employee records, leave, payroll (workday_* MCP tools)
+│   ├── marketing/SKILL.md     ← campaigns, copy, market research
+│   ├── operations/SKILL.md    ← SOPs, runbooks, approvals
+│   ├── research/SKILL.md      ← web research
+│   ├── sales/SKILL.md         ← pipeline, accounts, deals
+│   └── writer/SKILL.md        ← drafting and content
 ├── tools/
-│   └── sample_tool.py
-├── tests/                     ← 392 tests
+│   ├── sample_tool.py         ← the extension template
+│   └── text_stats.py          ← dependency-free dynamic-tool reference
+├── tests/                     ← 447 tests, plus tests/fixtures/mcp_server.py
 └── workspace/                 ← agent file output (git-tracked sample notes)
 ```
 
@@ -262,26 +284,31 @@ The single owner of the compiled graph. Everything that needs a graph calls
 `get_deep_agent()` here.
 
 ```
-START → orchestrator → (conditional) → tools ─────────→ orchestrator   (ReAct loop)
-                             ↘            → subagent_fanout → responder → END
-                             ↘            → responder ↗
+START → orchestrator → (conditional) → subagent_fanout → responder → END
+                             ↘                            ↗
+                             ↘         → responder ─────↗
 ```
 
-The `tools → orchestrator` edge is conditional: it goes back for another turn
-unless the iteration budget is spent or `consecutive_invalid_tools` has hit
-`MAX_INVALID_TOOL_RETRIES` (3). A model that has been told "no tool named X"
-and asks again is not going to recover on its own, so after a few misses the
-responder answers from what is available.
+Three nodes, one direction. There is no `tools` node: the orchestrator is a
+pure router that returns `{enhanced_query, departments}` and binds no tools, so
+there is no top-level ReAct loop and no graph-level retry counter. Tool calls
+happen inside a sub-agent's own loop, bounded by that loop's iteration budget.
 
 Nodes are module-level functions, not closures:
 
 - `_local_orchestrator_node(state, config)` — pulls `thread_id` from
   `config["configurable"]`, calls `call_orchestrator`. Declared with
   `config: RunnableConfig | None` rather than a bare `dict` because LangGraph
-  type-checks that parameter and warns otherwise.
+  type-checks that parameter and warns otherwise. Builds no tool set: it used
+  to call `get_all_tools()` and pass the result to a dispatcher that ignored
+  it, paying to load the dynamic and MCP tool layers every turn for nothing.
 - `_subagent_fanout_node(state)` — builds department specs, runs
-  `asyncio.run(engine.invoke_parallel(...))`. Safe here because LangGraph runs
-  sync nodes on a worker thread with no event loop of its own. Calling this
+  `asyncio.run(engine.invoke_parallel(...))`, then folds each department's
+  token spend into `token_usage` and its file writes into `pending_writes` +
+  `audit_log`. That accounting used to live in the tools node; with spend and
+  writes now happening inside sub-agents, this is the only place the parent's
+  totals are kept. Safe to call `asyncio.run` here because LangGraph runs sync
+  nodes on a worker thread with no event loop of its own; calling this
   function from inside a running loop would fail.
 - `_responder_node(state)` — described in §2.
 - `_is_envelope(text)` and `_fallback_answer(state, query)` — the two helpers
@@ -290,9 +317,11 @@ Nodes are module-level functions, not closures:
 `get_deep_agent()` compiles once and caches in `_compiled_graph`. It compiles
 with `checkpointer=get_saver()` — the shared saver, per §4.
 
-`reset_deep_agent()` drops the cached graph and calls `agent_factory.clear_caches()`.
-Call it after editing skills, tools, or model config; otherwise the running
-process keeps the old graph. Tests call it between cases.
+`reset_deep_agent()` drops the cached graph, calls `agent_factory.clear_caches()`
+(model clients + both MCP caches), rebuilds `SUBAGENTS` from `skills/`, and
+nulls `subagents._TOOL_REGISTRY` so the next sub-agent dispatch rebuilds the
+shared tool registry. Call it after editing skills, tools, or model config;
+otherwise the running process keeps the old graph. Tests call it between cases.
 
 ### `orchestrator.py` — the dispatcher (CORE)
 
@@ -311,9 +340,11 @@ falls through to "treat the raw text as the answer".
 
 ### `routing.py` — one function (CORE)
 
-`route_from_orchestrator`. This file used to hold three more routers and a
-`max_iterations` branch that was unreachable. It is now 16 lines, and that is
-the correct size for a conditional edge over one field.
+`route_after_orchestrator`. This file used to hold three more routers and a
+`max_iterations` branch that was unreachable. It is now ~40 lines: the
+department check, a `_has_tool_calls` guard routing a stray tool-call message
+to the responder (see §2 step 2), and a `route_from_orchestrator` alias kept
+because the package `__init__` exports it.
 
 ### `state.py` — the graph state (CORE)
 
@@ -325,40 +356,51 @@ Fields, grouped by who writes them:
 
 | Field | Written by | Notes |
 |---|---|---|
-| `messages` | tools node, responder | append-only |
-| `current_plan` | `write_todos` tool | |
-| `workspace_files` | tools node | re-synced after every tool batch |
+| `messages` | responder | append-only |
+| `current_plan` | nobody | `write_todos` result stays inside the sub-agent; never synced back |
+| `workspace_files` | currently unused | was re-synced after every tools-node batch |
 | `next_message` | orchestrator | staging slot, cleared by responder |
-| `enhanced_query` | orchestrator | fixed on iteration 0 |
-| `department_targets` | orchestrator | fixed on iteration 0 |
+| `enhanced_query` | orchestrator | rewritten every turn; never carried over |
+| `department_targets` | orchestrator | rewritten every turn; never carried over |
 | `subagent_results` | fanout | cleared by responder |
-| `token_usage` | orchestrator, tools node | child spend folded in |
-| `iteration_count` / `max_iterations` | orchestrator | budget |
-| `recursion_depth` | tools node | delegation nesting level |
-| `pending_writes` | tools node | audit trail, informational |
-| `audit_log` | tools node | append-only |
+| `token_usage` | orchestrator, fanout | sub-agent spend folded in |
+| `pending_writes` | fanout | sub-agent file writes, informational |
+| `audit_log` | fanout | append-only |
 | `routing_decisions` | currently unused | kept for future routing history |
 | `review_verdict` | currently unused | legacy from the deleted reviewer pass |
 | `thread_id` | runtime config | mirrors `config["configurable"]["thread_id"]` |
+
+`iteration_count` and `max_iterations` are **not** in this table because they
+are no longer in the schema. They belonged to the top-level ReAct dispatcher
+loop that the pure-router hierarchy removed; see §12.
+
+`recursion_depth` and `consecutive_invalid_tools` were removed with the tools
+node: there is no sub-agent nesting left to bound, and no graph-level loop for
+an unknown-tool counter to cut short.
 
 The last three are legacy surface. They are cheap to keep and would be needed if
 critic or plan-checker passes come back.
 
 ### `subagent_engine.py` — parallel department dispatch (CORE)
 
-`SubAgentEngine.__init__` takes an optional registry and **defaults to
-`create_tool_registry()`**, not a bare `ToolRegistry()`. A bare registry has zero
-specs, which would leave every sub-agent with no tools and no error.
+`SubAgentEngine` has no constructor and no registry. It batches and nothing
+else.
 
-`invoke_parallel(subagents, enhanced_query, tools_registry=None)`:
+`invoke_parallel(subagents, enhanced_query)` → `dict[str, SubagentRun]`:
 - Batches by `get_max_parallel_tasks()` (default 4). Batches run in order;
   within a batch, `asyncio.gather` runs them concurrently.
 - Each sub-agent gets the same wall-clock deadline.
 - `_run_subagent` wraps the body in `asyncio.wait_for`, turning `TimeoutError`
   and any other exception into an error *string* for that sub-agent, so one
   failure never drops its siblings' results.
-- Tool visibility: `registry.get_visible_tools(name)` → `get_tool_definitions`.
-  A visibility lookup that raises is logged and yields an empty list, not a crash.
+- Departments marked `parallelizable: false` in their SKILL.md run after the
+  parallel group, one batch at a time. The deleted tools node used to make this
+  split; honouring it here is what keeps the frontmatter flag from being
+  silently ignored.
+- The engine selects no tools. It holds no registry and takes no `tool_defs`;
+  `subagents.select_department_tools` resolves each department's SKILL.md
+  allowlist. Building a `ToolRegistry` in the constructor to do so loaded every
+  MCP tool on every dispatch for a value that was only ever read back out.
 
 `_run_subagent_loop` is where a subtle performance bug lived.
 `invoke_with_retry` is a **blocking** sync call. Calling it directly inside
@@ -382,9 +424,9 @@ answers. Module-level `invoke_parallel(...)` is a module-level coroutine
 convenience wrapper — note it is `async def` now, which is a public API change
 for anything importing it from `agent_orchestrator.__init__`.
 
-### `agent_factory.py` — model clients, tracer, tools node (CORE)
+### `agent_factory.py` — model clients, tracer, cache hooks (CORE)
 
-The biggest file, three unrelated concerns:
+Three concerns, all of them infrastructure:
 
 **1. `DeepAgentTracer`** — a real `BaseCallbackHandler` recording
 `on_chat_model_start/end`, `on_llm_start/end`, `on_tool_start/end`,
@@ -406,25 +448,22 @@ The cache lives for the process and is cleared by `clear_caches()`. So a
 `.env` change requires `reset_deep_agent()`. That is the same contract as the
 graph cache and it is deliberate.
 
-**3. `local_tools_node`** — the ReAct tools node. This is where the classic
-tool-calling loop lives:
-- Non-`task` tool calls run first, sequentially, through `ToolExecutor`.
-- `task` calls are collected, checked against `get_max_subagent_depth()`, then
-  split by `is_parallelizable(subagent_type)`.
-- Parallelizable ones go into a `ThreadPoolExecutor(max_workers=min(
-  get_max_parallel_tasks(), len(independent)))`; the rest run one at a time.
-- One shared `batch_deadline` for the whole batch, so a hung batch costs one
-  timeout rather than N. `executor.shutdown(wait=False, cancel_futures=True)` —
-  a hung worker must not block the parent past the deadline.
-- Results are collected in submission order, so `ToolMessage` ordering is
-  deterministic across runs.
-- Child token usage and child file writes are folded into the parent's
-  `token_usage` and `pending_writes`. A parent's number is the whole tree's
-  spend, not just its own level.
+**3. Cache hooks** — `get_deep_agent()` here is a wrapper that ensures
+`./workspace` and `./skills` exist, then delegates to `graph.get_deep_agent()`.
+The bootstrap is kept because the Streamlit app and the write tools depend on
+those directories existing. `clear_caches()` drops the model clients and MCP
+registries; `reset_deep_agent()` clears the compiled graph too and rebuilds
+`SUBAGENTS` from `skills/`.
 
-`get_deep_agent()` here is a wrapper that ensures `./workspace` and `./skills`
-exist, then delegates to `graph.get_deep_agent()`. The bootstrap is kept because
-the `task` tool and the Streamlit app depend on those directories existing.
+This file used to own `local_tools_node`, the top-level ReAct node where the
+orchestrator called tools itself and delegated via the `task` tool. Both are
+gone with the pure-router hierarchy, which left only the concerns above. It
+also still declares a vestigial `_compiled_graph = None` global that nothing
+ever populates — `graph.py` owns the real cache — plus its own
+`reset_deep_agent` that re-exports graph's and additionally nulls the
+sub-agent tool registry. `main.py` imports the *factory's* `get_deep_agent`
+(the workspace/skills bootstrap wrapper), while `app.py` and `agent.py` import
+`graph.get_deep_agent` via the shim.
 
 ### `aggregator.py` — merge department results (CORE, small)
 
@@ -448,26 +487,29 @@ query and still be right.
 The responder logs a warning on `not approved` and aggregates anyway. Verification
 is advisory here, not a gate.
 
-### `memory.py` — skills, tools, workspace, and the long system prompt
+### `memory.py` — skills, tools, workspace, and AGENTS.md
 
-`_dir_tree_hash(directory)` walks a directory and hashes every file's relative
-path plus its mtime and size. Used to invalidate the skills cache, the dynamic
-tool cache, and the discovery cache. Same function, three call sites.
+`_dir_tree_hash` is imported from `tools_integration.discovery` — it is the
+one copy of that digest, used to invalidate the skills summary cache. (This
+module used to carry a second, subtly different version that did not sort
+`files`, so the same directory could hash two ways.)
 
-- `get_workspace_files()` — relative paths of everything under `./workspace`.
 - `get_skill_info(path)` / `get_skill_body(name)` — parse a `SKILL.md`
-  front-matter block and return metadata or body.
-- `get_skills_summary()` / `get_tools_summary(tools)` — one-line-per-item
-  summaries for the system prompt.
-- `get_memory_content()` — read `./AGENTS.md` if present.
-- `get_system_prompt(tools_dict)` — the **legacy** long planner prompt. It
-  describes the write-todos → load skill → delegate workflow, forbids `/tmp/`,
-  and requires output under `./workspace`.
+  front-matter block and return metadata or the body with the frontmatter
+  stripped (rejoining on `---`, so a `---` line inside the body survives).
+  Both route through `validate_read_path`.
+- `get_skills_summary()` — one-line-per-skill markdown summary, memoized on
+  the `skills/` tree hash so an edit invalidates it without a restart.
+- `get_memory_content()` — read `./AGENTS.md` if present. Appended to every
+  sub-agent's role prompt as well.
 
-**This prompt is not used on the live path.** The Phase 3 dispatcher prompt in
-`orchestrator.py` replaced it. It is kept because `build_role_prompt` and the
-tests still reach into this module, and because a fuller prompt is a reasonable
-starting point if the planner is ever brought back. Read it as reference.
+The legacy long planner prompt (`get_system_prompt`) is **gone** — it died
+with the old plan.py orchestrator. What remains is read-path helpers only.
+
+Two re-exports are deliberate compatibility shims: `get_workspace_files` and
+`get_workspace_root` moved to `tools_integration.guardrails` (workspace
+containment belongs beside the validators), but three modules still import
+them from here, so they stay in `__all__` until those importers are repointed.
 
 ### `subagents.py` — the sub-agent registry (CORE)
 
@@ -477,35 +519,45 @@ starting point if the planner is ever brought back. Read it as reference.
 | `kind` | Behavior | Entry point |
 |---|---|---|
 | `tool_loop` | restricted tools + `SKILL.md` prompt + a real ReAct loop | `run_tool_loop` |
-| `graph` | the full compiled graph, fresh thread | `graph.get_deep_agent()` |
 | `a2a` | HTTP call to a remote agent | `a2a_client.call_a2a_agent` |
 
-`SUBAGENTS` is assembled by `build_subagent_registry()` from three sources:
+There is no `graph` kind. A `general-purpose` spec used to run the whole
+compiled graph as a "sub-agent", which made the orchestrator its own
+sub-agent — a delegated description got routed again from the top, and the
+hierarchy stopped being one-way. The catch-all is `skills/general/SKILL.md`, a
+department like any other, chosen by the router rather than by a
+self-referential spec.
+
+`SUBAGENTS` is assembled by `build_subagent_registry()` from two sources:
 
 1. **`skills/*/SKILL.md`** via `discovery.discover_subagents` — each becomes a
    `tool_loop` spec whose `skill` names the SKILL.md (the prompt source) and
    whose `tools` come from the `allowed-tools` frontmatter. This is what makes
    `skills/` genuinely data-driven; adding a department is adding a directory.
-2. **`_RUNTIME_SUBAGENTS`** — `general-purpose` (graph, not parallelizable, alias
-   `general`). Hardcoded: it is a capability of the runtime, not a skill, and has
-   no `SKILL.md`.
-3. **`_a2a_specs()`** — remote agents from the `A2A_AGENTS` env var.
+2. **`_a2a_specs()`** — remote agents from the `A2A_AGENTS` env var.
 
 `refresh_subagents()` rebuilds it; `reset_deep_agent()` calls it.
 
 `list_departments()` is the subset that is *routable* — `tool_loop` specs backed
-by a SKILL.md. `general-purpose` is a delegation target and A2A agents are
-remote services, so neither belongs in the dispatcher's roster.
+by a SKILL.md, plus `a2a` specs. A remote agent is a sub-agent that happens to
+live behind a network hop, so the router treats it like any other department;
+it has to, since the `task` tool that used to be the only dispatcher for them
+is gone. A `tool_loop` spec with no skill is still excluded: it has no prompt
+to run a loop with.
 
 **Tool selection** (`select_department_tools`) is three stages, matching the
 documented contract: the SKILL.md `allowed-tools` allowlist is the hard limit,
 capped at 20 visible, then `relevance.sort_tools` narrows to 3-5 for the
 current query. Names that do not resolve are dropped with a warning — a stale
 name in a SKILL.md must not become a tool the model can call but never execute.
-The result is **real `BaseTool` objects**, not the metadata dicts
+A trailing `*` claims a whole `server*` namespace, which is how a department
+claims its MCP tools without naming each one in static frontmatter. The result
+is **real `BaseTool` objects**, not the metadata dicts
 `get_tool_definitions` returns; resolving names back to callables is what makes
 the shortlist bindable at all. A failing sorter falls back to the capped
-allowlist.
+allowlist. The sub-agent does not pick its own tools — this function is the
+single filter. (If the allowlist is 5 tools or fewer the shortlist step is
+skipped entirely — there is nothing to rank.)
 
 **Budget exhaustion is reported, not swallowed.** When `run_tool_loop` runs out
 of turns, the last model message is usually another tool call whose content is
@@ -513,15 +565,14 @@ of turns, the last model message is usually another tool call whose content is
 subagent found nothing" and leaves it to redo the whole task. The loop instead
 reports the truncation, the tools it called, and the files it wrote.
 
-`SUBAGENTS` is the single source of truth. It drives the `task` tool's
-`subagent_type` enum, the dispatch in `tools._execute_task`, the
-parallel-vs-sequential split, and role prompts. Adding a sub-agent is adding one
-dict entry.
+`SUBAGENTS` is the single source of truth. It drives the dispatcher's roster,
+the executor choice in `subagent_engine`, the parallel-vs-sequential split, and
+role prompts. Adding a sub-agent is adding a directory or a config entry.
 
-The module calls `load_dotenv()` itself. This is load-order surgery: the
-`task` tool's type enum is built statically at import time from `SUBAGENTS`, and
-the import chain (`tools` → `subagents`) runs before `agent_factory`'s
-`load_dotenv()`. The cost is that changing `A2A_AGENTS` needs a process restart.
+The module calls `load_dotenv()` itself. This is load-order surgery: the roster
+the router sees is built statically at import time from `SUBAGENTS`, and the
+import chain runs before `agent_factory`'s `load_dotenv()`. The cost is that
+changing `A2A_AGENTS` needs a process restart.
 
 `COMPLETION_CONTRACT` is the shared closing instruction for every tool-loop
 sub-agent: save to the exact path named in the task, never `/tmp/`, never a
@@ -530,29 +581,63 @@ end with a short summary of what was written.
 
 `build_role_prompt(spec)` = contract + the spec's `SKILL.md` body + `AGENTS.md`.
 
-`run_tool_loop(prompt, description, tools, max_iterations=10)` is the real ReAct
+`run_tool_loop(prompt, description, tools, max_iterations)` is the real ReAct
 loop: bind tools, invoke, execute any tool calls, append results, repeat until
 the model answers without tool calls or the budget runs out. Returns
-`(final_text, usage, write_ops)`. On budget exhaustion it returns the last AI
-message's text rather than an error, so a chatty sub-agent still contributes
-something.
+`(final_text, usage, write_ops)`. Two details inside it:
 
-### `guardrails.py` — filesystem containment (CORE for safety)
+- **Every tool call dispatches through `ToolRegistry.dispatch`** via a small
+  `_ToolDispatcher` adapter (it exists because `invoke_with_retry` expects an
+  object with `.invoke(payload)`). The bound `tool_map` decides what the
+  sub-agent *may* call; the registry validates the payload and picks the
+  transport. The registry itself is built once per process
+  (`_registry_for`, module-level `_TOOL_REGISTRY`) so dynamic and MCP tools
+  are not reloaded per sub-agent per turn; a tool the registry has never seen
+  is registered on the spot, so a bound tool is never silently uncallable.
+  This is the only tool-call site in the repo.
+- **Budget exhaustion is reported, not swallowed.** When the loop runs out of
+  turns, the last model message is usually another tool call whose content is
+  `""`. Returning that hands the parent an empty string, which reads as "the
+  subagent found nothing" and leaves it to redo the whole task. The loop
+  instead reports the truncation, the tools it called, and the files it wrote.
 
-Every file tool routes through here.
+**This loop is the only place in the system with an iteration budget.**
+`run_department` passes `AGENT_MAX_ITERATIONS` (default 25) when the caller does
+not override it, so that setting bounds a sub-agent's tool turns and nothing
+else. The orchestrator has no budget because it does not iterate.
 
-- `get_workspace_root()` — the `./workspace` `Path`.
-- `validate_and_normalize_path(path, must_be_in_workspace=False)` — resolve,
-  then confirm the resolved path is inside an allowed root. Symlinks are
-  resolved before the check, so a symlink pointing out of the workspace is
-  rejected. Known caveat: there is a TOCTOU window between the check and the
-  `open()`. Fine for a local agent, not fine for a multi-tenant service.
-- `validate_read_path(path)` — read is wider than write: `AGENTS.md`, plus
-  anything under `./workspace` or `./skills`.
-- `clear_workspace()` — used by the Streamlit sidebar reset button.
+### `tools_integration/guardrails.py` — filesystem containment (CORE for safety)
+
+Every file tool routes through here. It lives in `tools_integration` because
+that is the layer the file tools execute in; `agent_orchestrator` imports
+down from it, never the reverse. (`agent_orchestrator.memory` re-exports
+`get_workspace_files`/`get_workspace_root` for its remaining importers.)
+
+- `get_workspace_root()` — the `WORKSPACE_ROOT` (default `./workspace`) path,
+  resolved, read at call time.
+- `validate_and_normalize_path(path, must_be_in_workspace=False, strict=False)`
+  — normalize, then confirm the resolved target *and every parent component*
+  stays under its authorized root, so a symlink anywhere in the chain cannot
+  move the target out. An existing target must be a regular file.
+  `must_be_in_workspace=True` (the write path) allows `workspace/` as a
+  logical alias even when `WORKSPACE_ROOT` is set elsewhere; out-of-root
+  absolute/traversal writes fall back to the safe basename rather than
+  erroring, unless `strict=True` rejects them outright. Reads must use
+  `validate_read_path`, not this helper.
+- `validate_read_path(path)` — read is wider than write: `AGENTS.md` (only if
+  not itself a symlink), plus anything under `./workspace` or `./skills`.
+  Root selection precedes resolution, so a workspace symlink cannot grant
+  access to skills or repo files.
+- `get_workspace_files()` — workspace listing relative to the configured root;
+  walks without following directory symlinks and re-validates each hit.
+- `clear_workspace()` — used by the Streamlit sidebar reset button. Unlinks
+  top-level files and links only; directories remain.
 
 The invariant: **reads** may touch `AGENTS.md`, `workspace/`, `skills/`;
-**writes** may only touch `workspace/`.
+**writes** may only touch `workspace/`. Known caveat, stated in the code: this
+is resolved-path containment, not protection against adversarial filesystem
+mutation between check and I/O (TOCTOU). Fine for a local agent, not fine for
+a multi-tenant service.
 
 ### Deleted files, still referenced in git history
 
@@ -581,48 +666,35 @@ Ten built-ins, all defined with LangChain's `@tool` decorator so the docstring
 
 | Tool | What it does |
 |---|---|
-| `write_todos` | records a plan; result folded into `current_plan` |
+| `write_todos` | records a plan; result stays inside the sub-agent's loop |
 | `internet_search` | Tavily; needs `TAVILY_API_KEY`; returns 300-char snippets |
 | `read_file` | via `validate_read_path` |
 | `write_file` | via `validate_and_normalize_path(must_be_in_workspace=True)` |
 | `edit_file` | string replace in a workspace file |
-| `list_files` | workspace listing |
+| `list_files` | workspace listing (via `guardrails.get_workspace_files`) |
 | `search_files` | substring search across workspace, capped at 30 matches |
 | `fetch_url` | full page text via `fetch_public_url` |
-| `task` | delegate to a sub-agent |
 | `list_tools` | discovery — the model can ask what it can do |
+
+There is no `task` tool. It used to live here, which forced three lazy upward
+imports from the tool layer into `agent_orchestrator` and made the one-way
+hierarchy unenforceable. It moved to `agent_orchestrator.task_tool` and has
+since been deleted along with the sub-agent-to-sub-agent delegation it served.
 
 Note the pattern in every file tool: validate, then return a **string** on
 error. Tools return strings here, not raise, so one failed call does not kill
-the loop. (`_execute_task` is the deliberate exception — it must not run
-outside the tools node, so it refuses loudly.)
+the loop.
 
-`task` is built by hand rather than with a plain decorator, because its
-`subagent_type` parameter is a `Literal` generated from `SUBAGENTS.keys()` and
-its docstring is generated from the same registry. Adding a sub-agent updates
-the tool schema automatically. Direct invocation returns an error string —
-the depth guard lives in `local_tools_node`, which has the graph state, so
-bypassing it would break the recursion limit.
+Dispatching to a department is not this layer's job. `subagent_engine` picks an
+executor from the spec's `kind`: `tool_loop` runs `run_department` locally,
+`a2a` calls `call_a2a_agent` with the SDK imported lazily so it stays off the
+import path until used. A remote agent reports no local token usage and writes
+no local files, so its `SubagentRun` carries neither — by design, not an
+oversight.
 
 `FETCH_URL_TIMEOUT_SECONDS = 15` and `FETCH_URL_MAX_BYTES = 1_000_000` sit next
 to `fetch_url` on purpose: the size cap is what keeps a 200 MB response from
 landing in the model's context.
-
-**`_execute_task`** is the dispatch:
-
-- resolve the spec (unknown type → error string listing valid types),
-- `tool_loop` → restricted toolset from `spec.tools`, `run_tool_loop` with
-  `build_role_prompt(spec)`,
-- `a2a` → `call_a2a_agent(spec.url, description)`, importing the SDK lazily so
-  it stays off the import path until used. A remote agent reports no token usage
-  and its file writes are invisible, so both come back empty — by design,
-  not an oversight,
-- `graph` → the full compiled graph on a **fresh** thread
-  (`subagent-<uuid>`). Reusing the parent's thread would merge child state into
-  the parent checkpoint and back.
-
-The graph branch returns the last **non-empty AIMessage**, not `messages[-1]`,
-which could be a `ToolMessage`.
 
 **`load_dynamic_tools(tools_dir)`** loads `@tool` functions from every `.py`
 under `./tools` using `importlib.util.spec_from_file_location` — nothing is
@@ -642,26 +714,82 @@ Collisions are logged; the higher-precedence tool wins. This ordering is the
 reason a file in `./tools/` cannot shadow `read_file`.
 
 **`create_tool_registry()`** turns `get_all_tools()` into a populated
-`ToolRegistry`, unwrapping `tool.func` for `StructuredTool` instances.
+`ToolRegistry`, registering the `BaseTool` object itself — not `tool.func`.
+The object carries the `args_schema` that validates a payload and the `kind`
+that selects a transport, and both are lost if you keep only the function.
+Configured `A2A_AGENTS` are registered too, as `kind="a2a"` tools.
 
-### `registry.py` — specs, visibility, risk (CORE)
+### `validation.py` — the payload contract (CORE)
 
-`ToolRegistry` holds two dicts: specs and callables.
+Every tool call carries a payload the model produced, and it has to match the
+tool's parameter spec or the call is wrong. This module is where that is
+enforced.
 
-- `register_builtin(name, callable_, risk_level="low")` — the path used for
-  built-ins; description comes from the function's docstring.
+- `normalize_schema(schema)` — turns a raw JSON Schema **dict** into a Pydantic
+  model. This exists because **langchain-core does not validate a `dict`
+  `args_schema` at all** (`_parse_input` returns the input unchanged), and MCP
+  describes every one of its tools with exactly that. A `@tool` built-in
+  already has a model, so it passes through untouched. Handles `required`,
+  nested objects, arrays, and enums; degrades to returning the input unchanged
+  for a schema it cannot model, so a broken schema stays callable.
+- `validate_args(schema, args)` — raises `ValueError` naming the offending
+  field. **Rejection, not coercion:** a payload the model did not intend is
+  never quietly repaired.
+- `prune_unset(validated)` — drops `None`s that exist only because a field has
+  a default. langchain passes along every field that has one, so a normalized
+  schema would otherwise turn an omitted optional into an explicit `null` at the
+  server.
+- `ValidatedTool` — mixin validating the *raw* input. Needed because
+  `_to_args_and_kwargs` short-circuits ("StructuredTool with no args") for a
+  fieldless model and never parses, so a no-arg tool would otherwise discard
+  whatever it was handed instead of refusing it.
+
+### `registry.py` — selection, dispatch, risk (CORE)
+
+`ToolRegistry` holds three dicts: specs, callables, and the registered tool
+objects (`_tools`, which is what dispatch needs).
+
+- `register_builtin(name, callable_, risk_level="low", ...)` — the path used
+  for built-ins; description comes from the tool or its docstring.
 - `get_tools_for_role(role)` — everything with no `allowed_roles`, or with this
-  role, or with `*`.
-- `get_visible_tools(subagent_name)` — **capped at 20.** `general-purpose` gets
-  the first 20 specs; anything else is filtered by role first. The 20 is the
-  sub-agent context budget from `CLAUDE.md`.
+  role, or with `*`. This is a separate concern from sub-agent visibility: it
+  answers "may this role see the tool", and `dispatch()` takes the same role
+  argument.
 - `get_tool_definitions(names)` — the JSON-schema-shaped dicts the LLM ranks.
-- `_validate_args` — currently a `logger.debug` no-op. The real gate is
-  LangChain's own schema check before the call. Do not assume this validates
-  anything.
-- `execute(...)` — resolves the callable, checks the risk tier and approval flag,
-  calls through.
+- `select_for_query(allowed, query, max_tools)` — the registry's half of the
+  department filter: resolves names to real tools, drops unknown names with a
+  warning, and narrows to `max_tools` by relevance. `subagents.select_department_tools`
+  calls it and remains the single place a department's tools are decided; it
+  owns the allowlist, `prefix*` namespace matching, and the 20-tool cap.
+  Two fallbacks are deliberate: a sorter that *reached* but named nothing
+  usable yields a bounded slice, while a sorter that *could not be reached*
+  returns the full allowlist — shrinking it would look like a relevance
+  decision that never happened.
+- `kind_of(name)` — the transport, read off the tool object first (an MCP tool
+  is constructed with `kind="mcp"`), falling back to the spec. An unrecognized
+  kind is logged and treated as local.
+- `dispatch(name, args, subagent_name="")` — **the single execution entry
+  point.** Validates, checks approval and role, then routes by kind: `local`
+  and `mcp` both end at the tool's own `invoke` (an MCP tool is already a
+  sync-wrapped object by then), `a2a` serializes the validated args to JSON in
+  the message body, since A2A carries text rather than a structured payload.
+  Validation happens *before* the transport is chosen: a malformed payload is
+  the same mistake whichever protocol would have carried it.
+- `execute(...)` — retained for `executor.ToolExecutor`; equivalent to
+  `dispatch`.
 - `RequiresApprovalError` — raised for high-risk tools.
+
+There is no `get_visible_tools(subagent_name)`. It resolved a department's
+tools by role behind a 20-tool cap, and nothing ever bound the result — a
+second, weaker filter running beside
+`subagents.select_department_tools`, which resolves the SKILL.md allowlist
+instead. Deleting it leaves the allowlist the one place a sub-agent's tools are
+decided.
+
+`ToolKind` (in `src/types.py`) is the discriminator — `local` / `mcp` / `a2a`.
+There is deliberately **no `http` member**: no such tool type exists, and
+adding one is a genuine SSRF surface needing scheme checks, private-IP
+rejection, and reuse of `research_fetch`'s guardrails.
 
 ### `executor.py` — risk-tiered execution (CORE)
 
@@ -669,12 +797,18 @@ A thin wrapper over the registry, present mostly so the policy is in one place
 and the call site names a tier rather than re-implementing the checks. Tiers:
 `low` executes directly, `medium` validates then executes, `high` raises
 `RequiresApprovalError`. `execute` is `async`; `execute_sync` wraps it with
-`asyncio.run`, which is what `local_tools_node` calls.
+`asyncio.run`.
+
+**The tiers are declared but not active.** `dispatch` enforces `requires_approval`
+and `allowed_roles`, but `create_tool_registry` registers every tool with
+`allowed_roles=("*",)` and no tool declares `requires_approval`, so no call is
+actually gated. The hooks work; the policy does not exist yet. Which tools
+*should* gate is a decision, not a refactor.
 
 ### `decorator.py` — `@tool_spec` (CORE)
 
 Attaches `ToolSpecMetadata` (name, description, `risk_level`, `requires_approval`,
-`allowed_roles`) as a `__tool_spec__` attribute. It does not change the
+`allowed_roles`, `kind`) as a `__tool_spec__` attribute. It does not change the
 function. Stack it under `@tool`, as `tools/sample_tool.py` does:
 
 ```python
@@ -706,8 +840,13 @@ by relevance. `_extract_tool_names` scans for the first `[` and last `]`.
 Every failure path degrades to `tool_defs[:max_tools]` — first-N, unranked —
 rather than raising. A sort failure must not stop a sub-agent from working.
 
-`args_schema` is stripped before sending: it is large and the model only needs
-names and descriptions to rank.
+Each candidate is sent with its **parameter spec** as well as its name and
+description, under a `"parameters"` key. It is choosing from up to 20 tools, and
+the sorter cannot tell two same-named tools apart without knowing what each one
+accepts. `_render_schema` converts a Pydantic `args_schema` back to JSON Schema
+and truncates at `MAX_SCHEMA_CHARS = 400` so one verbose spec cannot crowd the
+rest of the roster out; the rendered form is prompt-only, and the returned
+entries are still the caller's own dicts.
 
 ### `research_fetch.py` — SSRF-safe URL fetch (CORE for safety)
 
@@ -745,10 +884,27 @@ Both wrap each MCP tool as a sync `StructuredTool`, because
 serialized server config; `clear_mcp_tools_cache()` invalidates.
 `agent_factory.clear_caches()` clears both copies.
 
-One subtlety in the wrapper: `args_schema` is carried over verbatim (MCP
-supplies a raw JSON Schema), but `response_format` is deliberately *not* set.
-The wrapper's `func` already returns unwrapped content, and declaring
-`content_and_artifact` would unpack it a second time.
+Three things happen in the wrapper that are easy to miss:
+
+- **The schema is normalized, not carried over.** MCP supplies a raw JSON Schema
+  dict, and langchain-core skips validation entirely for a dict `args_schema` —
+  `{"employee_id": 12345}` would go straight to the server. `normalize_schema`
+  turns the dict into a Pydantic model so an MCP tool holds the same payload
+  contract as a built-in. `MCPTool` also validates the *raw* input in `run`,
+  because langchain-core short-circuits parsing for a fieldless model and would
+  otherwise discard a no-arg tool's arguments without looking at them.
+- **Omitted optionals are pruned.** langchain-core injects a default for every
+  field that has one, so absent optionals arrive as explicit `null`;
+  `prune_unset` strips them before the call so the server receives the payload
+  that was actually asked for.
+- **Results are unwrapped.** A real server returns content blocks
+  (`[{"type": "text", ...}]`); `_unwrap_mcp_result` joins the text and names any
+  non-text block rather than dropping it. `response_format` is deliberately
+  *not* set — the `func` already returns plain text, and declaring
+  `content_and_artifact` would unpack it a second time.
+
+Both loaders now delegate to `mcp_client._to_sync_tool`, so this behavior holds
+regardless of which import you use.
 
 ### `a2a_client.py` and `a2a_bridge.py` — remote agents over A2A
 
@@ -868,59 +1024,77 @@ A shim so `main.py` and `app.py` can do `from agent import get_deep_agent`
 without importing a deep service path. Also the single place to swap in a
 different graph implementation for a test.
 
-### `main.py` — CLI REPL
+### `main.py` — CLI (151 lines)
 
-Mints `cli-<uuid>` once, then loops: read input, send only the new message with
-`iteration_count: 0`, print the last `AIMessage`, print total tokens and this
-turn's iteration count. Handles `EOFError`/`KeyboardInterrupt` and `exit`/`quit`.
-About 48 lines; read it as the reference for correct invocation.
+More than a REPL now. `uv run python main.py` mints `cli-<uuid>` once and
+loops: read input, send only the new message, log every intermediate message
+(tool calls and results included), print the last `AIMessage` and total
+tokens. Flags:
 
-### `app.py` — Streamlit UI (364 lines)
+- a bare argument list runs **one-shot** — `uv run python main.py "count the
+  words"` runs a single query and exits;
+- `--tools` prints the tool registry (name, risk, roles) and exits;
+- `--debug` turns on verbose per-message logging.
+
+Logging goes to stdout *and* `deep_agent.log` (best-effort — an OSError falls
+back to stdout only). `httpx`/`httpcore`/`urllib3` are silenced to WARNING so
+third-party HTTP chatter does not drown the turn log.
+
+### `app.py` — Streamlit UI (356 lines)
 
 Calls `agent.stream(..., stream_mode="updates")` and renders each node's state
 delta live, which is why you can watch the graph work.
 
-Sidebar panels: governance (iteration count, token usage, current node), active
-skills (from `get_skill_info`), audit log, system status, shared memory
-(`AGENTS.md`), and a workspace file browser. `clear_workspace()` is wired to a
-reset button.
+Sidebar panels: governance (token usage, current node), active skills (from
+`get_skill_info`), audit log, system status, shared memory (`AGENTS.md`), and a
+workspace file browser. `clear_workspace()` is wired to a reset button.
 
 State lives in `st.session_state`: `messages`, `current_plan`,
 `workspace_files`, `audit_log`, `token_usage`, `last_action`, `current_node`,
-`iteration_count`, and one `thread_id` minted at startup.
+and one `thread_id` minted at startup.
 
-The one rule to copy if you build another UI: send only the new message and
-reset `iteration_count` every turn. The checkpointer holds the rest.
+The one rule to copy if you build another UI: send only the new message. The
+checkpointer holds the rest, under `thread_id`.
 
 ---
 
 ## 9. Content files and the not-in-use code
 
-### `skills/research/SKILL.md`
+### `skills/` — seven departments, all data-driven
 
-YAML front matter (`name`, `description`, `license`, `compatibility`,
-`allowed-tools`) then markdown body: the research procedure (search → `fetch_url`
-the promising pages → alternate queries if thin), the workspace discipline
-(`list_files` before writing, never guess a path another sub-agent may have
-taken), and a completion contract (summary, key facts, sources, confidence
-score). Worked example at the end.
+`general`, `hr`, `marketing`, `operations`, `research`, `sales`, `writer` —
+each a directory with one `SKILL.md`. Same shape in every file: YAML
+frontmatter (`name`, `description`, `allowed-tools`, `parallelizable`) then a
+markdown body that becomes the sub-agent's system prompt.
 
-### `skills/writer/SKILL.md`
+The notable ones:
 
-Same shape. Reads notes from the workspace, outlines, matches tone to audience,
-writes GitHub-flavored markdown to a workspace file. Completion contract names
-the saved path, the outline, and the tone.
+- **`general`** is the router's fallback destination and is marked
+  `parallelizable: false` — it runs alone, after the parallel group. Its body
+  branches on turn kind: greeting/small talk (no tools), off-topic questions
+  (polite refusal), then real work.
+- **`hr`** shows the MCP namespace claim: its allowlist is
+  `workday_*, read_file, write_file, ...` — the `workday_*` prefix claims
+  every tool of a configured `workday` MCP server without naming them in
+  static frontmatter.
+- **`research` / `writer`** are the original pair: search → `fetch_url` →
+  workspace notes, and outline → tone-matched draft with a named completion
+  contract.
 
-Both are on the live path — `build_role_prompt` reads them for `tool_loop`
-sub-agents. Adding a `skills/<name>/SKILL.md` plus one `SUBAGENTS` entry is the
-whole extension story.
+The `description` frontmatter is the only signal the router has for choosing
+a department, so it is the part worth writing well. Adding a department is
+adding a directory.
 
-### `tools/sample_tool.py` — the extension template (19 lines)
+### `tools/sample_tool.py` and `tools/text_stats.py`
 
-`get_current_time`, decorated `@tool` over `@tool_spec` with `risk_level="low"`.
-Copy this file, change the function, and it is discovered on the next
-`get_all_tools()`. Note it imports `pytz` inside the function body, so a missing
-optional dependency does not break module load for every other tool.
+`sample_tool.py` is 19 lines: `get_current_time`, decorated `@tool` over
+`@tool_spec` with `risk_level="low"`. `text_stats.py` is the fuller reference
+— dependency-free, documented for the model (the docstring *is* the tool
+schema), and noting that the name must not collide with a built-in since
+dynamic tools lose the precedence fight. Copy either, change the function,
+and it is discovered on the next `get_all_tools()`. Note `sample_tool` imports
+`pytz` inside the function body, so a missing optional dependency does not
+break module load for every other tool.
 
 ### `AGENTS.md` — dual purpose
 
@@ -951,12 +1125,13 @@ implementation; it does not run and nothing imports it.
 
 ### `workspace/` — git-tracked sample output
 
-Six markdown files: `research_notes.md`, `notes_1.md`, `notes_3.md`,
-`notes_23.md`, `multi_agent_research.md`, `research_multi_agent_systems.md`.
-These are real agent output, committed as examples. `CLAUDE.md` says memory
-files are `SKILL.md` only and there is no per-session `AGENTS.md`; `workspace/`
-is scratch output, not memory. A test or the Streamlit reset button can clear
-it — the reset button deletes the contents, not the directory.
+Eight markdown files (`a.md`, `notes.md`, `research_notes.md`, `notes_1.md`,
+`notes_3.md`, `notes_23.md`, `multi_agent_research.md`,
+`research_multi_agent_systems.md`). These are real agent output, committed as
+examples. `CLAUDE.md` says memory files are `SKILL.md` only and there is no
+per-session `AGENTS.md`; `workspace/` is scratch output, not memory. A test or
+the Streamlit reset button can clear it — the reset button deletes the
+contents, not the directory.
 
 ### `app_new.log`
 
@@ -979,10 +1154,10 @@ Everything is env-var driven. There is no config file.
 | `*_MODEL` | `agent_factory` | per-provider model id override |
 | `TAVILY_API_KEY` | `tools.internet_search` | missing → tool returns a setup message, not a crash |
 | `OBSERVABILITY` | `agent_factory` | `=1` attaches `DeepAgentTracer` |
-| `AGENT_MAX_ITERATIONS` | `orchestrator` | per-turn dispatcher budget |
-| `AGENT_MAX_SUBAGENT_DEPTH` | `tools` node | delegation nesting cap |
-| `MAX_PARALLEL_TASKS` | `subagent_engine`, tools node | concurrency cap |
-| `SUBAGENT_TIMEOUT_SECONDS` | both | wall-clock guard, shared per batch |
+| `AGENT_MAX_ITERATIONS` | `subagents.run_department` | per-sub-agent ReAct turn budget |
+| `AGENT_MAX_SUBAGENT_DEPTH` | *(unused)* | no sub-agent nesting left to bound |
+| `MAX_PARALLEL_TASKS` | `subagent_engine` | concurrency cap |
+| `SUBAGENT_TIMEOUT_SECONDS` | `subagent_engine` | wall-clock guard, shared per batch |
 | `MCP_SERVERS` | `mcp_client` | JSON object of server connections |
 | `A2A_AGENTS` | `subagents` | JSON object; **needs a process restart** |
 
@@ -993,17 +1168,18 @@ second call if you add a module that must see `.env` at import time.
 
 ## 11. Tests
 
-392 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
+447 tests, `testpaths=["tests"]`, `pythonpath=["."]`.
 
 Layout mirrors `src/`:
 
 ```
 tests/
 ├── fake_models.py                       ScriptedChatModel
+├── fixtures/mcp_server.py               a real MCP server for the live test
 ├── test_a2a.py  test_async_bridge.py  test_config.py
-├── test_delegation.py  test_guardrails.py  test_mcp.py
-├── test_observability.py  test_research_fetch.py
-├── test_state.py  test_subagents.py  test_tools.py  test_utils.py
+├── test_delegation.py  test_guardrails.py  test_mcp.py  test_mcp_live.py
+├── test_observability.py  test_research_fetch.py  test_state.py
+├── test_subagents.py  test_tools.py  test_utils.py  test_validation.py
 └── services/
     ├── agent_orchestrator/   test_aggregator, test_graph, test_orchestrator,
     │                         test_routing, test_subagent_engine, test_verification
@@ -1022,8 +1198,13 @@ tests assert call counts, which is how the wasted-second-dispatcher-call
 regression was caught. It must scan all messages, not just the first, because
 Phase 3 nodes pass dict-form messages.
 
-Current baseline: **370 pass, 0 fail.** ruff reports 87 findings and mypy 22
-errors, all pre-existing and none in the files touched most recently. Run
+Two suites sit slightly apart: `test_validation.py` (the payload-contract
+module and the MCP wrapper's validation behavior) and `test_mcp_live.py`
+(spins up `tests/fixtures/mcp_server.py` and exercises a real MCP round trip
+— everything else fakes the transport).
+
+Current baseline: **447 pass, 0 fail.** ruff reports 93 findings (53
+auto-fixable) and mypy 11 errors in 4 files, all pre-existing. Run
 `uv run ruff check .` and `uv run mypy src` to see the current numbers rather
 than trusting these.
 
@@ -1051,13 +1232,34 @@ inside a coroutine.
 **`subagent_results` must be cleared by the responder.** It is checkpointed
 state. A leftover value is replayed as the next turn's answer.
 
+**Do not put a counter in parent state.** This is the bug that shipped. The
+orchestrator used to keep a checkpointed `iteration_count` and force
+`departments = []` once it passed a maximum — a guard belonging to the
+top-level ReAct dispatcher loop that the pure-router hierarchy had already
+removed. Because the counter was checkpointed, it carried across turns on a
+reused thread: **turn 2 of every conversation** saw a non-zero count, dropped
+its departments, and answered "I could not route this request" while quoting
+turn 1's query.
+
+It survived a green suite for two reasons, both worth remembering. Both entry
+points passed `iteration_count: 0` on every invoke, compensating at the call
+site. And the one multi-turn graph test sent a full initial state each turn,
+which reset the counter the same way. A regression test has to reuse the
+thread and send *only* the new message, the way the CLI and Streamlit do —
+that is `test_delegation.py::TestMultiTurnRouting`.
+
+The general rule: a value that persists in checkpointed state persists across
+turns. Per-turn values do not belong there, and a "safety" counter is worse
+than none, because it fires on turn two of every conversation and looks like a
+routing failure.
+
 **A test that never sends a user message proves nothing.** `tests/.../test_graph.py::_initial_state`
 used to drop its argument and build `messages: []`, which is why a real memory
 bug survived a fully green suite. When you touch graph tests, check that the
 state builder actually uses the message you pass it.
 
-**`A2A_AGENTS` changes need a restart.** The `task` tool's type enum is built at
-import time.
+**`A2A_AGENTS` changes need a restart.** `subagents.SUBAGENTS` is a module-level
+dict assembled at import time from the configured agents plus `skills/`.
 
 **There are two `load_mcp_tools` and two `call_a2a_agent`.** The package
 `__init__` exports the *bridge* versions; `tools.py` uses the *client* versions.
