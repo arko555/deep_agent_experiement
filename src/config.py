@@ -55,20 +55,6 @@ def get_max_iterations() -> int:
     return _env_int("AGENT_MAX_ITERATIONS", 25)
 
 
-def get_max_subagent_depth() -> int:
-    """Maximum subagent nesting level.
-
-    Removed from use with the ``task`` delegation path, which was the only
-    thing that nested sub-agents. There is no nesting left to bound: a
-    sub-agent's tool loop is capped by its own iteration budget
-    (``get_max_iterations``), and the router never calls a sub-agent from
-    inside a sub-agent. Kept because ``AGENT_MAX_SUBAGENT_DEPTH`` is a
-    documented environment variable, so a deployment setting it should not
-    break, and so re-introducing nesting has a knob waiting for it.
-    """
-    return _env_int("AGENT_MAX_SUBAGENT_DEPTH", 3)
-
-
 def get_max_parallel_tasks() -> int:
     """Concurrency cap for independent research/writer subagent tasks."""
     return max(1, _env_int("MAX_PARALLEL_TASKS", 4))

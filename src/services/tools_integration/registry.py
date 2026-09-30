@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from src.services.tools_integration.decorator import ToolSpecMetadata
 from src.services.tools_integration.validation import validate_args
-from src.types import ToolKind, ToolSpec
+from src.types import ToolKind
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class ToolRegistry:
         # correct relevance decision that never happened.
         return shortlist or resolved[:max_tools]
 
-    def register(self, spec: ToolSpec | ToolSpecMetadata, callable_: Any | None = None) -> None:
+    def register(self, spec: ToolSpecMetadata, callable_: Any | None = None) -> None:
         """Register a tool spec and optionally the tool object itself.
 
         ``callable_`` is normally a ``BaseTool``: it carries the ``args_schema``
@@ -126,26 +126,15 @@ class ToolRegistry:
         it. A bare function is still accepted and stored, but a tool
         registered that way cannot be schema-checked.
         """
-        if isinstance(spec, ToolSpec):
-            metadata = ToolSpecMetadata(
-                name=spec.name,
-                description=spec.description,
-                risk_level=spec.risk_level,
-                requires_approval=spec.requires_approval,
-                allowed_roles=tuple(spec.allowed_roles),
-                kind=spec.kind,
-            )
-        else:
-            metadata = spec
-        self._specs[metadata.name] = metadata
+        self._specs[spec.name] = spec
         if callable_ is not None:
-            self._callables[metadata.name] = callable_
+            self._callables[spec.name] = callable_
             # Stored unconditionally. `args_schema` and `kind` are read with
             # getattr, so a bare function is usable — it just has no schema to
             # validate against and takes its declared kind. Gating on
             # `hasattr(args_schema)` would make such a tool unselectable,
             # which is worse than selecting something that validates nothing.
-            self._tools[metadata.name] = callable_
+            self._tools[spec.name] = callable_
 
     def get_spec(self, tool_name: str) -> ToolSpecMetadata | None:
         """Return the spec for a tool, or None if unregistered."""
@@ -295,7 +284,7 @@ class ToolRegistry:
             raise ValueError(f"A2A tool '{tool_name}' has no configured agent URL")
 
         message = json.dumps(args, sort_keys=True, default=str)
-        return call_a2a_agent(url, message, timeout=getattr(spec, "timeout_seconds", None))
+        return call_a2a_agent(url, message)
 
     def list_tools(self) -> list[str]:
         """Return all registered tool names."""

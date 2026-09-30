@@ -12,7 +12,7 @@ from src.services.tools_integration.registry import (
     RequiresApprovalError,
 )
 from src.services.tools_integration.decorator import ToolSpecMetadata
-from src.types import ToolKind, ToolSpec
+from src.types import ToolKind
 
 
 # ---------------------------------------------------------------------------

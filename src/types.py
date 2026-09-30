@@ -1,8 +1,6 @@
 """Shared type definitions for the three-service architecture."""
 
-from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Optional
 
 
 class ToolKind(StrEnum):
@@ -34,16 +32,3 @@ class ToolKind(StrEnum):
     MCP = "mcp"
     A2A = "a2a"
 
-
-@dataclass
-class ToolSpec:
-    """Metadata attached to a tool via @tool_spec."""
-
-    name: str
-    description: str
-    risk_level: str = "low"          # "low" | "medium" | "high"
-    requires_approval: bool = False
-    allowed_roles: list = field(default_factory=list)
-    kind: ToolKind = ToolKind.LOCAL
-    handler: Optional[Any] = None
-    timeout_seconds: int = 600

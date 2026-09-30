@@ -28,7 +28,7 @@ def tool_spec(
     allowed_roles: Optional[tuple] = None,
     kind: ToolKind = ToolKind.LOCAL,
 ):
-    """Decorator that attaches ToolSpec metadata to a tool function.
+    """Decorator that attaches tool metadata to a tool function.
 
     Applied to @tool-decorated functions to register them in
     ToolRegistry with risk-tier and role-scoping information.
