@@ -418,9 +418,9 @@ def select_department_tools(
        query, so a department is handed the tools its current task needs
        rather than its whole declared set.
 
-    The return value is real ``BaseTool`` objects. ``get_tool_definitions``
-    returns metadata only, so resolving names back to callables here is what
-    makes the sub-agent able to actually *call* what it was offered.
+    The return value is real ``BaseTool`` objects, not metadata dicts —
+    resolving names back to callables is what makes the sub-agent able to
+    actually *call* what it was offered.
 
     Stage 3 delegates to ``ToolRegistry.select_for_query``, which owns the
     relevance shortlist; this function owns the allowlist, namespace matching,

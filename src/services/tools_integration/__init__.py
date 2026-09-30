@@ -8,8 +8,6 @@ Key components:
 - ``ToolRegistry`` — central registry with risk metadata,
   role-based visibility (≤20 tools per sub-agent), and
   schema validation.
-- ``ToolExecutor`` — risk-tiered execution (low/direct,
-  medium/validate+execute, high/approval gate).
 - ``@tool_spec`` — decorator for attaching risk, role, and
   approval metadata to tools.
 - ``discover_subagents`` — scan ``skills/*/SKILL.md`` for
@@ -20,7 +18,6 @@ Key components:
 """
 
 from src.services.tools_integration.registry import ToolRegistry, RequiresApprovalError
-from src.services.tools_integration.executor import ToolExecutor
 from src.services.tools_integration.relevance import sort_tools
 from src.services.tools_integration.discovery import discover_subagents
 from src.services.tools_integration.decorator import tool_spec, ToolSpecMetadata
@@ -30,7 +27,6 @@ from src.services.tools_integration.a2a_client import call_a2a_agent
 
 __all__ = [
     "ToolRegistry",
-    "ToolExecutor",
     "RequiresApprovalError",
     "sort_tools",
     "discover_subagents",

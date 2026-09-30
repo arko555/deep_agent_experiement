@@ -151,10 +151,6 @@ class ToolRegistry:
         """Return the spec for a tool, or None if unregistered."""
         return self._specs.get(tool_name)
 
-    def get_callable(self, tool_name: str) -> Callable | None:
-        """Return the callable for a tool, or None."""
-        return self._callables.get(tool_name)
-
     def get_tool(self, tool_name: str) -> Any | None:
         """Return the registered object for a tool, or None if unregistered.
 
@@ -181,13 +177,6 @@ class ToolRegistry:
             callable_,
         )
 
-    def get_tools_for_role(self, role: str) -> list[ToolSpecMetadata]:
-        """Return tools visible to a given role."""
-        return [
-            spec for spec in self._specs.values()
-            if not spec.allowed_roles or role in spec.allowed_roles or "*" in spec.allowed_roles
-        ]
-
     # `get_visible_tools(subagent_name)` used to sit here: a sub-agent's tools
     # resolved by role, capped at 20, with a `general-purpose` special case
     # that saw everything. It has no production caller. A sub-agent's tools are
@@ -197,21 +186,6 @@ class ToolRegistry:
     # disagreed, and the allowlist is the one the architecture specifies.
     # The 20-tool visibility cap still applies, there, in
     # `select_department_tools`.
-
-    def get_tool_definitions(self, tool_names: list[str]) -> list[dict[str, Any]]:
-        """Return tool schemas for the given tool names."""
-        definitions = []
-        for name in tool_names:
-            spec = self._specs.get(name)
-            if spec is None:
-                continue
-            definitions.append({
-                "name": spec.name,
-                "description": spec.description,
-                "risk_level": spec.risk_level,
-                "requires_approval": spec.requires_approval,
-            })
-        return definitions
 
     def _validate_args(self, tool_name: str, args: dict) -> dict:
         """Validate *args* against the tool's declared schema.
@@ -322,22 +296,6 @@ class ToolRegistry:
 
         message = json.dumps(args, sort_keys=True, default=str)
         return call_a2a_agent(url, message, timeout=getattr(spec, "timeout_seconds", None))
-
-    def execute(
-        self,
-        tool_name: str,
-        args: dict,
-        subagent_name: str,
-        trace_id: str | None = None,
-    ) -> Any:
-        """Execute a tool with risk-tier controls and schema validation.
-
-        Retained for ``executor.ToolExecutor``, the only production caller.
-        Equivalent to :meth:`dispatch`; kept separate because the executor
-        passes a ``trace_id`` and an explicit sub-agent name for the role check.
-        """
-        logger.debug("execute('%s', trace=%s) via dispatch", tool_name, trace_id)
-        return self.dispatch(tool_name, args, subagent_name=subagent_name)
 
     def list_tools(self) -> list[str]:
         """Return all registered tool names."""
