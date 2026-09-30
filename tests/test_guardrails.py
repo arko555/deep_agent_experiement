@@ -108,10 +108,16 @@ class TestValidatePathNonStrictRedirect:
 
 class TestValidateReadPath:
 
-    def test_workspace_path_allowed(self):
+    def test_workspace_path_allowed(self, tmp_path, monkeypatch):
+        # Build the allowed file locally: the repo's own workspace/ must not
+        # be a test dependency.
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "a.md").write_text("x")
         assert validate_read_path("workspace/a.md") == "workspace/a.md"
 
-    def test_workspace_dot_slash_normalized(self):
+    def test_workspace_dot_slash_normalized(self, tmp_path, monkeypatch):
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "a.md").write_text("x")
         assert validate_read_path("./workspace/a.md") == "workspace/a.md"
 
     def test_skills_path_allowed(self):

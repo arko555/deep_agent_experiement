@@ -15,10 +15,7 @@ from src.services.agent_orchestrator.memory import get_workspace_files, get_memo
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("app_new.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("DeepAgentApp")
 logger.info("App started")
