@@ -120,8 +120,7 @@ def sort_tools(
 
     # Preserve the LLM's ranking order, but only include names we have.
     by_name = {d["name"]: d for d in tool_defs}
-    ranked = [by_name[name] for name in selected_names if name in by_name]
-    return ranked
+    return [by_name[name] for name in selected_names if name in by_name]
 
 
 def _extract_tool_names(response: Any, max_tools: int) -> list[str]:

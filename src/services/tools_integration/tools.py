@@ -107,7 +107,10 @@ def read_file(path: str) -> str:
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """Write content to a file in the `./workspace` directory. Use this to save reports, drafts, or notes."""
+    """Write content to a file in the `./workspace` directory.
+
+    Use this to save reports, drafts, or notes.
+    """
     try:
         clean_path = validate_and_normalize_path(path, must_be_in_workspace=True)
         os.makedirs(os.path.dirname(clean_path), exist_ok=True)
@@ -120,7 +123,7 @@ def write_file(path: str, content: str) -> str:
 
 @tool
 def edit_file(path: str, search_text: str, replace_text: str) -> str:
-    """Edit an existing file in the `./workspace` directory by replacing search_text with replace_text."""
+    """Edit a `./workspace` file by replacing search_text with replace_text."""
     try:
         clean_path = validate_and_normalize_path(path, must_be_in_workspace=True)
         if not os.path.exists(clean_path):

@@ -132,8 +132,9 @@ def call_orchestrator(
 
     # Built per call so a department added to skills/ mid-process is listed.
     formatted_messages = [
-        SystemMessage(content=_build_dispatcher_prompt())
-    ] + list(messages)
+        SystemMessage(content=_build_dispatcher_prompt()),
+        *messages,
+    ]
 
     # No bind_tools. The dispatcher routes; it does not execute. Tool calls
     # happen inside sub-agents, which is what keeps the hierarchy one-way:
@@ -179,7 +180,11 @@ def call_orchestrator(
             current_usage = state.get("token_usage", {})
             total_in = current_usage.get("input", 0) + input_tokens
             total_out = current_usage.get("output", 0) + output_tokens
-            updates["token_usage"] = {"input": total_in, "output": total_out, "total": total_in + total_out}
+            updates["token_usage"] = {
+                "input": total_in,
+                "output": total_out,
+                "total": total_in + total_out,
+            }
     except Exception:
         pass
 

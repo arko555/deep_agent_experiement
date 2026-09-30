@@ -6,7 +6,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from src.services.session_memory.compression import (
     compress_messages,
     _summarize_old_messages,
-    DEFAULT_MAX_MESSAGES,
     MIN_KEEP_RECENT,
 )
 

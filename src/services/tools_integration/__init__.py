@@ -26,13 +26,13 @@ from src.services.tools_integration.tools import create_tool_registry
 from src.services.tools_integration.a2a_client import call_a2a_agent
 
 __all__ = [
-    "ToolRegistry",
     "RequiresApprovalError",
-    "sort_tools",
-    "discover_subagents",
-    "tool_spec",
+    "ToolRegistry",
     "ToolSpecMetadata",
-    "load_mcp_tools",
     "call_a2a_agent",
     "create_tool_registry",
+    "discover_subagents",
+    "load_mcp_tools",
+    "sort_tools",
+    "tool_spec",
 ]

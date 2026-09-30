@@ -1,21 +1,20 @@
 import os
-from typing import Optional
 
 from src.services.tools_integration.guardrails import validate_read_path
 
 __all__ = [
-    "get_skill_info",
-    "get_skill_body",
     "get_memory_content",
+    "get_skill_body",
+    "get_skill_info",
 ]
 
 
-def get_skill_info(skill_path: str) -> Optional[dict]:
+def get_skill_info(skill_path: str) -> dict | None:
     skill_md = os.path.join(skill_path, "SKILL.md")
     if os.path.exists(skill_md):
         try:
             skill_md = validate_read_path(skill_md)
-            with open(skill_md, "r") as f:
+            with open(skill_md) as f:
                 content = f.read()
                 if content.startswith("---"):
                     parts = content.split("---")
@@ -66,7 +65,7 @@ def get_memory_content() -> str:
     if os.path.exists(path):
         try:
             path = validate_read_path(path)
-            with open(path, "r") as f:
+            with open(path) as f:
                 return f.read()
         except Exception:
             pass

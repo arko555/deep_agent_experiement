@@ -1,16 +1,16 @@
-from typing import Annotated, List, TypedDict, Optional, Dict
+from typing import Annotated, TypedDict
 from operator import add
 from langchain_core.messages import BaseMessage
 
 class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add]  # append-only message log
-    next_message: Optional[BaseMessage]           # staging area for LLM response
-    pending_writes: List[Dict]                    # file write operations for audit
-    audit_log: Annotated[List[Dict], add]         # append-only action log
-    token_usage: Dict[str, int]                   # tracking API consumption
+    messages: Annotated[list[BaseMessage], add]  # append-only message log
+    next_message: BaseMessage | None           # staging area for LLM response
+    pending_writes: list[dict]                    # file write operations for audit
+    audit_log: Annotated[list[dict], add]         # append-only action log
+    token_usage: dict[str, int]                   # tracking API consumption
     enhanced_query: str                           # LLM-enhanced query
-    department_targets: List[str]                 # departments detected by orchestrator
-    subagent_results: Dict[str, str]              # results from parallel sub-agent dispatch
+    department_targets: list[str]                 # departments detected by orchestrator
+    subagent_results: dict[str, str]              # results from parallel sub-agent dispatch
     # `recursion_depth`, `consecutive_invalid_tools`, `iteration_count`, and
     # `max_iterations` are deliberately absent. They belonged to the removed
     # top-level ReAct dispatcher loop: the graph is acyclic

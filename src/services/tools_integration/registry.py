@@ -2,9 +2,12 @@
 
 import json
 import logging
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from src.services.tools_integration.decorator import ToolSpecMetadata
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 from src.services.tools_integration.validation import validate_args
 from src.types import ToolKind
 

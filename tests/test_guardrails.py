@@ -15,7 +15,13 @@ from src.services.tools_integration.guardrails import (
 )
 from src.services.agent_orchestrator.memory import get_memory_content, get_skill_body
 from src.services.tools_integration.guardrails import get_workspace_files
-from src.services.tools_integration.tools import edit_file, list_files, read_file, search_files, write_file
+from src.services.tools_integration.tools import (
+    edit_file,
+    list_files,
+    read_file,
+    search_files,
+    write_file,
+)
 
 
 @pytest.fixture(autouse=True)

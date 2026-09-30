@@ -1,10 +1,8 @@
 """Tests for the dispatcher orchestrator (Phase 3)."""
 
-import pytest
 
 from src.services.agent_orchestrator.orchestrator import call_orchestrator, _parse_dispatcher_output
-from src.services.agent_orchestrator.state import AgentState
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 
 def _state(**kwargs):
@@ -29,8 +27,7 @@ class FakeModel:
         self._responses = deque(responses)
 
     def invoke(self, messages, **kwargs):
-        resp = self._responses.popleft() if self._responses else self._responses[0]
-        return resp
+        return self._responses.popleft() if self._responses else self._responses[0]
 
     def bind_tools(self, tools, **kwargs):
         return self
@@ -39,7 +36,10 @@ class FakeModel:
 class TestParseDispatcherOutput:
 
     def test_valid_json_extracted(self):
-        content = 'Here is the result: {"enhanced_query": "find research papers", "departments": ["research", "writer"]} done.'
+        content = (
+            'Here is the result: {"enhanced_query": "find research papers",'
+            ' "departments": ["research", "writer"]} done.'
+        )
         result = _parse_dispatcher_output(content)
         assert result is not None
         assert result["enhanced_query"] == "find research papers"
@@ -64,7 +64,9 @@ class TestParseDispatcherOutput:
 class TestCallOrchestrator:
 
     def test_detection_mode_returns_departments(self):
-        fake = FakeModel([AIMessage(content='{"enhanced_query": "find papers", "departments": ["research", "writer"]}')])
+        fake = FakeModel([AIMessage(
+            content='{"enhanced_query": "find papers", "departments": ["research", "writer"]}',
+        )])
         state = _state()
         result = call_orchestrator(state, fake)
         assert result["enhanced_query"] == "find papers"
@@ -140,7 +142,12 @@ class TestCallOrchestrator:
         assert result["enhanced_query"] == "this turn's question"
 
     def test_departments_from_llm_output(self):
-        fake = FakeModel([AIMessage(content='Analyze: {"enhanced_query": "comprehensive review", "departments": ["research"]}')])
+        fake = FakeModel([AIMessage(
+            content=(
+                'Analyze: {"enhanced_query": "comprehensive review",'
+                ' "departments": ["research"]}'
+            ),
+        )])
         state = _state()
         result = call_orchestrator(state, fake)
         assert result["enhanced_query"] == "comprehensive review"

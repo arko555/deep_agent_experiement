@@ -55,7 +55,7 @@ class SubagentSpec:
     """One subagent type, as registered in SUBAGENTS."""
 
     description: str   # the only signal the router has for choosing this one
-    kind: str          # "tool_loop" (restricted tools), "graph" (full graph), or "a2a" (remote agent)
+    kind: str          # "tool_loop" (restricted tools) or "a2a" (remote agent)
     parallelizable: bool = False  # may run concurrently with sibling tasks
     aliases: tuple = ()            # accepted alternate names for subagent_type
     skill: str | None = None       # skills/<skill>/SKILL.md — prompt source (tool_loop only)

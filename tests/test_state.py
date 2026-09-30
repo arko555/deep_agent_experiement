@@ -1,6 +1,5 @@
 """Tests for state integrity — verify AgentState transitions are well-defined."""
 
-from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.agent_orchestrator.state import AgentState
 
@@ -12,7 +11,6 @@ from src.services.agent_orchestrator.state import AgentState
 class TestAgentStateDefaults:
 
     def test_messages_is_list(self):
-        state = {}
         # AgentState is a TypedDict Python doesn't enforce types at runtime,
         # but we verify the expected keys exist in our node logic.
         expected_keys = [

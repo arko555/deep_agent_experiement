@@ -2,7 +2,6 @@
 
 import json
 import logging
-from typing import Optional
 
 import pytest
 from pydantic import ConfigDict, create_model
@@ -47,7 +46,7 @@ class _Tool:
                 f"{name}_args",
                 __config__=ConfigDict(extra="forbid"),
                 **{
-                    f: (Optional[t], None)  # noqa: UP007 - runtime pydantic needs it
+                    f: (t | None, None)
                     for f, t in (fields or {}).items()
                 },
             )
@@ -62,7 +61,7 @@ class _Tool:
         self.calls.append((self.kind, args))
         if self._result is not None:
             return self._result
-        return f"called:{self.kind}:{list(args.values())[0] if args else ''}"
+        return f"called:{self.kind}:{next(iter(args.values())) if args else ''}"
 
 
 # ---------------------------------------------------------------------------

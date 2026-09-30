@@ -6,7 +6,11 @@ from datetime import datetime
 from langchain_core.messages import HumanMessage
 from agent import get_deep_agent
 from dotenv import load_dotenv
-from src.services.tools_integration.guardrails import clear_workspace, get_workspace_root, validate_read_path
+from src.services.tools_integration.guardrails import (
+    clear_workspace,
+    get_workspace_root,
+    validate_read_path,
+)
 from src.services.tools_integration.guardrails import get_workspace_files
 from src.services.agent_orchestrator.memory import get_memory_content, get_skill_info
 
@@ -145,7 +149,8 @@ def add_audit_entry(action: str, details: str):
 
 # --- Sidebar ---
 with st.sidebar:
-    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200) # Placeholder
+    # Placeholder logo
+    st.image("https://github.com/deepagents/deepagents/raw/main/docs/logo.png", width=200)
     st.title("Deep Agent Context")
 
     st.divider()
@@ -236,7 +241,7 @@ with st.sidebar:
 
 # --- Main Interface ---
 st.title("🚀 Deep Agent Orchestrator")
-st.markdown("*Demonstrating hierarchical planning, specialist subagents, and dynamic skill loading.*")
+st.markdown("*Demonstrating specialist subagents and dynamic skill loading.*")
 
 # Display chat history
 for message in st.session_state.messages:

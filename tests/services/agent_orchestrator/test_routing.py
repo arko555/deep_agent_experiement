@@ -1,9 +1,7 @@
 """Tests for Phase 3 routing logic."""
 
-import pytest
 
 from src.services.agent_orchestrator.routing import route_after_orchestrator
-from src.services.agent_orchestrator.state import AgentState
 
 
 def _state(**kwargs):
