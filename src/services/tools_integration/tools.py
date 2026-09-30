@@ -267,7 +267,11 @@ def load_dynamic_tools(tools_dir: str) -> dict[str, BaseTool]:
                     if isinstance(obj, BaseTool)
                 }
                 if not found_tools:
-                    logger.warning(
+                    # A module with no tools is normal for MCP server scripts
+                    # (FastMCP servers live here too and are loaded through the
+                    # MCP layer, not as local callables) — that is not a
+                    # problem worth a warning.
+                    logger.debug(
                         "Dynamic tool module %s defines no @tool functions; ignored.", entry
                     )
                     continue
