@@ -188,19 +188,25 @@ class SubAgentEngine:
         try:
             if spec.kind == "a2a":
                 from src.services.tools_integration.a2a_client import call_a2a_agent
+                from src import observability
 
                 if not spec.url:
                     # `_a2a_specs` always sets one, but a hand-built spec need
                     # not, and a missing URL must not become a call to None.
                     raise ValueError(f"A2A department '{name}' has no url configured")
-                text = await asyncio.to_thread(
-                    call_a2a_agent, spec.url, enhanced_query or description
-                )
+                # A remote agent is an external call like any other: latency
+                # and status at the boundary, nothing from inside it.
+                with observability.external_tool_span(name, "a2a") as ext_span:
+                    if ext_span is not None:
+                        ext_span.attributes["url"] = spec.url
+                    text = await asyncio.to_thread(
+                        call_a2a_agent, spec.url, enhanced_query or description
+                    )
                 # A remote agent reports no local token usage and writes no
                 # local files; its own spend is its business, not ours.
                 return SubagentRun(text=str(text))
             text, usage, writes = await asyncio.to_thread(
-                run_department, spec, enhanced_query or description
+                run_department, spec, enhanced_query or description, None, None, name
             )
             return SubagentRun(text=str(text), usage=usage, writes=writes)
         except Exception as e:

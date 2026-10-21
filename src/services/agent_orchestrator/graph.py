@@ -35,14 +35,24 @@ def _local_orchestrator_node(state: AgentState, config: RunnableConfig | None = 
     The thread id lives in the runtime config, not in state, so it is read
     from there — otherwise the dispatcher sees an empty message window.
 
+    This node is also where the turn's observability request begins: one
+    user message is one request, so the request id is minted once here and
+    every LLM call, department execution, and external tool call of the turn
+    records against it. The contextvar stays current through the fanout and
+    responder nodes (same call stack) and is finalized by the responder; if
+    a node raises past it, the next turn's ``start_request`` marks this one
+    abandoned rather than letting its spans leak into the new turn.
+
     No tool set is built here. This node used to call ``get_all_tools()`` and
     hand the result to the dispatcher, which ignored it — so every turn paid
     for loading the dynamic and MCP tool layers to produce a value the router
     never looked at. The router routes; the sub-agents bind tools.
     """
     from src.services.agent_orchestrator.agent_factory import get_model
+    from src import observability
 
     thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+    observability.start_request(thread_id)
     return call_orchestrator(state, model=get_model(), thread_id=thread_id)
 
 
@@ -61,9 +71,15 @@ def _subagent_fanout_node(state: AgentState) -> dict:
     seeing an "unknown department" error.
     """
     from src.services.agent_orchestrator.subagents import SUBAGENTS
+    from src import observability
 
     departments = state.get("department_targets", [])
     enhanced_query = state.get("enhanced_query", "")
+
+    fanout_span = observability.start_span(
+        "subagent_fanout", "fanout",
+        attributes={"departments": list(departments)},
+    )
 
     subagents = []
     for dept in departments:
@@ -76,10 +92,14 @@ def _subagent_fanout_node(state: AgentState) -> dict:
 
     if not subagents:
         logger.warning("No requested department resolved; answering directly")
+        observability.end_span(fanout_span, "completed", resolved_departments=0)
         return {"subagent_results": {}}
 
     engine = SubAgentEngine()
     runs = asyncio.run(engine.invoke_parallel(subagents, enhanced_query))
+    observability.end_span(
+        fanout_span, "completed", resolved_departments=len(runs)
+    )
 
     # Token spend and file writes happen inside the sub-agents now, so the
     # parent folds them in here. The top-level tools node that used to do this
@@ -137,6 +157,9 @@ def _responder_node(state: AgentState) -> dict:
     Always clears ``subagent_results`` on the way out: the channel is part of
     the checkpointed state, so a leftover value from a previous turn would be
     replayed as this turn's answer.
+
+    This is the last node before END, so it also finalizes the turn's
+    observability request — one user message, one request, closed here.
     """
     subagent_results = state.get("subagent_results") or {}
     enhanced_query = state.get("enhanced_query", "")
@@ -158,6 +181,12 @@ def _responder_node(state: AgentState) -> dict:
             content = text
     else:
         content = _fallback_answer(state, enhanced_query)
+
+    # One user message, one request: closed at the last node before END. The
+    # request log now carries this turn for the caller to read back.
+    from src import observability
+
+    observability.end_request("completed")
 
     return {
         "messages": [AIMessage(content=content)],

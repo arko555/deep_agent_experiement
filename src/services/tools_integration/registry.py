@@ -262,7 +262,18 @@ class ToolRegistry:
 
         # LOCAL and MCP both end at the tool's own call: an MCP tool is
         # already wrapped as a sync StructuredTool at load time, so the
-        # transport is already inside the object being called.
+        # transport is already inside the object being called. An MCP call
+        # is an external call, so it is measured at the boundary — latency
+        # and status only, nothing from inside the tool.
+        if kind == ToolKind.MCP:
+            from src import observability
+
+            with observability.external_tool_span(tool_name, "mcp"):
+                return self._invoke_tool(tool_name, validated)
+        return self._invoke_tool(tool_name, validated)
+
+    def _invoke_tool(self, tool_name: str, validated: dict) -> Any:
+        """Invoke the registered tool object with a validated payload."""
         tool = self._tools.get(tool_name)
         if tool is not None and hasattr(tool, "invoke"):
             return tool.invoke(validated)
@@ -287,7 +298,12 @@ class ToolRegistry:
             raise ValueError(f"A2A tool '{tool_name}' has no configured agent URL")
 
         message = json.dumps(args, sort_keys=True, default=str)
-        return call_a2a_agent(url, message)
+        # Measured at the boundary like every external call: latency and
+        # status, nothing from inside the remote agent.
+        from src import observability
+
+        with observability.external_tool_span(tool_name, "a2a"):
+            return call_a2a_agent(url, message)
 
     def list_tools(self) -> list[str]:
         """Return all registered tool names."""

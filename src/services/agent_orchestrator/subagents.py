@@ -515,6 +515,7 @@ def run_department(
     query: str,
     tools_dict: dict | None = None,
     max_iterations: int | None = None,
+    name: str | None = None,
 ):
     """Run one department end to end: prompt, tools, ReAct loop.
 
@@ -533,16 +534,44 @@ def run_department(
             the system: the ReAct loop below is the only thing that
             iterates, so this is where that setting belongs. The orchestrator
             has no budget because it is a single-shot router.
+        name: The department's registry name, for observability. ``None``
+            derives one from the spec.
 
     Returns:
         ``(final_text, usage, write_ops)`` — same shape as ``run_tool_loop``.
+
+    The whole execution is wrapped in a ``department`` span under the turn's
+    observability request, so every LLM call and external tool call the
+    department makes attributes to it. This runs in a worker thread
+    (``asyncio.to_thread``), which copies the current context — the request
+    id set by the orchestrator node is inherited here without being passed.
     """
     if max_iterations is None:
         max_iterations = get_max_iterations()
-    tools = select_department_tools(spec, query, tools_dict)
-    return run_tool_loop(
-        build_role_prompt(spec),
-        query,
-        tools,
-        max_iterations=max_iterations,
+
+    from src import observability
+
+    display = name or spec.skill or spec.url or spec.kind
+    span = observability.start_span(
+        display, "department",
+        attributes={
+            "department": display,
+            "kind": spec.kind,
+            "allowed_tools": len(spec.tools),
+        },
     )
+    try:
+        tools = select_department_tools(spec, query, tools_dict)
+        if span is not None:
+            span.attributes["shortlisted_tools"] = [t.name for t in tools]
+        result = run_tool_loop(
+            build_role_prompt(spec),
+            query,
+            tools,
+            max_iterations=max_iterations,
+        )
+    except Exception as e:
+        observability.end_span(span, "error", error=f"{type(e).__name__}: {e}")
+        raise
+    observability.end_span(span, "completed")
+    return result

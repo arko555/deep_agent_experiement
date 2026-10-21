@@ -247,7 +247,9 @@ class TestExecutionDispatch:
         )
         monkeypatch.setattr(
             "src.services.agent_orchestrator.subagents.run_department",
-            lambda spec, query: ("local answer", {"input": 2, "output": 1}, []),
+            lambda spec, query, *a, **k: (
+                "local answer", {"input": 2, "output": 1}, []
+            ),
         )
 
         run = asyncio.run(SubAgentEngine()._run_subagent_loop(

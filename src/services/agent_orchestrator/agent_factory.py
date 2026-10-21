@@ -48,7 +48,15 @@ logger = logging.getLogger(__name__)
 # wherever the model is invoked (orchestrator, reviewers, subagent loops).
 
 class DeepAgentTracer(BaseCallbackHandler):
-    """Records LLM invocation, tool call, and chain events for debugging."""
+    """Records LLM invocation, tool call, and chain events for debugging.
+
+    Each LLM callback is also recorded as a request-tagged span in
+    ``src.observability``: every event the handler receives is attributed to
+    the user message being served (its ``request_id``) and the conversation
+    (its ``session_id``), which is the granularity all observability metrics
+    are tagged at. The ``run_id`` each callback carries is how a start is
+    paired with its end when several model calls are in flight.
+    """
 
     def __init__(self):
         super().__init__()
@@ -62,6 +70,49 @@ class DeepAgentTracer(BaseCallbackHandler):
     def _name(serialized: dict | None, kwargs) -> str:
         return (serialized or {}).get("name") or kwargs.get("name") or "unknown"
 
+    @staticmethod
+    def _messages_of(response) -> list:
+        """The generated messages of an LLM/ChatResult response.
+
+        ``response.generations`` is a list of lists (one per input prompt),
+        so a flat iteration would see lists, not messages, and read nothing.
+        """
+        messages = []
+        for batch in getattr(response, "generations", None) or []:
+            for gen in batch or []:
+                msg = getattr(gen, "message", None)
+                if msg is not None:
+                    messages.append(msg)
+        return messages
+
+    @classmethod
+    def _tokens(cls, response) -> tuple[int, int]:
+        # on_llm_end hands over an LLMResult; usage_metadata sits on the
+        # generated message. Some paths pass a message-shaped object that
+        # carries usage_metadata directly. Read both.
+        meta = getattr(response, "usage_metadata", None)
+        if not isinstance(meta, dict):
+            for msg in cls._messages_of(response):
+                meta = getattr(msg, "usage_metadata", None)
+                if isinstance(meta, dict):
+                    break
+        if not isinstance(meta, dict):
+            return 0, 0
+        return (
+            meta.get("input_tokens", 0) or 0,
+            meta.get("output_tokens", 0) or 0,
+        )
+
+    @classmethod
+    def _model_name(cls, response) -> str | None:
+        """The model id, from the generated message when one is present."""
+        for msg in cls._messages_of(response):
+            model = getattr(msg, "model", None)
+            if model:
+                return str(model)
+        fallback = getattr(response, "model", None)
+        return str(fallback) if fallback else None
+
     # Chat models (ChatAnthropic/ChatOpenAI/etc. all emit chat_model events)
     def on_chat_model_start(self, serialized: dict, messages: list, **kwargs):
         self._record(
@@ -69,16 +120,20 @@ class DeepAgentTracer(BaseCallbackHandler):
             name=self._name(serialized, kwargs),
             message_count=len(messages or []),
         )
+        self._llm_span(self._name(serialized, kwargs), kwargs)
 
     def on_chat_model_end(self, response, **kwargs):
         self._record("chat_model_end")
+        self._close_llm_span(response, kwargs)
 
     # Non-chat LLMs, for parity (on_llm_* fires for BaseLLM subclasses)
     def on_llm_start(self, serialized: dict, prompts: list, **kwargs):
         self._record("llm_start", name=self._name(serialized, kwargs))
+        self._llm_span(self._name(serialized, kwargs), kwargs)
 
     def on_llm_end(self, response, **kwargs):
         self._record("llm_end")
+        self._close_llm_span(response, kwargs)
 
     # Tool executions
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs):
@@ -96,6 +151,32 @@ class DeepAgentTracer(BaseCallbackHandler):
 
     def on_chain_end(self, outputs, **kwargs):
         self._record("chain_end")
+
+    # --- request-tagged LLM spans (src.observability) ---
+
+    def _llm_span(self, name: str, kwargs) -> None:
+        from src import observability
+
+        observability.start_llm_span(name, run_id=kwargs.get("run_id"))
+
+    def _close_llm_span(self, response, kwargs) -> None:
+        from src import observability
+
+        req = observability.current_request()
+        if req is None:
+            return
+        run_id = str(kwargs.get("run_id")) if kwargs.get("run_id") is not None else None
+        span = req.open_llm_spans.pop(run_id, None) if run_id else None
+        if span is None and req.open_llm_spans:
+            # The run_id pairing missed (a handler wrapping mismatch); fall
+            # back to the oldest open span so no LLM call goes uncounted.
+            key = next(iter(req.open_llm_spans))
+            span = req.open_llm_spans.pop(key)
+        in_toks, out_toks = self._tokens(response)
+        model = self._model_name(response)
+        observability.end_llm_span(
+            span, input_tokens=in_toks, output_tokens=out_toks, model=model
+        )
 
     def get_events(self) -> list[dict]:
         return list(self._events)
