@@ -161,31 +161,44 @@ def _responder_node(state: AgentState) -> dict:
     This is the last node before END, so it also finalizes the turn's
     observability request — one user message, one request, closed here.
     """
+    from src import observability
+
     subagent_results = state.get("subagent_results") or {}
     enhanced_query = state.get("enhanced_query", "")
     next_msg = state.get("next_message")
 
-    if subagent_results:
-        verdict = verify(subagent_results, {"original_query": enhanced_query})
-        if not verdict["approved"]:
-            logger.warning("Sub-agent results failed verification: %s", verdict["reasons"])
-        content = aggregate(subagent_results, enhanced_query)
-    elif next_msg is not None:
-        # The dispatcher's normal reply is a JSON control envelope
-        # ({enhanced_query, departments}), not an answer. Anything else — e.g.
-        # the max-iterations notice — is a real message and is passed through.
-        text = get_message_text(getattr(next_msg, "content", ""))
-        if _is_envelope(text) or not text.strip():
-            content = _fallback_answer(state, enhanced_query)
-        else:
-            content = text
-    else:
-        content = _fallback_answer(state, enhanced_query)
+    span = observability.start_span(
+        "responder", "responder",
+        attributes={"subagent_results": len(subagent_results)},
+    )
 
+    try:
+        if subagent_results:
+            verdict = verify(subagent_results, {"original_query": enhanced_query})
+            if not verdict["approved"]:
+                logger.warning(
+                    "Sub-agent results failed verification: %s", verdict["reasons"]
+                )
+            content = aggregate(subagent_results, enhanced_query)
+        elif next_msg is not None:
+            # The dispatcher's normal reply is a JSON control envelope
+            # ({enhanced_query, departments}), not an answer. Anything else — e.g.
+            # the max-iterations notice — is a real message and is passed through.
+            text = get_message_text(getattr(next_msg, "content", ""))
+            if _is_envelope(text) or not text.strip():
+                content = _fallback_answer(state, enhanced_query)
+            else:
+                content = text
+        else:
+            content = _fallback_answer(state, enhanced_query)
+    except Exception as e:
+        observability.end_span(span, "error", error=f"{type(e).__name__}: {e}")
+        observability.end_request("error")
+        raise
+
+    observability.end_span(span, "completed", content_length=len(content))
     # One user message, one request: closed at the last node before END. The
     # request log now carries this turn for the caller to read back.
-    from src import observability
-
     observability.end_request("completed")
 
     return {

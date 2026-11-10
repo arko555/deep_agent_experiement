@@ -47,6 +47,39 @@ logger = logging.getLogger(__name__)
 # invocations via with_config(callbacks=[...]), so events are recorded
 # wherever the model is invoked (orchestrator, reviewers, subagent loops).
 
+_PROVIDER_HINTS = ("openrouter", "anthropic", "openai", "google", "ollama")
+
+
+def _resolve_provider(serialized: dict | None, kwargs: dict | None = None) -> str | None:
+    """Infer the provider from what LangChain hands the callback.
+
+    The serialized dict carries the integration package id (e.g.
+    ``langchain_openrouter``) and, in ``kwargs.model_name``, the model id. The
+    package id is exact, so it is checked first; the model-id prefix is only a
+    fallback for callbacks that omit it. Returns ``None`` when unknown, which
+    lets :func:`observability.end_llm_span` apply its configured default.
+    """
+    serialized = serialized or {}
+    parts = [str(p).lower() for p in (serialized.get("id") or [])]
+    model_name = str((serialized.get("kwargs") or {}).get("model_name") or "").lower()
+    haystack = " ".join([*parts, model_name])
+    for provider in _PROVIDER_HINTS:
+        if provider in haystack:
+            return provider
+    if model_name.startswith(("claude", "anthropic/")):
+        return "anthropic"
+    if model_name.startswith(("gpt", "o1", "o3", "openai/")):
+        return "openai"
+    if model_name.startswith(("gemini", "models/gemini")):
+        return "google"
+    return None
+
+
+def _chain_spans_enabled() -> bool:
+    """Chain callbacks fire for framework internals too, so they are opt-in."""
+    return os.getenv("OBSERVABILITY_CHAIN_SPANS") == "1"
+
+
 class DeepAgentTracer(BaseCallbackHandler):
     """Records LLM invocation, tool call, and chain events for debugging.
 
@@ -120,7 +153,7 @@ class DeepAgentTracer(BaseCallbackHandler):
             name=self._name(serialized, kwargs),
             message_count=len(messages or []),
         )
-        self._llm_span(self._name(serialized, kwargs), kwargs)
+        self._llm_span(self._name(serialized, kwargs), kwargs, serialized)
 
     def on_chat_model_end(self, response, **kwargs):
         self._record("chat_model_end")
@@ -129,7 +162,7 @@ class DeepAgentTracer(BaseCallbackHandler):
     # Non-chat LLMs, for parity (on_llm_* fires for BaseLLM subclasses)
     def on_llm_start(self, serialized: dict, prompts: list, **kwargs):
         self._record("llm_start", name=self._name(serialized, kwargs))
-        self._llm_span(self._name(serialized, kwargs), kwargs)
+        self._llm_span(self._name(serialized, kwargs), kwargs, serialized)
 
     def on_llm_end(self, response, **kwargs):
         self._record("llm_end")
@@ -148,16 +181,38 @@ class DeepAgentTracer(BaseCallbackHandler):
         keyset = list(inputs.keys()) if isinstance(inputs, dict) else []
         self._record("chain_start", name=self._name(serialized, kwargs),
                      input_keys=keyset)
+        if _chain_spans_enabled():
+            from src import observability
+
+            observability.start_chain_span(
+                self._name(serialized, kwargs), run_id=kwargs.get("run_id")
+            )
 
     def on_chain_end(self, outputs, **kwargs):
         self._record("chain_end")
+        if _chain_spans_enabled():
+            from src import observability
+
+            observability.end_chain_span(kwargs.get("run_id"))
+
+    def on_chain_error(self, error: BaseException, **kwargs):
+        self._record("chain_error", error=f"{type(error).__name__}: {error}")
+        if _chain_spans_enabled():
+            from src import observability
+
+            span = observability.end_chain_span(kwargs.get("run_id"))
+            if span is not None:
+                span.status = "error"
 
     # --- request-tagged LLM spans (src.observability) ---
 
-    def _llm_span(self, name: str, kwargs) -> None:
+    def _llm_span(self, name: str, kwargs, serialized: dict | None = None) -> None:
         from src import observability
 
-        observability.start_llm_span(name, run_id=kwargs.get("run_id"))
+        span = observability.start_llm_span(name, run_id=kwargs.get("run_id"))
+        provider = _resolve_provider(serialized, kwargs)
+        if span is not None and provider:
+            span.attributes["provider"] = provider
 
     def _close_llm_span(self, response, kwargs) -> None:
         from src import observability
@@ -174,8 +229,12 @@ class DeepAgentTracer(BaseCallbackHandler):
             span = req.open_llm_spans.pop(key)
         in_toks, out_toks = self._tokens(response)
         model = self._model_name(response)
+        # Prefer the provider resolved from the model at start; fall back to
+        # the configured default for callbacks that did not carry it.
+        provider = span.attributes.get("provider") if span is not None else None
         observability.end_llm_span(
-            span, input_tokens=in_toks, output_tokens=out_toks, model=model
+            span, input_tokens=in_toks, output_tokens=out_toks, model=model,
+            provider=provider,
         )
 
     def get_events(self) -> list[dict]:

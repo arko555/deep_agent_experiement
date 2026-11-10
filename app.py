@@ -26,6 +26,20 @@ logger.info("App started")
 # Load environment variables
 load_dotenv()
 
+
+def _span_tree_lines(spans, parent=None, depth=0):
+    """Render the flat span list as an indented parent/child tree."""
+    lines = []
+    for span in spans:
+        if span.get("parent_span_id") == parent:
+            duration = span.get("duration_ms") or 0.0
+            lines.append(
+                f"{'  ' * depth}{span.get('name')} [{span.get('kind')}] "
+                f"{span.get('status')} {duration:.0f}ms"
+            )
+            lines.extend(_span_tree_lines(spans, span.get("span_id"), depth + 1))
+    return lines
+
 # --- Page Configuration ---
 st.set_page_config(
     page_title="Deep Agent Demo",
@@ -160,6 +174,50 @@ with st.sidebar:
     # counter to show here — the departments that ran are shown further down.
     st.subheader("🛡️ Governance")
     st.metric("Tokens", f"{st.session_state.token_usage.get('total', 0):,}")
+
+    try:
+        from src import observability as _obs
+
+        if _obs.tracing_enabled():
+            st.divider()
+            st.subheader("🔍 Observability")
+            last = _obs.get_last_request()
+            if last is None:
+                st.caption("No traced request yet.")
+            else:
+                analysis = _obs.analyze_request(last)
+                perf = analysis.get("performance", {})
+                st.caption(f"request: {last.get('request_id', '')[:8]}…")
+                st.caption(
+                    f"status: {last.get('status')} ({last.get('duration_ms')} ms)"
+                )
+                st.caption(
+                    f"llm calls: {perf.get('llm_call_count', 0)}  "
+                    f"tokens: {perf.get('total_tokens', 0):,}  "
+                    f"cost: ${perf.get('total_cost_usd', 0):.4f}"
+                )
+                departments = analysis.get("departments") or []
+                if departments:
+                    st.caption(
+                        "departments: " + ", ".join(
+                            f"{d['department']} (${d['cost_usd']:.4f}, "
+                            f"{(d.get('duration_ms') or 0):.0f}ms)"
+                            for d in departments
+                        )
+                    )
+                bottlenecks = analysis.get("bottlenecks") or []
+                if bottlenecks:
+                    st.caption(
+                        "bottlenecks: " + ", ".join(
+                            f"{b['name']} ({b['duration_ms']:.0f}ms)"
+                            for b in bottlenecks[:3]
+                        )
+                    )
+                with st.expander("span tree"):
+                    for line in _span_tree_lines(last.get("spans", [])):
+                        st.text(line)
+    except Exception:
+        pass
 
     st.divider()
 

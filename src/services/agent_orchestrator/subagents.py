@@ -564,14 +564,39 @@ def run_department(
         tools = select_department_tools(spec, query, tools_dict)
         if span is not None:
             span.attributes["shortlisted_tools"] = [t.name for t in tools]
-        result = run_tool_loop(
+        text, usage, writes = run_tool_loop(
             build_role_prompt(spec),
             query,
             tools,
             max_iterations=max_iterations,
         )
     except Exception as e:
-        observability.end_span(span, "error", error=f"{type(e).__name__}: {e}")
+        observability.end_span(
+            span, "error", success=False, error=f"{type(e).__name__}: {e}"
+        )
         raise
-    observability.end_span(span, "completed")
-    return result
+
+    input_tokens = int(usage.get("input", 0) or 0)
+    output_tokens = int(usage.get("output", 0) or 0)
+    # The department's cost is the sum of its own LLM spans, so it stays correct
+    # per provider and never double-counts when the session total is folded.
+    req = observability.current_request()
+    cost = 0.0
+    if req is not None and span is not None:
+        cost = sum(
+            s.cost_usd
+            for s in req.spans
+            if s.parent_span_id == span.span_id and s.kind == "llm"
+        )
+    observability.end_span(
+        span,
+        "completed",
+        success=True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        cost_usd=round(cost, 6),
+        writes=len(writes),
+        output_length=len(text or ""),
+    )
+    return text, usage, writes

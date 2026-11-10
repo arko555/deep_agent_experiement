@@ -192,7 +192,12 @@ class TestExternalToolSpans:
         assert span["kind"] == "external_tool"
         assert span["status"] == "completed"
         assert span["duration_ms"] >= 0
-        assert span["attributes"] == {"tool": "mcp_calc", "transport": "mcp"}
+        assert span["attributes"] == {
+            "tool": "mcp_calc",
+            "transport": "mcp",
+            "service": "mcp_calc",
+            "caller": "orchestrator",
+        }
 
     def test_latency_only_records_error_and_reraises(self, obs):
         obs.start_request("t")
@@ -231,7 +236,11 @@ class TestExternalToolSpans:
 
         span = obs.get_last_request()["spans"][0]
         assert span["kind"] == "external_tool"
-        assert span["attributes"] == {"tool": "srv_calc", "transport": "mcp"}
+        attrs = span["attributes"]
+        assert attrs["tool"] == "srv_calc"
+        assert attrs["transport"] == "mcp"
+        assert attrs["service"] == "srv_calc"
+        assert attrs["caller"] == "orchestrator"
 
     def test_local_dispatch_records_no_external_span(self, obs):
         from src.services.tools_integration.registry import ToolRegistry
@@ -439,6 +448,8 @@ class TestGraphTurnTracing:
         assert first["status"] == "completed"
         # The turn's LLM calls are tagged: orchestrator + sub-agent at least.
         assert any(s["kind"] == "llm" for s in first["spans"])
+        # The last node before END records a responder span.
+        assert any(s["kind"] == "responder" for s in first["spans"])
 
     def test_session_summary_across_two_turns(self, tracer, obs, monkeypatch):
         from src.services.agent_orchestrator.graph import (
@@ -483,6 +494,7 @@ class TestGraphTurnTracing:
         assert len(dept_spans) == 1
         assert dept_spans[0]["attributes"]["department"] == "general"
         assert "shortlisted_tools" in dept_spans[0]["attributes"]
+        assert dept_spans[0]["attributes"]["success"] is True
 
     def test_no_request_leaks_between_invokes(self, tracer, obs, monkeypatch):
         from src.services.agent_orchestrator.graph import (
@@ -502,3 +514,455 @@ class TestGraphTurnTracing:
         # After the invoke returns, no request is active in the caller's
         # context — the responder closed it.
         assert obs.current_request() is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — cost estimation and export
+# ---------------------------------------------------------------------------
+
+class TestCostEstimation:
+
+    def test_known_model_returns_expected_value(self):
+        from src import observability
+
+        cost = observability.estimate_cost("anthropic", "claude-3-5-sonnet-20240620", 1000, 1000)
+        assert cost == pytest.approx(3.00 + 15.00)
+
+    def test_unknown_model_defaults_to_zero(self):
+        from src import observability
+
+        assert observability.estimate_cost("nope", "no-model", 1000, 1000) == 0.0
+
+    def test_env_override_takes_precedence(self, monkeypatch):
+        from src import observability
+
+        monkeypatch.setenv("OBSERVABILITY_PRICE_OPENAI_GPT_4O_INPUT", "1.0")
+        monkeypatch.setenv("OBSERVABILITY_PRICE_OPENAI_GPT_4O_OUTPUT", "2.0")
+        cost = observability.estimate_cost("openai", "gpt-4o", 1000, 1000)
+        assert cost == pytest.approx(1.0 + 2.0)
+
+    def test_openrouter_convenience_env(self, monkeypatch):
+        from src import observability
+
+        monkeypatch.setenv("OPENROUTER_INPUT_PRICE", "0.5")
+        monkeypatch.setenv("OPENROUTER_OUTPUT_PRICE", "1.5")
+        cost = observability.estimate_cost("openrouter", "any-model", 1000, 1000)
+        assert cost == pytest.approx(0.5 + 1.5)
+
+
+class TestExport:
+
+    def test_export_json_writes_valid_file(self, obs, tmp_path, monkeypatch):
+        out = tmp_path / "trace.json"
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_PATH", str(out))
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_FORMAT", "json")
+
+        obs.start_request("t")
+        obs.end_request("completed")
+
+        assert out.exists()
+        import json
+
+        data = json.loads(out.read_text())
+        assert "request_id" in data
+        assert "spans" in data
+        assert "events" in data
+        assert data["status"] == "completed"
+
+    def test_export_jsonl_appends_line(self, obs, tmp_path, monkeypatch):
+        out = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_PATH", str(out))
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_FORMAT", "jsonl")
+
+        obs.start_request("t")
+        obs.end_request("completed")
+
+        lines = out.read_text().strip().splitlines()
+        assert len(lines) == 1
+        import json
+
+        obj = json.loads(lines[0])
+        assert "request_id" in obj
+
+    def test_llm_span_records_cost(self, tracer, obs):
+        import os
+
+        os.environ["OBSERVABILITY_DEFAULT_PROVIDER"] = "anthropic"
+        try:
+            obs.start_request("t")
+
+            class UsageModel(FakeListChatModel):
+                def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                    result = super()._generate(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    )
+                    result.generations[0].message.usage_metadata = {
+                        "input_tokens": 1000, "output_tokens": 1000, "total_tokens": 2000,
+                    }
+                    result.generations[0].message.model = "claude-3-5-sonnet-20240620"
+                    return result
+
+            wrapped = agent_factory._maybe_attach_callbacks(UsageModel(responses=["hi"]))
+            wrapped.invoke([HumanMessage(content="hi")])
+            obs.end_request()
+
+            llm_spans = [s for s in obs.get_last_request()["spans"] if s["kind"] == "llm"]
+            assert len(llm_spans) == 1
+            assert llm_spans[0]["cost_usd"] > 0
+        finally:
+            os.environ.pop("OBSERVABILITY_DEFAULT_PROVIDER", None)
+
+
+# ---------------------------------------------------------------------------
+# Span tree — root/child navigation (adopted from the OTel-style model)
+# ---------------------------------------------------------------------------
+
+class TestTraceTree:
+
+    def test_root_spans_and_children(self, obs):
+        req = obs.start_request("t")
+        dept = obs.start_span("research", "department")
+        tool = obs.start_span("external_tool:x", "external_tool")
+        obs.end_span(tool)
+        obs.end_span(dept)
+        obs.end_request()
+
+        assert [s.span_id for s in req.root_spans] == [dept.span_id]
+        assert [s.span_id for s in req.children(dept.span_id)] == [tool.span_id]
+        assert req.children(tool.span_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Analysis — trajectory-level rollups (adopted from the snippet's analyzer)
+# ---------------------------------------------------------------------------
+
+class TestAnalysis:
+
+    def test_analyze_request_rolls_up_spans(self, obs):
+        obs.start_request("sess-A")
+        dept = obs.start_span("research", "department")
+        with obs.external_tool_span("search", "mcp"):
+            pass
+        obs.end_span(dept, "error", error="ValueError: bad input")
+        obs.end_request()
+
+        result = obs.analyze_last_request(bottleneck_ms=0.0)
+        assert result["request_id"]
+        assert result["summary"]["total_spans"] == 2
+        assert result["summary"]["span_types"] == {
+            "department": 1, "external_tool": 1,
+        }
+        assert result["summary"]["error_count"] == 1
+        assert result["performance"]["tool_call_count"] == 1
+        assert result["tool_usage"]["tools_used"] == ["search"]
+        assert result["tool_usage"]["success_rate"] == 1.0
+        assert result["tool_usage"]["tool_frequency"] == {"search": 1}
+        assert result["error_analysis"]["total_errors"] == 1
+        assert result["error_analysis"]["error_types"] == {"ValueError": 1}
+        assert len(result["bottlenecks"]) == 2  # threshold 0 includes everything
+
+    def test_analyze_performance_counts_llm_tokens_and_cost(self, obs):
+        obs.start_request("s")
+        span = obs.start_llm_span("gpt-4o", run_id="r1")
+        obs.end_llm_span(
+            span,
+            input_tokens=1000,
+            output_tokens=1000,
+            model="gpt-4o",
+            provider="openai",
+        )
+        obs.end_request()
+
+        perf = obs.analyze_last_request()["performance"]
+        assert perf["llm_call_count"] == 1
+        assert perf["total_tokens"] == 2000
+        assert perf["total_cost_usd"] > 0
+
+    def test_analysis_has_no_bottlenecks_below_threshold(self, obs):
+        obs.start_request("s")
+        span = obs.start_span("quick", "node")
+        obs.end_span(span)
+        obs.end_request()
+
+        result = obs.analyze_last_request(bottleneck_ms=60_000)
+        assert result["bottlenecks"] == []
+
+    def test_analyze_missing_request_is_none(self):
+        from src import observability
+
+        assert observability.analyze_request(None) is None
+
+    def test_caller_is_the_dispatching_department(self, obs):
+        obs.start_request("t")
+        dept = obs.start_span("research", "department")
+        with obs.external_tool_span("mcp_calc", "mcp"):
+            pass
+        obs.end_span(dept)
+        obs.end_request()
+
+        tool_span = obs.get_last_request()["spans"][1]
+        assert tool_span["attributes"]["service"] == "mcp_calc"
+        assert tool_span["attributes"]["caller"] == "research"
+
+
+# ---------------------------------------------------------------------------
+# Provider resolution — from the model, not just an env default
+# ---------------------------------------------------------------------------
+
+class TestProviderResolution:
+
+    def test_resolve_from_serialized_package_id(self):
+        from src.services.agent_orchestrator.agent_factory import _resolve_provider
+
+        assert _resolve_provider(
+            {"id": ["langchain_openrouter", "chat_models", "ChatOpenRouter"]}
+        ) == "openrouter"
+        assert _resolve_provider(
+            {"id": ["langchain_anthropic", "chat_models", "ChatAnthropic"]}
+        ) == "anthropic"
+        assert _resolve_provider(
+            {"id": ["langchain_openai", "chat_models", "ChatOpenAI"]}
+        ) == "openai"
+        assert _resolve_provider(
+            {"id": ["langchain_google_genai", "chat_models", "ChatGoogleGenerativeAI"]}
+        ) == "google"
+        assert _resolve_provider(
+            {"id": ["langchain_ollama", "chat_models", "ChatOllama"]}
+        ) == "ollama"
+        assert _resolve_provider({"id": ["unknown"], "kwargs": {}}) is None
+
+    def test_resolve_falls_back_to_model_prefix(self):
+        from src.services.agent_orchestrator.agent_factory import _resolve_provider
+
+        assert _resolve_provider({"kwargs": {"model_name": "claude-3-5-sonnet"}}) == "anthropic"
+        assert _resolve_provider({"kwargs": {"model_name": "gpt-4o"}}) == "openai"
+        assert _resolve_provider({"kwargs": {"model_name": "gemini-2.0-flash"}}) == "google"
+
+    def test_llm_span_records_the_resolved_provider(self, tracer, obs):
+        from langchain_core.messages import AIMessage as _AI
+        from langchain_core.outputs import ChatGeneration, LLMResult
+
+        obs.start_request("t")
+        serialized = {
+            "id": ["langchain_openrouter", "chat_models", "ChatOpenRouter"],
+            "kwargs": {"model_name": "deepseek/deepseek-v4.1"},
+        }
+        tracer.on_chat_model_start(
+            serialized, [HumanMessage(content="hi")], run_id="r1"
+        )
+        message = _AI(
+            content="ok",
+            usage_metadata={
+                "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+            },
+        )
+        message.model = "deepseek/deepseek-v4.1"
+        tracer.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]]), run_id="r1"
+        )
+        obs.end_request()
+
+        llm = [s for s in obs.get_last_request()["spans"] if s["kind"] == "llm"]
+        assert llm[0]["attributes"]["provider"] == "openrouter"
+
+
+# ---------------------------------------------------------------------------
+# Chain spans — opt-in, paired by run_id
+# ---------------------------------------------------------------------------
+
+class TestChainSpans:
+
+    def test_chain_callbacks_create_a_span_when_enabled(self, tracer, obs, monkeypatch):
+        monkeypatch.setenv("OBSERVABILITY_CHAIN_SPANS", "1")
+        obs.start_request("t")
+        tracer.on_chain_start({"name": "responder"}, {}, run_id="c1")
+        tracer.on_chain_end({}, run_id="c1")
+        obs.end_request()
+
+        chains = [s for s in obs.get_last_request()["spans"] if s["kind"] == "chain"]
+        assert len(chains) == 1
+        assert chains[0]["name"] == "responder"
+        assert chains[0]["status"] == "completed"
+
+    def test_chain_spans_are_off_by_default(self, tracer, obs, monkeypatch):
+        monkeypatch.delenv("OBSERVABILITY_CHAIN_SPANS", raising=False)
+        obs.start_request("t")
+        tracer.on_chain_start({"name": "x"}, {}, run_id="c1")
+        tracer.on_chain_end({}, run_id="c1")
+        obs.end_request()
+
+        assert [s for s in obs.get_last_request()["spans"] if s["kind"] == "chain"] == []
+
+
+# ---------------------------------------------------------------------------
+# Department span enrichment
+# ---------------------------------------------------------------------------
+
+class TestDepartmentSpanDetail:
+
+    def test_department_span_records_usage_cost_and_writes(self, obs, monkeypatch):
+        from types import SimpleNamespace
+
+        from src.services.agent_orchestrator import subagents as mod
+
+        def fake_run_tool_loop(*args, **kwargs):
+            llm = obs.start_llm_span("gpt-4o", run_id="r")
+            obs.end_llm_span(
+                llm, input_tokens=100, output_tokens=50,
+                model="gpt-4o", provider="openai",
+            )
+            return "answer", {"input": 100, "output": 50}, [
+                {"tool": "write_file", "args": {"path": "x.txt"}},
+            ]
+
+        monkeypatch.setattr(mod, "select_department_tools", lambda *a, **k: [])
+        monkeypatch.setattr(mod, "build_role_prompt", lambda spec: "")
+        monkeypatch.setattr(mod, "run_tool_loop", fake_run_tool_loop)
+        spec = SimpleNamespace(skill="general", kind="tool_loop", tools=[], url=None)
+
+        obs.start_request("t")
+        mod.run_department(spec, "q", name="general")
+        obs.end_request()
+
+        dept = next(
+            s for s in obs.get_last_request()["spans"] if s["kind"] == "department"
+        )
+        attrs = dept["attributes"]
+        assert attrs["success"] is True
+        assert attrs["input_tokens"] == 100
+        assert attrs["output_tokens"] == 50
+        assert attrs["total_tokens"] == 150
+        assert attrs["cost_usd"] > 0
+        assert attrs["writes"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Department rollup in the analysis
+# ---------------------------------------------------------------------------
+
+class TestDepartmentAnalysis:
+
+    def test_rolls_up_descendant_llm_cost_and_tools(self):
+        from src import observability
+
+        spans = [
+            {
+                "span_id": "d", "parent_span_id": None, "kind": "department",
+                "name": "research", "duration_ms": 100.0, "status": "completed",
+                "attributes": {"department": "research"}, "cost_usd": 0.0,
+            },
+            {
+                "span_id": "l", "parent_span_id": "d", "kind": "llm",
+                "name": "gpt", "duration_ms": 80.0, "status": "completed",
+                "attributes": {"input_tokens": 10, "output_tokens": 5},
+                "cost_usd": 0.5,
+            },
+            {
+                "span_id": "x", "parent_span_id": "d", "kind": "external_tool",
+                "name": "tool", "duration_ms": 10.0, "status": "completed",
+                "attributes": {"tool": "x"}, "cost_usd": 0.0,
+            },
+        ]
+        result = observability.analyze_request({
+            "request_id": "r", "session_id": "s", "duration_ms": 100.0,
+            "status": "completed", "spans": spans,
+        })
+        dept = result["departments"][0]
+        assert dept["department"] == "research"
+        assert dept["llm_calls"] == 1
+        assert dept["input_tokens"] == 10
+        assert dept["output_tokens"] == 5
+        assert dept["cost_usd"] == 0.5
+        assert dept["tool_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Concurrency-safe export naming
+# ---------------------------------------------------------------------------
+
+class TestExportNaming:
+
+    def test_unique_flag_inserts_the_request_id(self, obs, tmp_path, monkeypatch):
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_UNIQUE", "1")
+        req = obs.start_request("t")
+
+        resolved = obs._export_path_for(req, str(tmp_path / "trace.json"), "json")
+        assert req.request_id in resolved
+        assert resolved.endswith(".json")
+
+    def test_directory_path_writes_one_file_per_request(self, obs, tmp_path, monkeypatch):
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_PATH", str(tmp_path))
+        monkeypatch.setenv("OBSERVABILITY_EXPORT_FORMAT", "json")
+
+        req = obs.start_request("t")
+        obs.end_request("completed")
+
+        assert (tmp_path / f"{req.request_id}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# OTLP/HTTP export
+# ---------------------------------------------------------------------------
+
+class TestOtlpExport:
+
+    def test_posts_protobuf_json_to_v1_traces(self, obs, monkeypatch):
+        import httpx
+
+        from src import observability
+
+        obs.start_request("t")
+        span = obs.start_span("dept", "department", {"department": "research"})
+        obs.end_span(span)
+        req = obs.end_request("completed")
+
+        captured: dict = {}
+
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+        def fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _Response()
+
+        monkeypatch.setattr(httpx, "post", fake_post)
+
+        assert observability.export_otlp(req, "http://collector:4318") is True
+        assert captured["url"] == "http://collector:4318/v1/traces"
+        payload = captured["json"]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        assert len(payload["traceId"]) == 32
+        assert len(payload["spanId"]) == 16
+        assert payload["name"] == "dept"
+        assert payload["status"]["code"] == 1
+
+    def test_no_endpoint_is_a_noop(self):
+        from src import observability
+
+        assert observability.export_otlp(None) is False
+
+
+# ---------------------------------------------------------------------------
+# A2A trace-id propagation
+# ---------------------------------------------------------------------------
+
+class TestA2ATracePropagation:
+
+    def test_message_carries_the_trace_id_in_metadata(self):
+        from src.services.tools_integration.a2a_client import _build_message
+
+        message = _build_message("hello", "trace-123")
+        assert message.metadata["trace_id"] == "trace-123"
+
+    def test_message_without_trace_id_has_no_metadata(self):
+        from src.services.tools_integration.a2a_client import _build_message
+
+        message = _build_message("hello")
+        assert "trace_id" not in message.metadata
+
+    def test_current_request_id_tracks_the_active_request(self, obs):
+        req = obs.start_request("t")
+        assert obs.current_request_id() == req.request_id
+        obs.end_request()
+        assert obs.current_request_id() is None

@@ -42,7 +42,22 @@ POLL_INTERVAL_SECONDS = 1.0
 MAX_POLLS = 300  # ~5 minutes at the default interval
 
 
-async def _call(url: str, description: str, timeout: float) -> str:
+def _build_message(description: str, trace_id: str | None = None):
+    """Build the outgoing user message, tagging it with the trace id.
+
+    A2A carries a free-form metadata struct; an agent that reads it can
+    correlate its logs with this turn. It is advisory: an agent that ignores
+    it still works.
+    """
+    message = new_text_message(description, role=Role.ROLE_USER)
+    if trace_id:
+        message.metadata.update({"trace_id": str(trace_id)})
+    return message
+
+
+async def _call(
+    url: str, description: str, timeout: float, trace_id: str | None = None
+) -> str:
     # One HTTP client per call, created and closed inside this single
     # coroutine: httpx binds its pool to the loop that created it, so a client
     # must never outlive or cross loops.
@@ -54,7 +69,7 @@ async def _call(url: str, description: str, timeout: float) -> str:
         )
         try:
             request = SendMessageRequest(
-                message=new_text_message(description, role=Role.ROLE_USER)
+                message=_build_message(description, trace_id)
             )
 
             answer_parts: list[str] = []
@@ -115,16 +130,27 @@ async def _call(url: str, description: str, timeout: float) -> str:
             await client.close()
 
 
-def call_a2a_agent(url: str, description: str, timeout: float | None = None) -> str:
+def call_a2a_agent(
+    url: str,
+    description: str,
+    timeout: float | None = None,
+    trace_id: str | None = None,
+) -> str:
     """Send *description* to the A2A agent at *url*; return its answer as text.
 
     Blocks until the remote agent produces a result or *timeout* elapses.
-    Raises on transport failure or a non-successful terminal state, so the
-    caller (``agent_factory.local_tools_node``) surfaces it as a task error.
+    *trace_id* defaults to the active observability request, so the remote
+    agent receives the same id this turn is tagged with. Raises on transport
+    failure or a non-successful terminal state, so the caller surfaces it as a
+    task error.
     """
     if timeout is None:
         timeout = get_subagent_timeout_seconds()
+    if trace_id is None:
+        from src import observability
+
+        trace_id = observability.current_request_id()
     try:
-        return cast("str", run_sync(_call(url, description, timeout)))
+        return cast("str", run_sync(_call(url, description, timeout, trace_id)))
     except Exception as e:
         raise RuntimeError(f"A2A agent at {url} failed: {e}") from e

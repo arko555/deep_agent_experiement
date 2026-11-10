@@ -258,7 +258,7 @@ class ToolRegistry:
                     spec.risk_level)
 
         if kind == ToolKind.A2A:
-            return self._dispatch_a2a(tool_name, validated)
+            return self._dispatch_a2a(tool_name, validated, subagent_name)
 
         # LOCAL and MCP both end at the tool's own call: an MCP tool is
         # already wrapped as a sync StructuredTool at load time, so the
@@ -268,7 +268,14 @@ class ToolRegistry:
         if kind == ToolKind.MCP:
             from src import observability
 
-            with observability.external_tool_span(tool_name, "mcp"):
+            attrs = {
+                "risk_level": spec.risk_level,
+                "kind": "mcp",
+                "subagent_name": subagent_name,
+            }
+            with observability.external_tool_span(
+                tool_name, "mcp", attributes=attrs
+            ):
                 return self._invoke_tool(tool_name, validated)
         return self._invoke_tool(tool_name, validated)
 
@@ -281,7 +288,9 @@ class ToolRegistry:
             return self._callables[tool_name](**validated)
         raise ValueError(f"Tool '{tool_name}' has no registered callable")
 
-    def _dispatch_a2a(self, tool_name: str, args: dict) -> Any:
+    def _dispatch_a2a(
+        self, tool_name: str, args: dict, subagent_name: str = ""
+    ) -> Any:
         """Call a remote A2A agent with the payload serialized as JSON.
 
         A2A carries free text, not a structured payload, so the validated
@@ -302,7 +311,15 @@ class ToolRegistry:
         # status, nothing from inside the remote agent.
         from src import observability
 
-        with observability.external_tool_span(tool_name, "a2a"):
+        with observability.external_tool_span(
+            tool_name,
+            "a2a",
+            attributes={
+                "risk_level": spec.risk_level,
+                "kind": "a2a",
+                "subagent_name": subagent_name,
+            },
+        ):
             return call_a2a_agent(url, message)
 
     def list_tools(self) -> list[str]:

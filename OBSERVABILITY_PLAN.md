@@ -1,7 +1,7 @@
 # LLM Observability Implementation Plan
 
 **Target:** deep-agents-langchain-blog repo
-**Status:** Proposed (not yet implemented)
+**Status:** All planned phases implemented (2026-11-10): request-scoped tracing, cost, JSON/JSONL + OTLP/HTTP export, analysis, provider resolution, chain/responder/department spans, A2A trace propagation, and a span-tree UI.
 **Builds on:** existing `DeepAgentTracer` in `src/services/agent_orchestrator/agent_factory.py:50`
 
 ---
@@ -28,16 +28,34 @@ Non-goals (for this phase):
 
 ## 2. Current state (what exists)
 
+The shipped implementation lives in **`src/observability.py`** and is
+**request-scoped**, not the `tracing.py` / `TraceContext` design sketched in
+§3–§6 below. A *request* is one user message (`request_id`); a *session* is the
+LangGraph `thread_id` (`session_id`). The design sections are kept as the
+original record; this table is the source of truth for what runs today.
+
 | Component | Location | What it does |
 |---|---|---|
-| `DeepAgentTracer` | `agent_factory.py:50` | `BaseCallbackHandler` recording `chat_model/llm/tool/chain` start/end into an in-memory list. |
-| `_tracer` global | `agent_factory.py:107` | Built only when `OBSERVABILITY=1`. |
-| `_maybe_attach_callbacks` | `agent_factory.py:110` | Wraps model with `with_config(callbacks=[_tracer])`. |
-| `token_usage` state | `state.py:10` | `{"input", "output", "total"}` aggregated in orchestrator (`orchestrator.py:175`) and fanout (`graph.py:88`). |
-| `SubagentRun` | `subagent_engine.py:22` | `text`, `usage`, `writes` per department. |
-| `ToolRegistry.dispatch` | `registry.py:217` | Single tool execution surface; validates payload, routes by `ToolKind`. |
+| `Span` / `RequestTrace` | `observability.py:73,114` | Span: request/session ids, parent id, kind, duration, status, `cost_usd`, attributes. Request: spans, raw callback events, `open_llm_spans` map for `run_id` pairing. |
+| Request lifecycle | `observability.py:218-292` | `start_request` / `end_request` / `current_request`; a stale turn is finalized as `abandoned`; auto-export on end. |
+| Span API | `observability.py:297-360` | `start_span` / `end_span`, `start_llm_span` / `end_llm_span`, `start_chain_span` / `end_chain_span`, `external_tool_span`. The active span is a `ContextVar`, so `asyncio.to_thread` fan-out inherits its parent. |
+| Span tree helpers | `observability.py:152-157` | `RequestTrace.root_spans` and `RequestTrace.children(span_id)`. |
+| Cost | `observability.py:423` | `estimate_cost` with a built-in price table plus `OBSERVABILITY_PRICE_*` / `OPENROUTER_*_PRICE` overrides; `cost_usd` on LLM spans and in the session summary. |
+| Provider resolution | `agent_factory.py:_resolve_provider` | Infers the provider from the serialized integration id (`langchain_openrouter`, …) with a model-prefix fallback; spans no longer rely solely on `OBSERVABILITY_DEFAULT_PROVIDER`. |
+| Export | `observability.py:436,455` | `export_request` / `export_last_request`; JSON (overwrite) or JSONL (append); `OBSERVABILITY_EXPORT_UNIQUE=1` or a directory path yields one file per request. |
+| OTLP export | `observability.py:export_otlp` | Optional OTLP/HTTP protobuf-JSON POST to `OBSERVABILITY_OTLP_ENDPOINT` using `httpx` (no SDK dependency); best-effort. |
+| Analysis | `observability.py:655-760` | `analyze_request` / `analyze_last_request`: `summary`, `performance`, `tool_usage`, `error_analysis`, `departments`, `bottlenecks` (`OBSERVABILITY_BOTTLENECK_MS`, default 5000 ms). |
+| `DeepAgentTracer` | `agent_factory.py:50` | `BaseCallbackHandler`: raw events, request-tagged LLM spans, opt-in `chain` spans (`OBSERVABILITY_CHAIN_SPANS=1`); pairs start/end by `run_id`. |
+| Graph wiring | `graph.py:55,79,269` | Request starts in the orchestrator node, `fanout` span in fan-out, `responder` span + request close in the responder node. |
+| Department spans | `subagents.py:555` | `run_department` span with department, kind, allowed/shortlisted tools, success/error, token usage, `cost_usd`, write count, output length. |
+| Tool boundary spans | `registry.py:268-320` | MCP/A2A calls measured at `dispatch` with `risk_level`, `kind`, `subagent_name`. |
+| A2A propagation | `a2a_client.py:_build_message` | The active request id is sent in the A2A message `metadata.trace_id`. |
+| Streamlit panel | `app.py:165-215` | Guarded by `tracing_enabled()`: last request status/duration, LLM calls/tokens/cost, per-department cost, top bottlenecks, indented span tree. |
+| Tests | `tests/test_observability.py` | 59 tests: lifecycle, spans, external tools, session summary, LLM spans, graph turns, cost, export/naming, span tree, analysis, provider resolution, chain spans, department detail, A2A, OTLP. |
 
-**Gaps:** no trace ID, no span parent/child linkage, no per-turn context, no cost, no department/tool attribution, no structured export, no external-backend hook.
+**Remaining optional work:** a full OpenTelemetry SDK/collector integration (the
+current OTLP path is a dependency-free HTTP exporter); remote-side correlation of
+A2A responses; and concurrency beyond the single-flight contract.
 
 ---
 
@@ -212,6 +230,11 @@ Read the exported trace file or query `TraceStore` and display it in the existin
 | `OBSERVABILITY` | off | `=1` attaches `DeepAgentTracer` (existing) |
 | `OBSERVABILITY_EXPORT_PATH` | — | If set, write trace JSON to this path after each turn |
 | `OBSERVABILITY_EXPORT_FORMAT` | `json` | `json` or `jsonl` |
+| `OBSERVABILITY_EXPORT_UNIQUE` | off | `=1` writes `<name>-<request_id>.<ext>` (or one file per request when the path is a directory) |
+| `OBSERVABILITY_OTLP_ENDPOINT` | — | Base URL of an OTLP/HTTP collector; `/v1/traces` is appended |
+| `OBSERVABILITY_CHAIN_SPANS` | off | `=1` records opt-in `chain` spans from LangChain chain callbacks |
+| `OBSERVABILITY_BOTTLENECK_MS` | `5000` | Slow-span threshold used by `analyze_request` |
+| `OBSERVABILITY_DEFAULT_PROVIDER` | `openrouter` | Fallback provider when the model's integration id is not recognized |
 | `OBSERVABILITY_PRICE_<PROVIDER>_<MODEL>_INPUT` | — | Override input price per 1K tokens |
 | `OBSERVABILITY_PRICE_<PROVIDER>_<MODEL>_OUTPUT` | — | Override output price per 1K tokens |
 
@@ -231,6 +254,11 @@ All read at call time from env (consistent with `src/config.py` pattern). No con
 ## 5. File changes
 
 ### New file: `src/services/agent_orchestrator/tracing.py`
+
+> **Superseded.** This sketch was never created. The implementation is
+> `src/observability.py`, request-scoped (not a `trace_id`-per-turn
+> `TraceContext`), with spans on `RequestTrace` and a `ContextVar` span stack.
+> Treat the code below as historical design, not the current API.
 
 ```python
 """LLM observability: trace context, spans, cost, export."""
@@ -409,24 +437,38 @@ Run with `uv run pytest tests/test_observability.py` — no API keys or network 
 
 ## 7. Rollout phases
 
-**Phase 1 — Core trace & spans** (`tracing.py` + enhanced tracer + graph integration)
-- Trace ID per turn via contextvar
-- Span capture from langchain callback events (run_id/parent_run_id)
-- Department, fanout, responder spans
-- Cost estimation stub
-- No export yet (in-memory only)
+**Phase 1 — Core trace & spans** — ✅ Implemented (2026-10-22, `23f54f4`)
+- Request id per turn (`start_request`/`end_request`), session id = `thread_id`
+- Span capture from LangChain callback events (`run_id` pairing)
+- Department, fanout, external-tool spans; `ContextVar` span stack
 
-**Phase 2 — Export & cost**
-- `export_trace` to JSON/JSONL file via `OBSERVABILITY_EXPORT_PATH`
-- Cost per turn/department/tool using token usage already tracked
-- Env-based pricing overrides
+**Phase 2 — Export & cost** — ✅ Implemented (2026-10-22)
+- `export_request` / `export_last_request` to JSON or JSONL via env
+- `estimate_cost` with defaults + env overrides; `cost_usd` on LLM spans;
+  `total_cost_usd` in the session summary
 
-**Phase 3 — Tool dispatch enrichment + UI**
-- `ToolRegistry.dispatch` span attributes (risk, kind, role)
-- Streamlit view of trace file
-- A2A trace ID propagation (optional header in remote call)
+**Phase 3 — Tool dispatch enrichment + UI** — ✅ Implemented (2026-11-10)
+- ✅ MCP/A2A external spans carry `risk_level`, `kind`, `subagent_name`
+- ✅ Streamlit panel: LLM/tokens/cost, per-department cost, bottlenecks, span tree
+- ✅ A2A trace-id propagation in message metadata
+- ✅ `chain` (opt-in) and `responder` spans
 
-Each phase is independently testable and can be merged without enabling observability by default (`OBSERVABILITY` still gates everything).
+**Phase 4 — Analysis & span tree** — ✅ Implemented (2026-11-10)
+- `RequestTrace.root_spans` / `children(span_id)`
+- `analyze_request` / `analyze_last_request` (summary, performance, tool usage,
+  error analysis, departments, bottlenecks) with `OBSERVABILITY_BOTTLENECK_MS`
+- Bug fixes: JSONL newline, stale span stack reset on new request, tool `caller`
+  attribute, A2A `subagent_name` routing
+
+**Phase 5 — Hardening** — ✅ Implemented (2026-11-10)
+- Provider resolved from the serialized model integration, not only env
+- Department span carries tokens, cost, writes, output length, success flag
+- Concurrency-safe export naming (`OBSERVABILITY_EXPORT_UNIQUE`, directory paths)
+- Dependency-free OTLP/HTTP exporter (`OBSERVABILITY_OTLP_ENDPOINT`)
+- `on_chain_error` marks the open chain span as errored
+
+Each phase is independently testable and can be merged without enabling
+observability by default (`OBSERVABILITY=1` still gates everything).
 
 ---
 
@@ -442,6 +484,75 @@ Each phase is independently testable and can be merged without enabling observab
 
 ---
 
-## 9. Immediate next step
+## 10. Progress log
 
-Implement Phase 1: create `tracing.py`, extend `DeepAgentTracer`, wire trace start/end into `graph.py` orchestrator and responder nodes, add tests.
+### 2026-10-22 — Phase 1 (implemented)
+
+- Done: request lifecycle, spans, external tool spans, session summary, LLM spans via
+  `DeepAgentTracer`, graph wiring, department spans, registry spans.
+- Module: `src/observability.py` (not `tracing.py`).
+- Tests: `tests/test_observability.py` Phase 1 classes.
+
+### 2026-10-22 — Phase 2 (implemented)
+
+- Done: `estimate_cost` with env overrides and defaults; `cost_usd` on LLM spans;
+  `total_cost_usd` in session summary; JSON/JSONL export via
+  `OBSERVABILITY_EXPORT_PATH`/`OBSERVABILITY_EXPORT_FORMAT`; auto-export in `end_request`;
+  tests `TestCostEstimation`, `TestExport`.
+- Pending: provider tracking beyond default openrouter; concurrency-safe export file naming.
+
+### 2026-10-22 — Phase 3 (partial)
+
+- Done: registry dispatch enrichment attributes (risk_level, kind, subagent_name);
+  minimal Streamlit observability panel.
+- Pending: A2A trace-id propagation; responder/chain spans; richer UI (span tree,
+  per-department cost breakdown).
+
+### 2026-11-10 — Phase 4 (analysis + hardening)
+
+- Added span-tree helpers: `RequestTrace.root_spans`, `RequestTrace.children(span_id)`.
+- Added an analysis layer: `analyze_request` / `analyze_last_request` producing
+  `summary`, `performance`, `tool_usage`, `error_analysis`, and `bottlenecks`;
+  threshold read from `OBSERVABILITY_BOTTLENECK_MS` (default 5000 ms).
+- Fixed: JSONL export wrote a literal `\n` instead of a newline; `start_request`
+  now resets the `ContextVar` span stack so a crashed turn cannot parent the next
+  turn; external-tool `caller` now records the dispatching service instead of
+  duplicating `service`; A2A dispatch passes `subagent_name` through (previously a
+  `NameError`); span-stack `Token` is typed.
+- Tests: `tests/test_observability.py` now 45 passing (added `TestTraceTree` and
+  `TestAnalysis`; corrected stale external-tool attribute assertions).
+- Validation: `ruff` clean; `mypy src/observability.py` clean.
+
+### 2026-11-10 — Phase 5 (all open items)
+
+- Provider: `_resolve_provider` infers the provider from the serialized integration
+  id (`langchain_openrouter`, `langchain_anthropic`, …) with a model-prefix fallback;
+  LLM spans no longer depend solely on `OBSERVABILITY_DEFAULT_PROVIDER`.
+- Spans: `SPAN_KINDS` now includes `chain` and `responder`; the responder node opens
+  a `responder` span; LangChain chain callbacks emit opt-in `chain` spans
+  (`OBSERVABILITY_CHAIN_SPANS=1`) paired by `run_id`, including `on_chain_error`.
+- Department spans now carry `success`, `input_tokens`, `output_tokens`,
+  `total_tokens`, `cost_usd` (sum of child LLM spans), `writes`, and `output_length`.
+- A2A: `_build_message` attaches the active request id as `metadata.trace_id`;
+  `call_a2a_agent` defaults `trace_id` to `current_request_id()`.
+- Export: `OBSERVABILITY_EXPORT_UNIQUE=1` (or a directory path) writes one file per
+  request; optional OTLP/HTTP exporter (`OBSERVABILITY_OTLP_ENDPOINT`) posts
+  protobuf-JSON to `/v1/traces` via `httpx`, no SDK dependency.
+- Analysis: added a `departments` rollup (latency, LLM cost/tokens, tool calls).
+- UI: Streamlit panel shows performance, per-department cost, top bottlenecks, and
+  an indented span tree.
+- Tests: `tests/test_observability.py` now 59 passing (provider resolution, chain
+  spans, department detail, department analysis, export naming, OTLP, A2A).
+- Validation: full suite `426 →` (all passing); `ruff` clean.
+
+## 11. Remaining optional work
+
+All previously listed open items are implemented. Optional follow-ups:
+
+1. Replace the dependency-free OTLP/HTTP exporter with the OpenTelemetry SDK when a
+   collector pipeline (batching, retries, resource detection) is needed.
+2. Correlate the remote A2A agent's response back to the trace (the id is sent
+   today; nothing consumes it on the receiving side in this repo).
+3. Support concurrent invokes beyond the single-flight contract (the request is
+   still a process global).
+4. Add memory/reasoning/decision span kinds only if the agent gains those steps.
